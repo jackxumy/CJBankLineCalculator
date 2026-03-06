@@ -121,6 +121,7 @@ function generatePerpendicularLines(
 interface SelectionGroup {
   id: string;
   line: GeoJSON.Feature<GeoJSON.LineString>;
+  lineIndex: number | undefined; // 线在上传数据中的索引，用于判断是否同一条线
   start: number;
   end: number | null;
   interval: number;
@@ -845,10 +846,11 @@ function App() {
 
         if (activeIndex === -1) {
           // 创建新组
-          console.log(`[设置起点] 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
+          console.log(`[设置起点] 线索引: ${lineIndex}, 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
           const newGroup: SelectionGroup = {
             id: Math.random().toString(36).substr(2, 9),
             line: lineFeature,
+            lineIndex: lineIndex,
             start: dist,
             end: null,
             interval: interval,
@@ -858,14 +860,13 @@ function App() {
           };
           setGroups(prev => [...prev, newGroup]);
         } else {
-          // 检查正在进行的组是否在同一条线上
+          // 检查正在进行的组是否在同一条线上（通过lineIndex判断）
           const activeGroup = currentGroups[activeIndex];
-          const currentLineCoords = JSON.stringify(lineFeature.geometry.coordinates);
-          const activeLineCoords = JSON.stringify(activeGroup.line.geometry.coordinates);
+          const isSameLine = lineIndex !== undefined && lineIndex === activeGroup.lineIndex;
 
-          if (currentLineCoords === activeLineCoords) {
+          if (isSameLine) {
             // 在同一条线上，结束该组（不立即生成垂线）
-            console.log(`[设置终点] 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
+            console.log(`[设置终点] 线索引: ${lineIndex}, 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
             
             setGroups(prev => {
               const updated = [...prev];
@@ -877,11 +878,12 @@ function App() {
             });
           } else {
             // 在不同线上，重置起点
-            console.log(`[跨线点击] 重置起点: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
+            console.log(`[跨线点击] 从线${activeGroup.lineIndex}跳到线${lineIndex}，重置起点: ${dist.toFixed(2)}m`);
             
             const newGroup: SelectionGroup = {
               id: Math.random().toString(36).substr(2, 9),
               line: lineFeature,
+              lineIndex: lineIndex,
               start: dist,
               end: null,
               interval: interval,
@@ -984,6 +986,7 @@ function App() {
         id: g.id,
         lineCoordinates: g.line.geometry.coordinates,
         lineProperties: g.line.properties,
+        lineIndex: g.lineIndex,
         start: g.start,
         end: g.end,
         interval: g.interval,
@@ -1038,6 +1041,7 @@ function App() {
                 coordinates: g.lineCoordinates
               }
             } as GeoJSON.Feature<GeoJSON.LineString>,
+            lineIndex: g.lineIndex,
             start: g.start,
             end: g.end,
             interval: g.interval,
