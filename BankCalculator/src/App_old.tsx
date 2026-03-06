@@ -7,14 +7,116 @@ import './App.css';
 // 设置Mapbox访问令牌
 mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg'
 
-// imports from split modules
-import { ANALYSIS_CONFIG_DEFAULT} from './constants';
-import { generatePerpendicularLines, sendCrossLinesToBackend } from './utils';
-import PropertiesModal from './components/PropertiesModal';
+// 分析配置默认值
+const ANALYSIS_CONFIG_DEFAULT = {
+  "bench-id": "tiff/Mzs/2012/standard/201210/201210.tif",
+  "ref-id": "tiff/Mzs/2023/standard/202304/202304.tif",
+  "dem-id": "tiff/Mzs/2023/standard/202304/202304.tif",
+  "current-timepoint": "2024-01-15",
+  "comparison-timepoint": "2020-01-15",
+  "segment": "Mzs",
+  "year": "2023",
+  "set": "standard",
+  "water-qs": "45000",
+  "tidal-level": "zc",
+  "hs": 0.5,
+  "hc": 2,
+  "protection-level": "systemic",
+  "control-level": "strict",
+  "risk-thresholds": {
+    "Zb": [20, 30, 40],
+    "Sa": [0.2, 0.3, 0.5],
+    "Ln": [0.04, 0.12, 0.2],
+    "PQ": [0.5, 1, 2.3],
+    "Ky": [1.7, 1.35, 1],
+    "Zd": [0.1, 0.15, 0.3],
+    "Dsed": [0.7, 1, 1.5],
+    "all": [0.25, 0.5, 0.75]
+  },
+  "wNM": [0.43, 0.32, 0.25],
+  "wRE": [0.48, 0.16, 0.36],
+  "wGE": [0.6, 0.2, 0.2],
+  "wRL": [0.32, 0.43, 0.25]
+};
 
-// geometry utilities moved to ./utils
+/**
+ * 在线上以固定间距生成垂线
+ * @param line 主线
+ * @param startDist 起点距离 (米)
+ * @param endDist 终点距离 (米)
+ * @param interval 间距 (米)
+ * @param crossLength 垂线总长度 (米)
+ */
+function generatePerpendicularLines(
+  line: GeoJSON.Feature<GeoJSON.LineString>,
+  startDist: number,
+  endDist: number,
+  interval: number,
+  crossLength: number
+) {
+  const perpendicularLines: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+  const endpointData: { distance: number; left: number[]; right: number[] }[] = [];
 
-// --- Types ---
+  // 确保 start < end
+  const actualStart = Math.min(startDist, endDist);
+  const actualEnd = Math.max(startDist, endDist);
+  const lineLength = turf.length(line, { units: 'meters' });
+  const segmentLen = actualEnd - actualStart;
+
+  console.log(`--- 生成垂线数据 (范围: ${actualStart.toFixed(2)}m - ${actualEnd.toFixed(2)}m, 段长: ${segmentLen.toFixed(2)}m, 母线总长: ${lineLength.toFixed(2)}m) ---`);
+
+  for (let d = actualStart; d <= actualEnd; d += interval) {
+    const p1 = turf.along(line, d, { units: 'meters' });
+    // 为了计算切线方向
+    const p2Offset = Math.min(d + 0.1, lineLength);
+    const p2 = turf.along(line, p2Offset, { units: 'meters' });
+
+    const relPos = segmentLen > 0 ? (d - actualStart) / segmentLen : 0;
+    console.log(`垂线位置: ${d.toFixed(2)}m, 整线归一化: ${(d / lineLength).toFixed(4)}, 区段内归一化: ${relPos.toFixed(4)}`);
+
+    let bearing = 0;
+    if (d >= lineLength - 0.1) {
+      const pPrev = turf.along(line, Math.max(0, d - 0.1), { units: 'meters' });
+      bearing = turf.bearing(pPrev, p1);
+    } else {
+      bearing = turf.bearing(p1, p2);
+    }
+
+    const leftEnd = turf.destination(p1, crossLength / 2, bearing - 90, { units: 'meters' });
+    const rightEnd = turf.destination(p1, crossLength / 2, bearing + 90, { units: 'meters' });
+
+    const leftCoords = leftEnd.geometry.coordinates;
+    const rightCoords = rightEnd.geometry.coordinates;
+
+    endpointData.push({
+      distance: d,
+      left: leftCoords,
+      right: rightCoords
+    });
+
+    perpendicularLines.push({
+      type: 'Feature',
+      properties: {
+        distance: d,
+        leftPoint: leftCoords,
+        rightPoint: rightCoords
+      },
+      geometry: {
+        type: 'LineString',
+        coordinates: [
+          leftCoords,
+          rightCoords
+        ]
+      }
+    });
+  }
+
+  return {
+    featureCollection: turf.featureCollection(perpendicularLines),
+    endpointData
+  };
+}
+
 // 定义选择组接口
 interface SelectionGroup {
   id: string;
@@ -23,7 +125,7 @@ interface SelectionGroup {
   start: number;
   end: number | null;
   interval: number;
-  // 上一次实际应用到断面上的间距，用于判断用户是否修改了间距
+  // 上一次实际应用到垂线上的间距，用于判断用户是否修改了间距
   lastAppliedInterval: number;
   length: number;
   crossData: { distance: number; left: number[]; right: number[] }[];
@@ -31,18 +133,64 @@ interface SelectionGroup {
   properties?: Partial<typeof ANALYSIS_CONFIG_DEFAULT>;
 }
 
-// backend sender moved to ./utils
+/**
+ * 将垂线数据发送到后端进行分析
+ * @param crossData 垂线端点数据数组
+ * @param groupId 组ID（用于日志）
+ */
+async function sendCrossLinesToBackend(
+  crossData: { distance: number; left: number[]; right: number[]; analysisConfig?: typeof ANALYSIS_CONFIG_DEFAULT }[],
+  groupId: string
+) {
+  console.log(`开始向后端发送组 ${groupId} 的 ${crossData.length} 条垂线数据...`);
 
-// PropertiesModal moved to separate component file
+  try {
+    const promises = crossData.map(async (item, index) => {
+      const payload = {
+        ...(item.analysisConfig || ANALYSIS_CONFIG_DEFAULT),
+        "section-geometry": {
+          "type": "Feature",
+          "properties": { "distance": item.distance, "index": index },
+          "geometry": { 
+            "type": "LineString", 
+            "coordinates": [item.left, item.right] 
+          }
+        }
+      };
+
+      console.log(`正在发送垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m):`, payload);
+
+      const response = await fetch('http://192.168.1.116:8088/v0/mi/risk-level', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`请求失败: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      console.log(`垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m) 已发送`);
+      return result;
+    });
+
+    const results = await Promise.all(promises);
+    console.log(`组 ${groupId} 的所有垂线数据已成功发送到后端`);
+    return results;
+  } catch (error) {
+    console.error(`发送组 ${groupId} 的垂线数据时出错:`, error);
+    throw error;
+  }
+}
 
 function App() {
-  // --- State & Refs ---
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
 
   // 上传的 GeoJSON 数据 (主线)
   const [uploadedData, setUploadedData] = useState<GeoJSON.FeatureCollection | null>(null);
-  // 生成的断面数据
+  // 生成的垂线数据
   const [perpendicularData, setPerpendicularData] = useState<GeoJSON.FeatureCollection | null>(null);
 
   // 所有选择组
@@ -50,7 +198,7 @@ function App() {
   const groupsRef = useRef(groups);
   useEffect(() => { groupsRef.current = groups; }, [groups]);
 
-  // 全局断面配置（用于首次绘制整个 GeoJSON）
+  // 全局垂线配置（用于首次绘制整个 GeoJSON）
   const [globalInterval, setGlobalInterval] = useState<number>(100);
   const [globalLength, setGlobalLength] = useState<number>(2000);
   
@@ -75,14 +223,13 @@ function App() {
   const isSelectingStartEndRef = useRef(isSelectingStartEnd);
   useEffect(() => { isSelectingStartEndRef.current = isSelectingStartEnd; }, [isSelectingStartEnd]);
   
-  // 新增状态：选中的用于生成断面的线段（存储线的唯一标识）
+  // 新增状态：选中的用于生成垂线的线段（存储线的唯一标识）
   const [selectedLines, setSelectedLines] = useState<Set<string>>(new Set());
   const selectedLinesRef = useRef(selectedLines);
   useEffect(() => { selectedLinesRef.current = selectedLines; }, [selectedLines]);
 
   // 使用 Ref 跟踪配置值，确保事件监听器中能获取到最新值
   const configRef = useRef({ interval: globalInterval, length: globalLength });
-  // --- Map Init & Event Listeners ---
   useEffect(() => {
     configRef.current = { interval: globalInterval, length: globalLength };
   }, [globalInterval, globalLength]);
@@ -122,7 +269,7 @@ function App() {
     }
   };
 
-  // 核心逻辑：基于上传的 GeoJSON 和全局配置生成所有断面
+  // 核心逻辑：基于上传的 GeoJSON 和全局配置生成所有垂线
   const handleGenerateSections = () => {
     if (!uploadedData) {
       alert('请先上传 GeoJSON 数据');
@@ -175,7 +322,7 @@ function App() {
       }
     });
 
-    // 为每条断面添加属性
+    // 为每条垂线添加属性
     allPerpendicularLines.forEach(line => {
       if (line.properties) {
         line.properties.analysisConfig = { ...globalProperties };
@@ -184,17 +331,17 @@ function App() {
 
     setPerpendicularData(turf.featureCollection(allPerpendicularLines));
     setShowCrossLines(true);
-    alert(`已为 ${selectedLines.size} 个岸段生成断面！\n\n提示：可以点击"属性配置"按钮设置分析参数`);
+    alert(`已为 ${selectedLines.size} 个岸段生成垂线！\n\n提示：可以点击"属性配置"按钮设置分析参数`);
   };
 
-  // 开始分析：将所有断面发送到后端
+  // 开始分析：将所有垂线发送到后端
   const handleStartAnalysis = async () => {
     if (!perpendicularData || perpendicularData.features.length === 0) {
       alert('请先绘制断面');
       return;
     }
 
-    // 收集所有断面数据，包括每个断面的属性配置
+    // 收集所有垂线数据，包括每条垂线的属性配置
     const allCrossData = perpendicularData.features.map(line => ({
       distance: line.properties?.distance ?? 0,
       left: line.properties?.leftPoint as number[],
@@ -204,14 +351,14 @@ function App() {
 
     try {
       await sendCrossLinesToBackend(allCrossData, 'all-lines');
-      alert(`成功发送 ${allCrossData.length} 个断面到后端！`);
+      alert(`成功发送 ${allCrossData.length} 条垂线到后端！`);
     } catch (err) {
-      alert('发送断面到后端时出错，请检查控制台');
+      alert('发送垂线到后端时出错，请检查控制台');
       console.error(err);
     }
   };
 
-  // 应用自定义线段配置：更新当前编辑组的断面
+  // 应用自定义线段配置：更新当前编辑组的垂线
   const handleApplyCustomSegments = () => {
     if (!editingGroupId) {
       alert('请先点击编辑按钮选择要修改的组');
@@ -235,11 +382,11 @@ function App() {
     // 判断是否修改了间距：如果当前间距与上一次应用的间距不同，则认为修改了间距
     const intervalChanged = editingGroup.interval !== editingGroup.lastAppliedInterval;
 
-    // 复制现有断面数据
+    // 复制现有垂线数据
     let updatedLines = [...perpendicularData.features] as GeoJSON.Feature<GeoJSON.LineString>[];
 
     if (!intervalChanged) {
-      // ✅ 未修改间距：仅根据每个断面的位置，调整其长度，不改变位置与数量
+      // ✅ 未修改间距：仅根据每条垂线的位置，调整其长度，不改变位置与数量
       const newCrossData: { distance: number; left: number[]; right: number[] }[] = [];
 
       updatedLines = updatedLines.map(line => {
@@ -249,15 +396,15 @@ function App() {
         if (!leftPoint || !rightPoint) return line;
 
         try {
-          // 断面中点
+          // 垂线中点
           const mid = [(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2];
           const midPoint = turf.point(mid);
-          // 投影到当前组的主线上，得到该断面在主线上的实际距离
+          // 投影到当前组的主线上，得到该垂线在主线上的实际距离
           const snapped = turf.nearestPointOnLine(editingGroup.line, midPoint, { units: 'meters' });
           const actualDist = snapped.properties.location ?? 0;
           const distToLine = turf.distance(midPoint, snapped, { units: 'meters' });
 
-          // 过滤：只处理同一条线、并且距离在线段 [start, end] 内的断面
+          // 过滤：只处理同一条线、并且距离在线段 [start, end] 内的垂线
           if (distToLine > Math.max(globalLength, editingGroup.length) / 2 + 100) {
             return line;
           }
@@ -313,11 +460,11 @@ function App() {
       });
 
       setPerpendicularData(turf.featureCollection(updatedLines));
-      alert(`已更新组 ${groups.findIndex(g => g.id === editingGroupId) + 1} 的断面长度（未修改间距）`);
+      alert(`已更新组 ${groups.findIndex(g => g.id === editingGroupId) + 1} 的垂线长度（未修改间距）`);
     } else {
-      // ✅ 修改了间距：删除该段原有断面，根据新的间距与长度重新生成
+      // ✅ 修改了间距：删除该段原有垂线，根据新的间距与长度重新生成
 
-      // 移除该线段范围内的旧断面（只移除同一条线上的）
+      // 移除该线段范围内的旧垂线（只移除同一条线上的）
       updatedLines = updatedLines.filter(line => {
         const lineProp = line.properties as any;
         if (!lineProp) return true;
@@ -331,10 +478,10 @@ function App() {
           const distOnLine = turf.nearestPointOnLine(editingGroup.line, midPoint, { units: 'meters' });
           const actualDist = distOnLine.properties.location ?? 0;
           
-          // 检查断面中点是否真的在当前线上（通过距离阈值判断）
+          // 检查垂线中点是否真的在当前线上（通过距离阈值判断）
           const distToLine = turf.distance(midPoint, distOnLine, { units: 'meters' });
           
-          // 如果断面中点距离线太远，说明不是同一条线
+          // 如果垂线中点距离线太远，说明不是同一条线
           if (distToLine > Math.max(globalLength, editingGroup.length) / 2 + 100) {
             return true; // 保留，不是同一条线
           }
@@ -350,7 +497,7 @@ function App() {
         }
       });
       
-      // 生成新的断面数据
+      // 生成新的垂线数据
       const { featureCollection, endpointData } = generatePerpendicularLines(
         editingGroup.line,
         start,
@@ -359,7 +506,7 @@ function App() {
         editingGroup.length
       );
       
-      // 为新生成的断面添加属性配置
+      // 为新生成的垂线添加属性配置
       featureCollection.features.forEach(line => {
         if (line.properties) {
           line.properties.analysisConfig = editingGroup.properties || { ...globalProperties };
@@ -380,7 +527,7 @@ function App() {
         return updated;
       });
       
-      // 合并新断面
+      // 合并新垂线
       updatedLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
 
       setPerpendicularData(turf.featureCollection(updatedLines));
@@ -424,7 +571,7 @@ function App() {
     reader.readAsText(file);
   };
 
-  // 核心逻辑：同步断面到地图数据源
+  // 核心逻辑：同步垂线到地图数据源
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -534,7 +681,7 @@ function App() {
     }
   }, [groups]);
 
-  // 控制断面图层显影
+  // 控制垂线图层显影
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -651,7 +798,7 @@ function App() {
         }
       });
 
-      const hitLayers = ['uploaded-lines-hit-target', 'selected-shore-lines-layer'];
+      const hitLayers = ['uploaded-lines-hit-target'];
 
       // 点击事件处理
       map.on('click', (e) => {
@@ -718,7 +865,7 @@ function App() {
           const isSameLine = lineIndex !== undefined && lineIndex === activeGroup.lineIndex;
 
           if (isSameLine) {
-            // 在同一条线上，结束该组（不立即生成断面）
+            // 在同一条线上，结束该组（不立即生成垂线）
             console.log(`[设置终点] 线索引: ${lineIndex}, 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
             
             setGroups(prev => {
@@ -825,8 +972,319 @@ function App() {
     });
   };
 
+  // 保存配置到JSON文件
+  const handleSaveConfig = () => {
+    const config = {
+      version: '1.0',
+      timestamp: new Date().toISOString(),
+      globalConfig: {
+        interval: globalInterval,
+        length: globalLength
+      },
+      globalProperties: globalProperties,
+      groups: groups.map(g => ({
+        id: g.id,
+        lineCoordinates: g.line.geometry.coordinates,
+        lineProperties: g.line.properties,
+        lineIndex: g.lineIndex,
+        start: g.start,
+        end: g.end,
+        interval: g.interval,
+        lastAppliedInterval: g.lastAppliedInterval,
+        length: g.length,
+        properties: g.properties
+      }))
+    };
+
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `perpendicular-config-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    alert('配置已保存到文件');
+  };
+
+  // 从JSON文件加载配置
+  const handleLoadConfig = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const config = JSON.parse(event.target?.result as string);
+        
+        const globalInterval = config.globalConfig?.interval || 100;
+        const globalLength = config.globalConfig?.length || 2000;
+        
+        // 恢复全局配置
+        setGlobalInterval(globalInterval);
+        setGlobalLength(globalLength);
+        
+        // 恢复全局属性配置
+        if (config.globalProperties) {
+          setGlobalProperties(config.globalProperties);
+        }
+
+        // 恢复选择组
+        let restoredGroups: SelectionGroup[] = [];
+        if (config.groups && Array.isArray(config.groups)) {
+          restoredGroups = config.groups.map((g: any) => ({
+            id: g.id || Math.random().toString(36).substr(2, 9),
+            line: {
+              type: 'Feature',
+              properties: g.lineProperties || {},
+              geometry: {
+                type: 'LineString',
+                coordinates: g.lineCoordinates
+              }
+            } as GeoJSON.Feature<GeoJSON.LineString>,
+            lineIndex: g.lineIndex,
+            start: g.start,
+            end: g.end,
+            interval: g.interval,
+            lastAppliedInterval: g.lastAppliedInterval ?? g.interval,
+            length: g.length,
+            crossData: [],
+            properties: g.properties
+          }));
+          setGroups(restoredGroups);
+        }
+        
+        // 立即绘制垂线
+        if (uploadedData) {
+          // 1. 先使用全局配置生成所有垂线
+          const allPerpendicularLines: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+
+          uploadedData.features.forEach(feature => {
+            if (feature.geometry.type === 'LineString') {
+              const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
+              const lineLengthMeters = turf.length(line, { units: 'meters' });
+              
+              const { featureCollection } = generatePerpendicularLines(
+                line,
+                0,
+                lineLengthMeters,
+                globalInterval,
+                globalLength
+              );
+              
+              allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+            } else if (feature.geometry.type === 'MultiLineString') {
+              const multiLine = feature.geometry as GeoJSON.MultiLineString;
+              multiLine.coordinates.forEach(coords => {
+                const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
+                const lineLengthMeters = turf.length(line, { units: 'meters' });
+                
+                const { featureCollection } = generatePerpendicularLines(
+                  line,
+                  0,
+                  lineLengthMeters,
+                  globalInterval,
+                  globalLength
+                );
+                allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+              });
+            }
+          });
+
+          let updatedLines = allPerpendicularLines;
+
+          // 2. 对每个已完成的选择组应用自定义配置
+          restoredGroups.forEach(group => {
+            if (group.end !== null) {
+              const start = Math.min(group.start, group.end);
+              const end = Math.max(group.start, group.end);
+              
+              // 移除该线段范围内的旧垂线
+              updatedLines = updatedLines.filter(line => {
+                const lineProp = line.properties;
+                if (!lineProp) return true;
+                
+                const leftPoint = lineProp.leftPoint as number[];
+                const rightPoint = lineProp.rightPoint as number[];
+                if (!leftPoint || !rightPoint) return true;
+                
+                try {
+                  const midPoint = turf.point([(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2]);
+                  const distOnLine = turf.nearestPointOnLine(group.line, midPoint, { units: 'meters' });
+                  const actualDist = distOnLine.properties.location ?? 0;
+                  const distToLine = turf.distance(midPoint, distOnLine, { units: 'meters' });
+                  
+                  if (distToLine > Math.max(globalLength, group.length) / 2 + 100) {
+                    return true;
+                  }
+                  
+                  if (actualDist >= start && actualDist <= end) {
+                    return false;
+                  }
+                  
+                  return true;
+                } catch {
+                  return true;
+                }
+              });
+              
+              // 生成新的垂线
+              const { featureCollection, endpointData } = generatePerpendicularLines(
+                group.line,
+                start,
+                end,
+                group.interval,
+                group.length
+              );
+              
+              // 更新组的 crossData
+              const groupIndex = restoredGroups.findIndex(g => g.id === group.id);
+              if (groupIndex !== -1) {
+                restoredGroups[groupIndex].crossData = endpointData;
+                restoredGroups[groupIndex].lastAppliedInterval = group.interval;
+              }
+              
+              updatedLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+            }
+          });
+
+          // 更新选择组（带 crossData）
+          setGroups(restoredGroups);
+          setPerpendicularData(turf.featureCollection(updatedLines));
+          setShowCrossLines(true);
+          
+          alert(`已加载配置并绘制 ${restoredGroups.length} 个选择组的垂线`);
+        } else {
+          alert(`已加载 ${restoredGroups.length} 个选择组配置，请先上传 GeoJSON 数据后再绘制断面`);
+        }
+        
+        // 重置输入框
+        e.target.value = '';
+      } catch (err) {
+        console.error('加载配置失败:', err);
+        alert('加载配置失败，请检查文件格式');
+      }
+    };
+    reader.readAsText(file);
+  };
+
   const totalCrossLinesCount = perpendicularData?.features.length || 0;
   const totalSelectedSegments = groups.filter(g => g.end !== null).length;
+
+  // 属性配置弹窗组件
+  const PropertiesModal = ({ 
+    config, 
+    onSave, 
+    onClose,
+    title 
+  }: { 
+    config: typeof ANALYSIS_CONFIG_DEFAULT; 
+    onSave: (newConfig: typeof ANALYSIS_CONFIG_DEFAULT) => void;
+    onClose: () => void;
+    title: string;
+  }) => {
+    const [year, setYear] = useState(config.year);
+    const years = Array.from({ length: 17 }, (_, i) => (2010 + i).toString());
+
+    const handleSave = () => {
+      onSave({ ...config, year });
+      onClose();
+    };
+
+    return (
+      <div style={{
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 10000
+      }}>
+        <div style={{
+          backgroundColor: 'white',
+          padding: '20px',
+          borderRadius: '8px',
+          maxWidth: '600px',
+          maxHeight: '80vh',
+          overflow: 'auto',
+          boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
+        }}>
+          <h3 style={{ marginTop: 0 }}>{title}</h3>
+          
+          <div style={{ marginBottom: '15px' }}>
+            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>
+              年份 (year) - 可编辑:
+            </label>
+            <select 
+              value={year} 
+              onChange={(e) => setYear(e.target.value)}
+              style={{ width: '100%', padding: '5px' }}
+            >
+              {years.map(y => <option key={y} value={y}>{y}</option>)}
+            </select>
+          </div>
+
+          <div style={{ marginBottom: '15px', opacity: 0.6 }}>
+            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>其他属性（仅展示）:</label>
+            <pre style={{ 
+              backgroundColor: '#f5f5f5', 
+              padding: '10px', 
+              borderRadius: '4px',
+              fontSize: '12px',
+              maxHeight: '300px',
+              overflow: 'auto'
+            }}>
+              {JSON.stringify({
+                'bench-id': config['bench-id'],
+                'ref-id': config['ref-id'],
+                'dem-id': config['dem-id'],
+                'current-timepoint': config['current-timepoint'],
+                'comparison-timepoint': config['comparison-timepoint'],
+                segment: config.segment,
+                set: config.set,
+                'water-qs': config['water-qs'],
+                'tidal-level': config['tidal-level'],
+                hs: config.hs,
+                hc: config.hc,
+                'protection-level': config['protection-level'],
+                'control-level': config['control-level'],
+                'risk-thresholds': config['risk-thresholds'],
+                wNM: config.wNM,
+                wRE: config.wRE,
+                wGE: config.wGE,
+                wRL: config.wRL
+              }, null, 2)}
+            </pre>
+          </div>
+
+          <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+            <button 
+              onClick={onClose}
+              style={{ padding: '8px 16px', cursor: 'pointer' }}
+            >
+              取消
+            </button>
+            <button 
+              onClick={handleSave}
+              style={{ 
+                padding: '8px 16px', 
+                backgroundColor: '#3b82f6', 
+                color: 'white', 
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer'
+              }}
+            >
+              保存
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="map-wrapper">
@@ -845,14 +1303,14 @@ function App() {
           <div className="upload-info">
             已加载 {uploadedData.features.length} 个要素
             <br />
-            已选线段: {totalSelectedSegments} | 断面总数: {totalCrossLinesCount}
+            已选线段: {totalSelectedSegments} | 垂线总数: {totalCrossLinesCount}
           </div>
         )}
         
         <div className="config-section">
-          <h4>1️⃣ 全局断面配置</h4>
+          <h4>1️⃣ 全局垂线配置</h4>
           <div className="config-item">
-            <label>断面间距 (m):</label>
+            <label>垂线间距 (m):</label>
             <input
               type="number"
               value={globalInterval}
@@ -862,7 +1320,7 @@ function App() {
             />
           </div>
           <div className="config-item">
-            <label>断面长度 (m):</label>
+            <label>垂线总长 (m):</label>
             <input
               type="number"
               value={globalLength}
@@ -969,8 +1427,8 @@ function App() {
                   </div>
                 )}
                 {g.crossData.length > 0 && (
-                    <div className="group-info">
-                    断面: {g.crossData.length} 条 | 间距: {g.interval}m | 长度: {g.length}m
+                  <div className="group-info">
+                    垂线: {g.crossData.length} 条 | 间距: {g.interval}m | 长度: {g.length}m
                   </div>
                 )}
               </div>
@@ -985,10 +1443,10 @@ function App() {
             onClick={handleStartAnalysis}
             disabled={!perpendicularData || perpendicularData.features.length === 0}
           >
-            🚀 开始分析（发送全部断面）
+            🚀 开始分析（发送全部垂线）
           </button>
           <p style={{fontSize: '13px', color: '#64748b', margin: '5px 0'}}>
-            {perpendicularData ? `当前共 ${perpendicularData.features.length} 条断面` : '请先绘制断面'}
+            {perpendicularData ? `当前共 ${perpendicularData.features.length} 条垂线` : '请先绘制断面'}
           </p>
         </div>
 
@@ -998,9 +1456,19 @@ function App() {
             className={`toggle-button ${!showCrossLines ? 'off' : ''}`}
             onClick={() => setShowCrossLines(!showCrossLines)}
           >
-            {showCrossLines ? '👁️ 隐藏断面' : '👁️ 显示断面'}
+            {showCrossLines ? '👁️ 隐藏垂线' : '👁️ 显示垂线'}
           </button>
           <button className="clear-button" onClick={onClear}>🧹 清空选择</button>
+          <button className="save-config-button" onClick={handleSaveConfig}>💾 保存配置</button>
+          <label className="load-config-button">
+            📁 加载配置
+            <input
+              type="file"
+              accept=".json,application/json"
+              onChange={handleLoadConfig}
+              style={{ display: 'none' }}
+            />
+          </label>
         </div>
       </div>
 
@@ -1011,7 +1479,7 @@ function App() {
           title="全局属性配置"
           onSave={(newConfig) => {
             setGlobalProperties(newConfig);
-              // 更新所有未自定义属性的断面
+            // 更新所有未自定义属性的垂线
             if (perpendicularData) {
               const updatedLines = perpendicularData.features.map(line => {
                 const lineProp: any = line.properties || {};
@@ -1064,7 +1532,7 @@ function App() {
                 }
                 return updated;
               });
-              alert(`组 ${groups.findIndex(g => g.id === editingPropertiesGroupId) + 1} 的属性配置已保存\n\n注意：需要点击"应用配置"才能将属性更新到断面上`);
+              alert(`组 ${groups.findIndex(g => g.id === editingPropertiesGroupId) + 1} 的属性配置已保存\n\n注意：需要点击"应用配置"才能将属性更新到垂线上`);
             }}
             onClose={() => setEditingPropertiesGroupId(null)}
           />
