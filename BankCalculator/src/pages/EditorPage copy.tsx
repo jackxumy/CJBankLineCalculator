@@ -137,17 +137,21 @@ interface SelectionGroup {
  * 将垂线数据发送到后端进行分析
  * @param crossData 垂线端点数据数组
  * @param groupId 组ID（用于日志）
+ * @param taskUid 任务的唯一标识符
  */
 async function sendCrossLinesToBackend(
   crossData: { distance: number; left: number[]; right: number[]; analysisConfig?: typeof ANALYSIS_CONFIG_DEFAULT }[],
-  groupId: string
+  groupId: string,
+  taskUid: string
 ) {
   console.log(`开始向后端发送组 ${groupId} 的 ${crossData.length} 条垂线数据...`);
+  console.log(`任务UID: ${taskUid}`);
 
   try {
     const promises = crossData.map(async (item, index) => {
-      // 为每一条断面生成简单的 UID
+      // 为每条断面生成唯一的uid
       const sectionUid = `crossline-${Date.now()}-${index + 1}`;
+      
       const payload = {
         uid: sectionUid,
         ...(item.analysisConfig || ANALYSIS_CONFIG_DEFAULT),
@@ -161,7 +165,7 @@ async function sendCrossLinesToBackend(
         }
       };
 
-      console.log(`正在发送垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m, uid: ${sectionUid}):`, payload);
+      console.log(`正在发送垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m, UID: ${sectionUid}):`, payload);
 
       const response = await fetch('http://192.168.1.116:8088/v0/mi/risk-level', {
         method: 'POST',
@@ -174,7 +178,7 @@ async function sendCrossLinesToBackend(
       }
 
       const result = await response.json();
-      console.log(`垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m) 已发送`);
+      console.log(`垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m, UID: ${sectionUid}) 已发送`);
       return result;
     });
 
@@ -193,9 +197,12 @@ function EditorPage() {
 
   // 上传的 GeoJSON 数据 (主线)
   const [uploadedData, setUploadedData] = useState<GeoJSON.FeatureCollection | null>(null);
-  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
+  // 上传的 GeoJSON 文件名
+  const [uploadedFileName, setUploadedFileName] = useState<string>('');
   // 生成的垂线数据
   const [perpendicularData, setPerpendicularData] = useState<GeoJSON.FeatureCollection | null>(null);
+  const perpendicularDataRef = useRef(perpendicularData);
+  useEffect(() => { perpendicularDataRef.current = perpendicularData; }, [perpendicularData]);
 
   // 所有选择组
   const [groups, setGroups] = useState<SelectionGroup[]>([]);
@@ -213,8 +220,6 @@ function EditorPage() {
   
   // 全局属性配置
   const [globalProperties, setGlobalProperties] = useState(ANALYSIS_CONFIG_DEFAULT);
-  const globalPropertiesRef = useRef(globalProperties);
-  useEffect(() => { globalPropertiesRef.current = globalProperties; }, [globalProperties]);
   // 属性配置弹窗状态
   const [showGlobalPropertiesModal, setShowGlobalPropertiesModal] = useState<boolean>(false);
   const [editingPropertiesGroupId, setEditingPropertiesGroupId] = useState<string | null>(null);
@@ -239,15 +244,15 @@ function EditorPage() {
   const isSelectingCrossLinesRef = useRef(isSelectingCrossLines);
   useEffect(() => { isSelectingCrossLinesRef.current = isSelectingCrossLines; }, [isSelectingCrossLines]);
   
-  // 新增状态：断面编辑模式 ('select' 选择现有断面, 'add' 新建断面)
-  const [crossLineEditMode, setCrossLineEditMode] = useState<'select' | 'add'>('select');
-  const crossLineEditModeRef = useRef(crossLineEditMode);
-  useEffect(() => { crossLineEditModeRef.current = crossLineEditMode; }, [crossLineEditMode]);
-  
   // 新增状态：选中的断面索引
   const [selectedCrossLineIndex, setSelectedCrossLineIndex] = useState<number | null>(null);
   const selectedCrossLineIndexRef = useRef(selectedCrossLineIndex);
   useEffect(() => { selectedCrossLineIndexRef.current = selectedCrossLineIndex; }, [selectedCrossLineIndex]);
+  
+  // 新增状态：拖拽相关
+  const [isDraggingCrossLine, setIsDraggingCrossLine] = useState<boolean>(false);
+  const isDraggingCrossLineRef = useRef(isDraggingCrossLine);
+  useEffect(() => { isDraggingCrossLineRef.current = isDraggingCrossLine; }, [isDraggingCrossLine]);
 
   // 使用 Ref 跟踪配置值，确保事件监听器中能获取到最新值
   const configRef = useRef({ interval: globalInterval, length: globalLength });
@@ -307,63 +312,7 @@ function EditorPage() {
     }
     if (!isSelectingCrossLines) {
       setSelectedCrossLineIndex(null); // 关闭模式时清空选择
-      setCrossLineEditMode('select'); // 重置为选择模式
     }
-  };
-  
-  // 在指定位置新建断面
-  const createCrossLineAtPoint = (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => {
-    // 先根据当前点击位置计算几何信息
-    const pointOnLine = turf.along(line, distanceOnLine, { units: 'meters' });
-    const lineLength = turf.length(line, { units: 'meters' });
-    const nextDist = Math.min(distanceOnLine + 0.1, lineLength);
-    const nextPoint = turf.along(line, nextDist, { units: 'meters' });
-
-    let bearing = 0;
-    if (distanceOnLine >= lineLength - 0.1) {
-      const prevPoint = turf.along(line, Math.max(0, distanceOnLine - 0.1), { units: 'meters' });
-      bearing = turf.bearing(prevPoint, pointOnLine);
-    } else {
-      bearing = turf.bearing(pointOnLine, nextPoint);
-    }
-
-    const currentLength = configRef.current.length;
-    const leftEnd = turf.destination(pointOnLine, currentLength / 2, bearing - 90, { units: 'meters' });
-    const rightEnd = turf.destination(pointOnLine, currentLength / 2, bearing + 90, { units: 'meters' });
-
-    const leftCoords = leftEnd.geometry.coordinates;
-    const rightCoords = rightEnd.geometry.coordinates;
-
-    // 所属岸段信息：来自母线的 index 属性
-    const parentIndex = (line.properties as any)?.index;
-    const parentId = parentIndex !== undefined ? `line-${parentIndex}` : undefined;
-
-    // 使用函数式更新，避免闭包中拿到过期的 perpendicularData
-    setPerpendicularData(prev => {
-      const existing = prev ? (prev.features as GeoJSON.Feature<GeoJSON.LineString>[]) : [];
-      const newCrossLineId = existing.length;
-
-      const newCrossLine: GeoJSON.Feature<GeoJSON.LineString> = {
-        type: 'Feature',
-        properties: {
-          crossLineId: newCrossLineId,
-          distance: distanceOnLine,
-          shoreLineIndex: parentIndex,
-          shoreLineId: parentId,
-          leftPoint: leftCoords,
-          rightPoint: rightCoords,
-          analysisConfig: { ...globalPropertiesRef.current }
-        },
-        geometry: {
-          type: 'LineString',
-          coordinates: [leftCoords, rightCoords]
-        }
-      };
-
-      const newFeatures = [...existing, newCrossLine];
-      console.log(`新建断面 #${newCrossLineId + 1}，位置: ${distanceOnLine.toFixed(2)}m，当前总数: ${newFeatures.length}`);
-      return turf.featureCollection(newFeatures);
-    });
   };
   
   // 删除选中的断面
@@ -386,56 +335,98 @@ function EditorPage() {
     alert('已删除选中的断面');
   };
   
-  // 平移选中的断面
-  const translateSelectedCrossLine = (offsetMeters: number) => {
-    if (selectedCrossLineIndex === null || !perpendicularData) {
-      alert('请先选择要平移的断面');
+  // 开始拖拽断面
+  const startDraggingCrossLine = (index: number) => {
+    console.log(`=== startDraggingCrossLine 被调用 ===`);
+    console.log(`- 断面索引: ${index}`);
+    console.log(`- 当前perpendicularData:`, perpendicularData);
+    console.log(`- 断面总数: ${perpendicularData?.features.length}`);
+    
+    setSelectedCrossLineIndex(index);
+    setIsDraggingCrossLine(true);
+    
+    console.log(`- 状态已更新: selectedCrossLineIndex=${index}, isDragging=true`);
+  };
+  
+  // 拖拽断面到新位置
+  const dragCrossLineTo = (lngLat: { lng: number; lat: number }) => {
+    console.log('=== dragCrossLineTo 被调用 ===', lngLat);
+    
+    const currentIndex = selectedCrossLineIndexRef.current;
+    const currentData = perpendicularDataRef.current;
+    const isDragging = isDraggingCrossLineRef.current;
+    
+    console.log('dragCrossLineTo - currentIndex:', currentIndex);
+    console.log('dragCrossLineTo - currentData:', currentData);
+    console.log('dragCrossLineTo - isDragging:', isDragging);
+    
+    if (currentIndex === null || !currentData || !isDragging) {
+      console.log('拖拽条件不满足:', { currentIndex, hasData: !!currentData, isDragging });
       return;
     }
     
-    const selectedLine = perpendicularData.features[selectedCrossLineIndex];
-    if (!selectedLine || selectedLine.geometry.type !== 'LineString') return;
+    const selectedLine = currentData.features[currentIndex];
+    console.log('dragCrossLineTo - selectedLine:', selectedLine);
+    
+    if (!selectedLine || selectedLine.geometry.type !== 'LineString') {
+      console.log('断面不存在或类型错误');
+      return;
+    }
     
     const coords = selectedLine.geometry.coordinates as number[][];
     const leftPoint = coords[0];
     const rightPoint = coords[1];
     
-    // 计算断面的中点和方向
-    const midPoint = turf.point([(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2]);
-    const bearing = turf.bearing(turf.point(leftPoint), turf.point(rightPoint));
+    console.log('dragCrossLineTo - leftPoint:', leftPoint, 'rightPoint:', rightPoint);
     
-    // 沿着垂直于断面的方向移动（即沿着母线方向）
-    const perpendicularBearing = bearing + 90;
-    const newMidPoint = turf.destination(midPoint, Math.abs(offsetMeters), offsetMeters > 0 ? perpendicularBearing : perpendicularBearing + 180, { units: 'meters' });
+    // 计算断面的原始中点
+    const oldMidPoint = [(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2];
     
-    // 计算新的端点
-    const halfLength = turf.distance(turf.point(leftPoint), turf.point(rightPoint), { units: 'meters' }) / 2;
-    const newLeftPoint = turf.destination(newMidPoint, halfLength, bearing + 180, { units: 'meters' });
-    const newRightPoint = turf.destination(newMidPoint, halfLength, bearing, { units: 'meters' });
+    // 新的中点就是鼠标位置
+    const newMidPoint = [lngLat.lng, lngLat.lat];
+    
+    console.log('dragCrossLineTo - oldMidPoint:', oldMidPoint, 'newMidPoint:', newMidPoint);
+    
+    // 计算偏移量
+    const offsetLng = newMidPoint[0] - oldMidPoint[0];
+    const offsetLat = newMidPoint[1] - oldMidPoint[1];
+    
+    console.log('dragCrossLineTo - 偏移量:', offsetLng, offsetLat);
+    
+    // 平移两个端点
+    const newLeftPoint = [leftPoint[0] + offsetLng, leftPoint[1] + offsetLat];
+    const newRightPoint = [rightPoint[0] + offsetLng, rightPoint[1] + offsetLat];
+    
+    console.log('dragCrossLineTo - newLeftPoint:', newLeftPoint, 'newRightPoint:', newRightPoint);
     
     // 更新断面，保留crossLineId
-    const updatedFeatures = [...perpendicularData.features];
-    updatedFeatures[selectedCrossLineIndex] = {
+    const updatedFeatures = [...currentData.features];
+    updatedFeatures[currentIndex] = {
       ...selectedLine,
       geometry: {
         type: 'LineString',
-        coordinates: [
-          newLeftPoint.geometry.coordinates,
-          newRightPoint.geometry.coordinates
-        ]
+        coordinates: [newLeftPoint, newRightPoint]
       },
       properties: {
-        crossLineId: selectedLine.properties?.crossLineId ?? selectedCrossLineIndex,
-        distance: selectedLine.properties?.distance,
-        shoreLineIndex: (selectedLine.properties as any)?.shoreLineIndex,
-        shoreLineId: (selectedLine.properties as any)?.shoreLineId,
-        leftPoint: newLeftPoint.geometry.coordinates,
-        rightPoint: newRightPoint.geometry.coordinates,
+        crossLineId: selectedLine.properties?.crossLineId ?? currentIndex,
+        leftPoint: newLeftPoint,
+        rightPoint: newRightPoint,
         analysisConfig: selectedLine.properties?.analysisConfig || globalProperties
       }
     };
     
+    console.log('dragCrossLineTo - 准备更新状态，新features数量:', updatedFeatures.length);
     setPerpendicularData(turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]));
+    perpendicularDataRef.current = turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]);
+    console.log('dragCrossLineTo - 状态已更新');
+  };
+  
+  // 结束拖拽
+  const stopDraggingCrossLine = () => {
+    if (isDraggingCrossLine && selectedCrossLineIndex !== null) {
+      console.log(`结束拖拽断面 #${selectedCrossLineIndex + 1}`);
+    }
+    setIsDraggingCrossLine(false);
   };
   
   // 为选中的断面配置属性
@@ -481,13 +472,6 @@ function EditorPage() {
           globalInterval,
           globalLength
         );
-
-        // 标记每条垂线所属的岸段索引
-        featureCollection.features.forEach(f => {
-          if (!f.properties) f.properties = {};
-          (f.properties as any).shoreLineIndex = index;
-          (f.properties as any).shoreLineId = `line-${index}`;
-        });
         
         allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
       } else if (feature.geometry.type === 'MultiLineString') {
@@ -503,28 +487,17 @@ function EditorPage() {
             globalInterval,
             globalLength
           );
-
-          // MultiLineString 的各段也归属于同一个岸段索引
-          featureCollection.features.forEach(f => {
-            if (!f.properties) f.properties = {};
-            (f.properties as any).shoreLineIndex = index;
-            (f.properties as any).shoreLineId = `line-${index}`;
-          });
           allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
         });
       }
     });
 
-    // 简化断面数据结构：只保留必要的属性，并添加唯一ID，同时保留 distance 与所属岸段
+    // 简化断面数据结构：只保留必要的属性，并添加唯一ID
     allPerpendicularLines.forEach((line, index) => {
-      const props: any = line.properties || {};
-      const leftPoint = props.leftPoint;
-      const rightPoint = props.rightPoint;
+      const leftPoint = line.properties?.leftPoint;
+      const rightPoint = line.properties?.rightPoint;
       line.properties = {
         crossLineId: index,
-        distance: props.distance,
-        shoreLineIndex: props.shoreLineIndex,
-        shoreLineId: props.shoreLineId,
         leftPoint: leftPoint,
         rightPoint: rightPoint,
         analysisConfig: { ...globalProperties }
@@ -543,47 +516,55 @@ function EditorPage() {
       return;
     }
 
-    const taskName = window.prompt('请输入任务名称：', '');
-    if (!taskName) {
+    // 获取任务名称
+    const taskName = prompt('请输入任务名称：');
+    if (!taskName || taskName.trim() === '') {
       alert('任务名称不能为空');
       return;
     }
 
+    // 生成任务UID
     const taskUid = `task-${Date.now()}`;
-
-    // 收集所有垂线数据，包括每条垂线的属性配置
-    const allCrossData = perpendicularData.features.map(line => ({
-      distance: line.properties?.distance ?? 0,
-      left: line.properties?.leftPoint as number[],
-      right: line.properties?.rightPoint as number[],
-      analysisConfig: line.properties?.analysisConfig as typeof ANALYSIS_CONFIG_DEFAULT
-    }));
+    
+    console.log(`创建任务: ${taskName} (UID: ${taskUid})`);
 
     try {
-      // 先向后端创建任务
+      // 1. 先发送任务信息到 /task 接口
       const taskPayload = {
         uid: taskUid,
-        name: taskName,
-        geojson: uploadedFileName || null
+        name: taskName.trim(),
+        geojson: uploadedFileName
       };
+      
+      console.log('向后端发送任务信息:', taskPayload);
+      
+      // const taskResponse = await fetch('http://192.168.1.116:8088/v0/mi/task', {
+      //   method: 'POST',
+      //   headers: { 'Content-Type': 'application/json' },
+      //   body: JSON.stringify(taskPayload)
+      // });
 
-      console.log('创建任务:', taskPayload);
+      // if (!taskResponse.ok) {
+      //   throw new Error(`创建任务失败: ${taskResponse.statusText}`);
+      // }
 
-      const taskResponse = await fetch('http://192.168.1.116:8088/v0/mi/task', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(taskPayload)
-      });
+      // const taskResult = await taskResponse.json();
+      // console.log('任务创建成功:', taskResult);
 
-      if (!taskResponse.ok) {
-        throw new Error(`创建任务失败: ${taskResponse.statusText}`);
-      }
+      // 2. 收集所有垂线数据，包括每条垂线的属性配置
+      const allCrossData = perpendicularData.features.map(line => ({
+        distance: line.properties?.distance ?? 0,
+        left: line.properties?.leftPoint as number[],
+        right: line.properties?.rightPoint as number[],
+        analysisConfig: line.properties?.analysisConfig as typeof ANALYSIS_CONFIG_DEFAULT
+      }));
 
-      // 任务创建成功后，再发送所有断面
-      await sendCrossLinesToBackend(allCrossData, taskUid);
-      alert(`任务已创建并成功发送 ${allCrossData.length} 条断面到后端！`);
+      // 3. 发送所有断面数据
+      await sendCrossLinesToBackend(allCrossData, 'all-lines', taskUid);
+      
+      alert(`任务 "${taskName}" 创建成功！\n任务UID: ${taskUid}\n已发送 ${allCrossData.length} 条垂线到后端`);
     } catch (err) {
-      alert('创建任务或发送断面到后端时出错，请检查控制台');
+      alert('发送数据到后端时出错，请检查控制台');
       console.error(err);
     }
   };
@@ -660,9 +641,6 @@ function EditorPage() {
           // 简化属性结构，保留原ID
           line.properties = {
             crossLineId: lineProp.crossLineId,
-            distance: lineProp.distance,
-            shoreLineIndex: lineProp.shoreLineIndex,
-            shoreLineId: lineProp.shoreLineId,
             leftPoint: newLeft,
             rightPoint: newRight,
             analysisConfig: editingGroup.properties || { ...globalProperties }
@@ -742,14 +720,10 @@ function EditorPage() {
       // 简化垂线属性结构，添加新ID
       const startId = updatedLines.length;
       featureCollection.features.forEach((line, idx) => {
-        const props: any = line.properties || {};
-        const leftPoint = props.leftPoint;
-        const rightPoint = props.rightPoint;
+        const leftPoint = line.properties?.leftPoint;
+        const rightPoint = line.properties?.rightPoint;
         line.properties = {
           crossLineId: startId + idx,
-          distance: props.distance,
-          shoreLineIndex: editingGroup.lineIndex,
-          shoreLineId: editingGroup.lineIndex !== undefined ? `line-${editingGroup.lineIndex}` : undefined,
           leftPoint: leftPoint,
           rightPoint: rightPoint,
           analysisConfig: editingGroup.properties || { ...globalProperties }
@@ -779,15 +753,12 @@ function EditorPage() {
   };
 
   // 处理文件上传
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // 记录上传文件名，供任务使用
-    setUploadedFileName(file.name);
-
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const json = JSON.parse(event.target?.result as string);
         const geojson = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
@@ -800,29 +771,37 @@ function EditorPage() {
           feature.properties.index = index;
         });
         
+        // 保存文件名
+        setUploadedFileName(file.name);
+        
+        // 发送 GeoJSON 到后端
+        try {
+          console.log('向后端发送 GeoJSON 文件:', file.name);
+          const response = await fetch('http://192.168.1.116:8088/v0/mi/geojson', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: file.name,
+              data: geojson
+            })
+          });
+
+          if (!response.ok) {
+            console.error('发送 GeoJSON 到后端失败:', response.statusText);
+          } else {
+            const result = await response.json();
+            console.log('GeoJSON 已成功发送到后端:', result);
+          }
+        } catch (err) {
+          console.error('发送 GeoJSON 到后端时出错:', err);
+          // 不阻止前端加载，只是记录错误
+        }
+        
         setUploadedData(geojson);
         // 重置选择状态
         setSelectedLines(new Set());
         setIsSelectingShoreLines(false);
         setIsSelectingStartEnd(false);
-
-        // 异步将 GeoJSON 发送到后端
-        fetch('http://192.168.1.116:8088/v0/mi/geojson', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: file.name,
-            data: geojson
-          })
-        }).then(res => {
-          if (!res.ok) {
-            console.error('上传 GeoJSON 到后端失败:', res.status, res.statusText);
-          } else {
-            console.log('GeoJSON 已发送到后端');
-          }
-        }).catch(err => {
-          console.error('上传 GeoJSON 到后端出错:', err);
-        });
 
         if (mapRef.current && geojson.features.length > 0) {
           const bbox = turf.bbox(geojson);
@@ -1116,69 +1095,48 @@ function EditorPage() {
       const hitLayers = ['uploaded-lines-hit-target'];
       const crossLineHitLayers = ['perpendicular-lines-hit-target'];
 
-      // 点击事件处理
-      map.on('click', (e) => {
-        // 模式3：断面编辑模式
-        if (isSelectingCrossLinesRef.current) {
-          const editMode = crossLineEditModeRef.current;
+      // mousedown事件：开始拖拽断面
+      map.on('mousedown', crossLineHitLayers, (e) => {
+        if (isSelectingCrossLinesRef.current && e.originalEvent.button === 0) {
+          const crossLineFeatures = map.queryRenderedFeatures(e.point, { layers: crossLineHitLayers });
+          console.log('mousedown - 查询到断面:', crossLineFeatures?.length);
           
-          if (editMode === 'select') {
-            // 选择现有断面
-            const crossLineFeatures = map.queryRenderedFeatures(e.point, { layers: crossLineHitLayers });
-            console.log(`点击断面，查询到 ${crossLineFeatures?.length || 0} 个要素`);
+          if (crossLineFeatures && crossLineFeatures.length > 0) {
+            const clickedFeature = crossLineFeatures[0];
+            const crossLineId = clickedFeature.properties?.crossLineId;
             
-            if (crossLineFeatures && crossLineFeatures.length > 0) {
-              const clickedFeature = crossLineFeatures[0];
-              const crossLineId = clickedFeature.properties?.crossLineId;
-              
-              console.log(`点击的断面ID: ${crossLineId}`);
-              
-              if (crossLineId !== undefined && crossLineId !== null) {
-                setSelectedCrossLineIndex(crossLineId);
-                console.log(`选中断面索引: ${crossLineId}`);
-              } else {
-                console.warn('断面没有crossLineId属性，尝试坐标匹配');
-                // 备用方案：使用坐标匹配
-                if (perpendicularData) {
-                  const clickedGeometry = clickedFeature.geometry as GeoJSON.LineString;
-                  const clickedCoords = clickedGeometry.coordinates;
-                  
-                  const index = perpendicularData.features.findIndex(feature => {
-                    if (feature.geometry.type !== 'LineString') return false;
-                    const coords = feature.geometry.coordinates;
-                    const tolerance = 0.00001;
-                    return Math.abs(coords[0][0] - clickedCoords[0][0]) < tolerance && 
-                           Math.abs(coords[0][1] - clickedCoords[0][1]) < tolerance &&
-                           Math.abs(coords[1][0] - clickedCoords[1][0]) < tolerance && 
-                           Math.abs(coords[1][1] - clickedCoords[1][1]) < tolerance;
-                  });
-                  
-                  if (index !== -1) {
-                    setSelectedCrossLineIndex(index);
-                    console.log(`通过坐标匹配选中断面索引: ${index}`);
-                  } else {
-                    console.warn('无法通过坐标匹配找到断面');
-                  }
-                }
-              }
-            }
-          } else if (editMode === 'add') {
-            // 新建断面：点击岸段上的点
-            const shoreLineFeatures = map.queryRenderedFeatures(e.point, { layers: hitLayers });
+            console.log('mousedown - 断面ID:', crossLineId);
             
-            if (shoreLineFeatures && shoreLineFeatures.length > 0) {
-              const clickedFeature = shoreLineFeatures[0];
-              const lineGeo = clickedFeature.geometry as GeoJSON.LineString;
-              const lineFeature = turf.feature(lineGeo, clickedFeature.properties) as GeoJSON.Feature<GeoJSON.LineString>;
-              
-              // 计算点击位置在线上的距离
-              const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-              const distanceOnLine = snapped.properties.location ?? 0;
-              
-              console.log(`点击岸段新建断面，距离: ${distanceOnLine.toFixed(2)}m`);
-              createCrossLineAtPoint(lineFeature, distanceOnLine);
+            if (crossLineId !== undefined && crossLineId !== null) {
+              startDraggingCrossLine(crossLineId);
+              e.preventDefault();
+              console.log('mousedown - 已调用startDraggingCrossLine');
             }
           }
+        }
+      });
+      
+      // mousemove事件：拖拽断面
+      map.on('mousemove', (e) => {
+        const isDragging = isDraggingCrossLineRef.current;
+        if (isDragging) {
+          console.log('mousemove - 正在拖拽, 位置:', e.lngLat.lng, e.lngLat.lat);
+          dragCrossLineTo(e.lngLat);
+          e.preventDefault();
+        }
+      });
+      
+      // mouseup事件：结束拖拽
+      map.on('mouseup', () => {
+        if (isDraggingCrossLineRef.current) {
+          stopDraggingCrossLine();
+        }
+      });
+
+      // 点击事件处理（保留原有的岸段和起止点选择逻辑）
+      map.on('click', (e) => {
+        // 断面选择模式下跳过click事件（使用mousedown/mousemove/mouseup处理拖拽）
+        if (isSelectingCrossLinesRef.current) {
           return;
         }
         
@@ -1280,47 +1238,8 @@ function EditorPage() {
         }
       });
 
-      // 断面鼠标悬停效果
-      map.on('mousemove', crossLineHitLayers, (e) => {
-        if (isSelectingCrossLinesRef.current && crossLineEditModeRef.current === 'select') {
-          map.getCanvas().style.cursor = 'pointer';
-          
-          // 显示断面中点作为视觉反馈
-          const features = e.features;
-          if (features && features.length > 0) {
-            const feature = features[0];
-            const geometry = feature.geometry as GeoJSON.LineString;
-            const coords = geometry.coordinates;
-            
-            // 计算中点
-            const midPoint = turf.point([
-              (coords[0][0] + coords[1][0]) / 2,
-              (coords[0][1] + coords[1][1]) / 2
-            ]);
-            
-            const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-            if (source) source.setData(midPoint);
-          }
-        }
-      });
-      
-      // 新建模式下，在岸段上显示吸附点
+      // 鼠标移动处理：实现吸附视觉反馈（只在激活模式下）
       map.on('mousemove', hitLayers, (e) => {
-        if (isSelectingCrossLinesRef.current && crossLineEditModeRef.current === 'add') {
-          map.getCanvas().style.cursor = 'crosshair';
-          
-          const feature = e.features?.[0];
-          if (!feature) return;
-
-          const lineGeo = feature.geometry as GeoJSON.LineString;
-          const lineFeature = turf.feature(lineGeo) as GeoJSON.Feature<GeoJSON.LineString>;
-
-          const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-          const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-          if (source) source.setData(snapped);
-          return;
-        }
-        
         // 只在选择岸段或选择起止点模式下显示吸附效果
         if (!isSelectingShoreLinesRef.current && !isSelectingStartEndRef.current) {
           return;
@@ -1349,8 +1268,8 @@ function EditorPage() {
       
       // 断面鼠标悬停效果
       map.on('mousemove', crossLineHitLayers, (e) => {
-        if (isSelectingCrossLinesRef.current) {
-          map.getCanvas().style.cursor = 'pointer';
+        if (isSelectingCrossLinesRef.current && !isDraggingCrossLineRef.current) {
+          map.getCanvas().style.cursor = 'grab';
           
           // 显示断面中点作为视觉反馈
           const features = e.features;
@@ -1368,6 +1287,8 @@ function EditorPage() {
             const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
             if (source) source.setData(midPoint);
           }
+        } else if (isDraggingCrossLineRef.current) {
+          map.getCanvas().style.cursor = 'grabbing';
         }
       });
       
@@ -1703,63 +1624,14 @@ function EditorPage() {
             onClick={toggleCrossLineSelection}
             style={{marginBottom: '10px'}}
           >
-            {isSelectingCrossLines ? '✅ 断面编辑已开启' : '🎯 开启断面编辑'}
+            {isSelectingCrossLines ? '✅ 断面拖拽模式已开启' : '🎯 开启断面拖拽'}
           </button>
-          
-          {isSelectingCrossLines && (
-            <div style={{marginBottom: '10px', display: 'flex', gap: '5px'}}>
-              <button
-                className={`toggle-button ${crossLineEditMode === 'select' ? 'active' : ''}`}
-                onClick={() => {
-                  setCrossLineEditMode('select');
-                  setSelectedCrossLineIndex(null);
-                }}
-                style={{flex: 1}}
-              >
-                ✏️ 选择断面
-              </button>
-              <button
-                className={`toggle-button ${crossLineEditMode === 'add' ? 'active' : ''}`}
-                onClick={() => {
-                  setCrossLineEditMode('add');
-                  setSelectedCrossLineIndex(null);
-                }}
-                style={{flex: 1}}
-              >
-                ➕ 新建断面
-              </button>
-            </div>
-          )}
-          
           {selectedCrossLineIndex !== null && (
             <div style={{marginBottom: '10px', padding: '10px', backgroundColor: '#f0f9ff', borderRadius: '4px'}}>
-              <p style={{margin: '0 0 10px 0', fontWeight: 'bold', color: '#0369a1'}}>已选中断面 #{selectedCrossLineIndex + 1}</p>
-              <div style={{display: 'flex', gap: '5px', flexWrap: 'wrap'}}>
-                <button 
-                  onClick={() => translateSelectedCrossLine(-10)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ⬅️ -10m
-                </button>
-                <button 
-                  onClick={() => translateSelectedCrossLine(-1)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ⬅️ -1m
-                </button>
-                <button 
-                  onClick={() => translateSelectedCrossLine(1)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ➡️ +1m
-                </button>
-                <button 
-                  onClick={() => translateSelectedCrossLine(10)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ➡️ +10m
-                </button>
-              </div>
+              <p style={{margin: '0 0 10px 0', fontWeight: 'bold', color: '#0369a1'}}>
+                已选中断面 #{selectedCrossLineIndex + 1}
+                {isDraggingCrossLine && <span style={{color: '#16a34a'}}> （拖拽中...）</span>}
+              </p>
               <div style={{display: 'flex', gap: '5px', marginTop: '10px'}}>
                 <button 
                   onClick={configureSelectedCrossLineProperties}
@@ -1777,12 +1649,7 @@ function EditorPage() {
             </div>
           )}
           <p style={{fontSize: '13px', color: '#64748b', margin: '5px 0'}}>
-            {isSelectingCrossLines 
-              ? (crossLineEditMode === 'select' 
-                  ? '💡 点击地图上的断面进行选择' 
-                  : '💡 点击岸段上的点新建断面')
-              : '点击上方按钮开启断面编辑模式'
-            }
+            {isSelectingCrossLines ? '💡 按住鼠标左键拖拽断面到任意位置' : '点击上方按钮开启断面拖拽模式'}
           </p>
         </div>
         
