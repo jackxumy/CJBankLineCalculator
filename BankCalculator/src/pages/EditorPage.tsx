@@ -7,37 +7,39 @@ import '../App.css';
 // 设置Mapbox访问令牌
 mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg'
 
-// 分析配置默认值
-const ANALYSIS_CONFIG_DEFAULT = {
-  "bench-id": "tiff/Mzs/2012/standard/201210/201210.tif",
-  "ref-id": "tiff/Mzs/2023/standard/202304/202304.tif",
-  "dem-id": "tiff/Mzs/2023/standard/202304/202304.tif",
-  "current-timepoint": "2024-01-15",
-  "comparison-timepoint": "2020-01-15",
-  "segment": "Mzs",
-  "year": "2023",
-  "set": "standard",
-  "water-qs": "45000",
-  "tidal-level": "zc",
-  "hs": 0.5,
-  "hc": 2,
-  "protection-level": "systemic",
-  "control-level": "strict",
-  "risk-thresholds": {
-    "Zb": [20, 30, 40],
-    "Sa": [0.2, 0.3, 0.5],
-    "Ln": [0.04, 0.12, 0.2],
-    "PQ": [0.5, 1, 2.3],
-    "Ky": [1.7, 1.35, 1],
-    "Zd": [0.1, 0.15, 0.3],
-    "Dsed": [0.7, 1, 1.5],
-    "all": [0.25, 0.5, 0.75]
-  },
-  "wNM": [0.43, 0.32, 0.25],
-  "wRE": [0.48, 0.16, 0.36],
-  "wGE": [0.6, 0.2, 0.2],
-  "wRL": [0.32, 0.43, 0.25]
-};
+// 断面参数接口（从后端获取）
+interface SectionParams {
+  param_name?: string;
+  segment?: string;
+  current_timepoint?: string;
+  set_name?: string;
+  water_qs?: string;
+  tidal_level?: string;
+  bench_id?: string;
+  ref_id?: string;
+  hs?: number;
+  hc?: number;
+  protection_level?: string;
+  control_level?: string;
+  comparison_timepoint?: string;
+  risk_thresholds?: {
+    Dsed?: number[];
+    Zb?: number[];
+    Sa?: number[];
+    Ln?: number[];
+    PQ?: number[];
+    Ky?: number[];
+    Zd?: number[];
+    all?: number[];
+  };
+  weights?: {
+    wRE?: number[];
+    wNM?: number[];
+    wGE?: number[];
+    wRL?: number[];
+  };
+  other_params?: Record<string, any>;
+}
 
 /**
  * 在线上以固定间距生成垂线
@@ -130,62 +132,141 @@ interface SelectionGroup {
   length: number;
   crossData: { distance: number; left: number[]; right: number[] }[];
   // 该组的属性配置（如果未设置则使用全局配置）
-  properties?: Partial<typeof ANALYSIS_CONFIG_DEFAULT>;
+  properties?: SectionParams;
 }
 
-/**
- * 将垂线数据发送到后端进行分析
- * @param crossData 垂线端点数据数组
- * @param groupId 组ID（用于日志）
- */
-async function sendCrossLinesToBackend(
-  crossData: { distance: number; left: number[]; right: number[]; analysisConfig?: typeof ANALYSIS_CONFIG_DEFAULT }[],
-  groupId: string
-) {
-  console.log(`开始向后端发送组 ${groupId} 的 ${crossData.length} 条垂线数据...`);
+// 新增：当前任务ID状态
+let currentTaskId: string | null = null;
+let currentBasicParamId: number | null = null; // 默认基础参数ID
+
+// 确保默认基础参数存在
+const ensureDefaultBasicParams = async (): Promise<number | null> => {
+  // 如果已经有缓存的ID，直接返回
+  if (currentBasicParamId !== null) {
+    return currentBasicParamId;
+  }
 
   try {
-    const promises = crossData.map(async (item, index) => {
-      // 为每一条断面生成简单的 UID
-      const sectionUid = `crossline-${Date.now()}-${index + 1}`;
-      const payload = {
-        uid: sectionUid,
-        ...(item.analysisConfig || ANALYSIS_CONFIG_DEFAULT),
-        "section-geometry": {
-          "type": "Feature",
-          "properties": { "distance": item.distance, "index": index },
-          "geometry": { 
-            "type": "LineString", 
-            "coordinates": [item.left, item.right] 
+    // 先尝试获取现有的基础参数列表
+    const listResponse = await fetch('/v0/bank/basic-params');
+    if (listResponse.ok) {
+      const listData = await listResponse.json();
+      if (listData.success && listData.params && listData.params.length > 0) {
+        // 使用第一个基础参数
+        currentBasicParamId = listData.params[0].id;
+        console.log('使用现有基础参数:', currentBasicParamId);
+        return currentBasicParamId;
+      }
+    }
+
+    // 如果没有基础参数，创建一个默认的
+    console.log('创建默认基础参数模板...');
+    const defaultParams = {
+      params: [
+        {
+          param_id: `PARAM_DEFAULT_${Date.now()}`,
+          param_name: '默认参数模板',
+          segment: 'Mzs',
+          current_timepoint: new Date().toISOString().split('T')[0],
+          set_name: 'standard',
+          water_qs: '45000',
+          tidal_level: 'zc',
+          bench_id: 'dem_2024.tif',
+          ref_id: 'dem_2020.tif',
+          hs: 0.5,
+          hc: 2.0,
+          protection_level: 'systemic',
+          control_level: 'strict',
+          comparison_timepoint: '2020-01-15',
+          risk_thresholds: {
+            Dsed: [0.3, 0.5, 0.7],
+            Zb: [2.0, 4.0, 6.0],
+            Sa: [15, 25, 35],
+            Ln: [0.5, 1.0, 1.5],
+            PQ: [1000, 2000, 3000],
+            Ky: [0.5, 0.3, 0.1],
+            Zd: [0.1, 0.2, 0.3],
+            all: [0.2, 0.4, 0.6]
+          },
+          weights: {
+            wRE: [0.3, 0.4, 0.3],
+            wNM: [0.4, 0.3, 0.3],
+            wGE: [0.4, 0.4, 0.2],
+            wRL: [0.3, 0.3, 0.4]
+          },
+          other_params: {
+            note: '系统自动创建的默认参数'
           }
         }
-      };
+      ],
+      overwrite: false
+    };
 
-      console.log(`正在发送垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m, uid: ${sectionUid}):`, payload);
-
-      const response = await fetch('http://192.168.1.116:8088/v0/mi/risk-level', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        throw new Error(`请求失败: ${response.statusText}`);
-      }
-
-      const result = await response.json();
-      console.log(`垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m) 已发送`);
-      return result;
+    const createResponse = await fetch('/v0/bank/basic-params', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(defaultParams)
     });
 
-    const results = await Promise.all(promises);
-    console.log(`组 ${groupId} 的所有垂线数据已成功发送到后端`);
-    return results;
-  } catch (error) {
-    console.error(`发送组 ${groupId} 的垂线数据时出错:`, error);
-    throw error;
+    if (!createResponse.ok) {
+      console.error('创建默认基础参数失败:', createResponse.statusText);
+      return null;
+    }
+
+    const createData = await createResponse.json();
+    if (createData.success && createData.params && createData.params.length > 0) {
+      currentBasicParamId = createData.params[0].id;
+      console.log('默认基础参数创建成功，ID:', currentBasicParamId);
+      return currentBasicParamId;
+    }
+
+    return null;
+  } catch (err) {
+    console.error('确保默认基础参数出错:', err);
+    return null;
   }
-}
+};
+
+// 从后端获取断面参数
+const fetchSectionParams = async (sectionId: string): Promise<SectionParams | null> => {
+  try {
+    const response = await fetch(`/v0/bank/sections/${sectionId}`);
+    if (!response.ok) {
+      console.error(`获取断面参数失败: ${response.statusText}`);
+      return null;
+    }
+    const data = await response.json();
+    if (!data.success || !data.section) {
+      console.error('断面数据格式错误');
+      return null;
+    }
+    
+    // 提取参数字段
+    const params: SectionParams = {
+      param_name: data.section.param_name,
+      segment: data.section.segment,
+      current_timepoint: data.section.current_timepoint,
+      set_name: data.section.set_name,
+      water_qs: data.section.water_qs,
+      tidal_level: data.section.tidal_level,
+      bench_id: data.section.bench_id,
+      ref_id: data.section.ref_id,
+      hs: data.section.hs,
+      hc: data.section.hc,
+      protection_level: data.section.protection_level,
+      control_level: data.section.control_level,
+      comparison_timepoint: data.section.comparison_timepoint,
+      risk_thresholds: data.section.risk_thresholds,
+      weights: data.section.weights,
+      other_params: data.section.other_params
+    };
+    
+    return params;
+  } catch (err) {
+    console.error('获取断面参数出错:', err);
+    return null;
+  }
+};
 
 function EditorPage() {
   const mapContainer = useRef<HTMLDivElement | null>(null);
@@ -212,7 +293,7 @@ function EditorPage() {
   const [showCrossLines, setShowCrossLines] = useState<boolean>(true);
   
   // 全局属性配置
-  const [globalProperties, setGlobalProperties] = useState(ANALYSIS_CONFIG_DEFAULT);
+  const [globalProperties, setGlobalProperties] = useState<SectionParams | null>(null);
   const globalPropertiesRef = useRef(globalProperties);
   useEffect(() => { globalPropertiesRef.current = globalProperties; }, [globalProperties]);
   // 属性配置弹窗状态
@@ -312,7 +393,19 @@ function EditorPage() {
   };
   
   // 在指定位置新建断面
-  const createCrossLineAtPoint = (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => {
+  const createCrossLineAtPoint = async (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => {
+    if (!currentTaskId) {
+      alert('未找到任务ID，请先创建任务');
+      return;
+    }
+
+    // 确保基础参数存在
+    const basicParamId = await ensureDefaultBasicParams();
+    if (!basicParamId) {
+      alert('获取默认参数失败');
+      return;
+    }
+
     // 先根据当前点击位置计算几何信息
     const pointOnLine = turf.along(line, distanceOnLine, { units: 'meters' });
     const lineLength = turf.length(line, { units: 'meters' });
@@ -338,56 +431,148 @@ function EditorPage() {
     const parentIndex = (line.properties as any)?.index;
     const parentId = parentIndex !== undefined ? `line-${parentIndex}` : undefined;
 
-    // 使用函数式更新，避免闭包中拿到过期的 perpendicularData
-    setPerpendicularData(prev => {
-      const existing = prev ? (prev.features as GeoJSON.Feature<GeoJSON.LineString>[]) : [];
-      const newCrossLineId = existing.length;
+    // 构建新断面几何
+    const newGeometry: GeoJSON.LineString = {
+      type: 'LineString',
+      coordinates: [leftCoords, rightCoords]
+    };
 
-      const newCrossLine: GeoJSON.Feature<GeoJSON.LineString> = {
-        type: 'Feature',
-        properties: {
-          crossLineId: newCrossLineId,
-          distance: distanceOnLine,
-          shoreLineIndex: parentIndex,
-          shoreLineId: parentId,
-          leftPoint: leftCoords,
-          rightPoint: rightCoords,
-          analysisConfig: { ...globalPropertiesRef.current }
-        },
-        geometry: {
-          type: 'LineString',
-          coordinates: [leftCoords, rightCoords]
-        }
+    try {
+      // 先发送到后端创建断面
+      const sectionId = `sec-${currentTaskId}-new-${Date.now()}`;
+      const newSectionIndex = perpendicularData ? perpendicularData.features.length : 0;
+
+      const sectionsPayload = {
+        task_id: currentTaskId,
+        sections: [
+          {
+            section_id: sectionId,
+            section_name: `新建断面${newSectionIndex + 1}`,
+            distance: distanceOnLine,
+            bank_id: parentId || 'line-0',
+            region_code: 'Mzs',
+            segment_index: newSectionIndex,
+            geometry: newGeometry,
+            section_geometry: newGeometry,
+            basic_param_id: basicParamId
+          }
+        ],
+        inherit_from_basic_param: true,
+        overwrite: false
       };
 
-      const newFeatures = [...existing, newCrossLine];
-      console.log(`新建断面 #${newCrossLineId + 1}，位置: ${distanceOnLine.toFixed(2)}m，当前总数: ${newFeatures.length}`);
-      return turf.featureCollection(newFeatures);
-    });
+      const response = await fetch('/v0/bank/sections', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sectionsPayload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`创建断面失败: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      console.log('断面创建成功:', result);
+
+      // 获取断面参数
+      if (result.success && result.sections && result.sections.length > 0) {
+        const createdSection = result.sections[0];
+        const params = await fetchSectionParams(createdSection.section_id);
+        if (params) {
+          console.log('获取到断面参数:', params);
+          // 如果这是第一个断面，设置为全局参数
+          if (!globalPropertiesRef.current) {
+            setGlobalProperties(params);
+          }
+        }
+      }
+
+      // 使用函数式更新前端状态
+      setPerpendicularData(prev => {
+        const existing = prev ? (prev.features as GeoJSON.Feature<GeoJSON.LineString>[]) : [];
+        const newCrossLineId = existing.length;
+
+        const newCrossLine: GeoJSON.Feature<GeoJSON.LineString> = {
+          type: 'Feature',
+          properties: {
+            sectionId: sectionId,
+            crossLineId: newCrossLineId,
+            distance: distanceOnLine,
+            shoreLineIndex: parentIndex,
+            shoreLineId: parentId,
+            leftPoint: leftCoords,
+            rightPoint: rightCoords
+          },
+          geometry: newGeometry
+        };
+
+        const newFeatures = [...existing, newCrossLine];
+        console.log(`新建断面 #${newCrossLineId + 1}，位置: ${distanceOnLine.toFixed(2)}m，当前总数: ${newFeatures.length}`);
+        return turf.featureCollection(newFeatures);
+      });
+    } catch (err: any) {
+      console.error('新建断面失败:', err);
+      alert(`新建断面失败: ${err.message}`);
+    }
   };
   
   // 删除选中的断面
-  const deleteSelectedCrossLine = () => {
+  const deleteSelectedCrossLine = async () => {
     if (selectedCrossLineIndex === null || !perpendicularData) {
       alert('请先选择要删除的断面');
       return;
     }
-    
-    const updatedFeatures = perpendicularData.features.filter((_, index) => index !== selectedCrossLineIndex);
-    // 重新分配ID
-    updatedFeatures.forEach((feature, index) => {
-      if (feature.properties) {
-        feature.properties.crossLineId = index;
+
+    const features = perpendicularData.features as GeoJSON.Feature<GeoJSON.LineString>[];
+    const selectedFeature = features[selectedCrossLineIndex];
+    const sectionId = selectedFeature.properties?.sectionId;
+
+    if (!sectionId) {
+      // 如果没有 sectionId，说明未同步到后端，仅删除前端
+      const updatedFeatures = perpendicularData.features.filter((_, index) => index !== selectedCrossLineIndex);
+      // 重新分配ID
+      updatedFeatures.forEach((feature, index) => {
+        if (feature.properties) {
+          feature.properties.crossLineId = index;
+        }
+      });
+      setPerpendicularData(turf.featureCollection(updatedFeatures));
+      setSelectedCrossLineIndex(null);
+      console.log('已删除未同步断面');
+      alert('已删除选中的断面');
+      return;
+    }
+
+    try {
+      // 调用后端删除接口
+      const response = await fetch(`/v0/bank/sections/${sectionId}`, {
+        method: 'DELETE'
+      });
+
+      if (!response.ok) {
+        throw new Error(`删除断面失败: ${response.statusText}`);
       }
-    });
-    setPerpendicularData(turf.featureCollection(updatedFeatures));
-    setSelectedCrossLineIndex(null);
-    console.log('已删除断面，剩余断面数:', updatedFeatures.length);
-    alert('已删除选中的断面');
+
+      // 删除成功后更新前端
+      const updatedFeatures = perpendicularData.features.filter((_, index) => index !== selectedCrossLineIndex);
+      // 重新分配ID
+      updatedFeatures.forEach((feature, index) => {
+        if (feature.properties) {
+          feature.properties.crossLineId = index;
+        }
+      });
+      setPerpendicularData(turf.featureCollection(updatedFeatures));
+      setSelectedCrossLineIndex(null);
+      console.log(`已从后端删除断面: ${sectionId}`);
+      alert('已删除选中的断面');
+    } catch (err: any) {
+      console.error('删除断面失败:', err);
+      alert(`删除断面失败: ${err.message}`);
+    }
   };
   
   // 平移选中的断面
-  const translateSelectedCrossLine = (offsetMeters: number) => {
+  const translateSelectedCrossLine = async (offsetMeters: number) => {
     if (selectedCrossLineIndex === null || !perpendicularData) {
       alert('请先选择要平移的断面');
       return;
@@ -412,44 +597,108 @@ function EditorPage() {
     const halfLength = turf.distance(turf.point(leftPoint), turf.point(rightPoint), { units: 'meters' }) / 2;
     const newLeftPoint = turf.destination(newMidPoint, halfLength, bearing + 180, { units: 'meters' });
     const newRightPoint = turf.destination(newMidPoint, halfLength, bearing, { units: 'meters' });
-    
-    // 更新断面，保留crossLineId
-    const updatedFeatures = [...perpendicularData.features];
-    updatedFeatures[selectedCrossLineIndex] = {
-      ...selectedLine,
-      geometry: {
-        type: 'LineString',
-        coordinates: [
-          newLeftPoint.geometry.coordinates,
-          newRightPoint.geometry.coordinates
-        ]
-      },
-      properties: {
-        crossLineId: selectedLine.properties?.crossLineId ?? selectedCrossLineIndex,
-        distance: selectedLine.properties?.distance,
-        shoreLineIndex: (selectedLine.properties as any)?.shoreLineIndex,
-        shoreLineId: (selectedLine.properties as any)?.shoreLineId,
-        leftPoint: newLeftPoint.geometry.coordinates,
-        rightPoint: newRightPoint.geometry.coordinates,
-        analysisConfig: selectedLine.properties?.analysisConfig || globalProperties
-      }
+
+    const newGeometry: GeoJSON.LineString = {
+      type: 'LineString',
+      coordinates: [
+        newLeftPoint.geometry.coordinates,
+        newRightPoint.geometry.coordinates
+      ]
     };
-    
-    setPerpendicularData(turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]));
+
+    const sectionId = selectedLine.properties?.sectionId;
+
+    if (!sectionId) {
+      // 如果没有 sectionId，说明未同步到后端，仅更新前端
+      const updatedFeatures = [...perpendicularData.features];
+      updatedFeatures[selectedCrossLineIndex] = {
+        ...selectedLine,
+        geometry: newGeometry,
+        properties: {
+          ...selectedLine.properties,
+          crossLineId: selectedLine.properties?.crossLineId ?? selectedCrossLineIndex,
+          leftPoint: newLeftPoint.geometry.coordinates,
+          rightPoint: newRightPoint.geometry.coordinates
+        }
+      };
+      setPerpendicularData(turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]));
+      console.log('已平移未同步断面');
+      return;
+    }
+
+    try {
+      // 调用后端更新断面几何
+      const response = await fetch(`/v0/bank/sections/${sectionId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          geometry: newGeometry,
+          section_geometry: newGeometry
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`更新断面几何失败: ${response.statusText}`);
+      }
+
+      // 更新成功后更新前端
+      const updatedFeatures = [...perpendicularData.features];
+      updatedFeatures[selectedCrossLineIndex] = {
+        ...selectedLine,
+        geometry: newGeometry,
+        properties: {
+          ...selectedLine.properties,
+          crossLineId: selectedLine.properties?.crossLineId ?? selectedCrossLineIndex,
+          leftPoint: newLeftPoint.geometry.coordinates,
+          rightPoint: newRightPoint.geometry.coordinates
+        }
+      };
+      setPerpendicularData(turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]));
+      console.log(`已更新后端断面几何: ${sectionId}`);
+    } catch (err: any) {
+      console.error('平移断面失败:', err);
+      alert(`平移断面失败: ${err.message}`);
+    }
   };
   
   // 为选中的断面配置属性
-  const configureSelectedCrossLineProperties = () => {
+  const configureSelectedCrossLineProperties = async () => {
     if (selectedCrossLineIndex === null || !perpendicularData) {
       alert('请先选择要配置的断面');
       return;
     }
-    // 打开属性配置弹窗（使用特殊的ID标识单个断面）
-    setEditingPropertiesGroupId(`cross-line-${selectedCrossLineIndex}`);
+    
+    const selectedLine = perpendicularData.features[selectedCrossLineIndex];
+    const sectionId = (selectedLine.properties as any)?.sectionId;
+    
+    if (!sectionId) {
+      alert('未找到断面ID，请先重新生成断面');
+      return;
+    }
+
+    try {
+      // 从后端获取断面详情（包含参数）
+      const response = await fetch(`/v0/bank/sections/${sectionId}`);
+      if (!response.ok) {
+        throw new Error(`获取断面参数失败: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      if (data.success && data.section) {
+        // 将后端参数映射到前端格式并打开配置弹窗
+        const backendParams = data.section;
+        // 存储后端返回的完整参数供弹窗使用
+        (selectedLine.properties as any).backendParams = backendParams;
+        setEditingPropertiesGroupId(`cross-line-${selectedCrossLineIndex}`);
+      }
+    } catch (err: any) {
+      console.error('获取断面参数失败:', err);
+      alert(`获取断面参数失败: ${err.message}`);
+    }
   };
 
   // 核心逻辑：基于上传的 GeoJSON 和全局配置生成所有垂线
-  const handleGenerateSections = () => {
+  const handleGenerateSections = async () => {
     if (!uploadedData) {
       alert('请先上传 GeoJSON 数据');
       return;
@@ -460,40 +709,67 @@ function EditorPage() {
       return;
     }
 
-    const allPerpendicularLines: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-
-    uploadedData.features.forEach((feature, index) => {
-      const lineId = `line-${index}`;
-      
-      // 只处理选中的线段
-      if (!selectedLines.has(lineId)) {
+    try {
+      // 0. 确保默认基础参数存在
+      const basicParamId = await ensureDefaultBasicParams();
+      if (!basicParamId) {
+        alert('初始化默认参数失败，请检查后端连接');
         return;
       }
-      
-      if (feature.geometry.type === 'LineString') {
-        const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
-        const lineLengthMeters = turf.length(line, { units: 'meters' });
-        
-        const { featureCollection } = generatePerpendicularLines(
-          line,
-          0,
-          lineLengthMeters,
-          globalInterval,
-          globalLength
-        );
 
-        // 标记每条垂线所属的岸段索引
-        featureCollection.features.forEach(f => {
-          if (!f.properties) f.properties = {};
-          (f.properties as any).shoreLineIndex = index;
-          (f.properties as any).shoreLineId = `line-${index}`;
-        });
+      // 1. 先创建任务
+      const taskName = window.prompt('请输入任务名称：', '岸线分析任务');
+      if (!taskName) {
+        alert('任务名称不能为空');
+        return;
+      }
+
+      const taskId = `task-${Date.now()}`;
+      currentTaskId = taskId;
+
+      // 收集选中的岸段ID
+      const selectedBankIds: string[] = [];
+      selectedLines.forEach(lineId => {
+        selectedBankIds.push(lineId);
+      });
+
+      const taskPayload = {
+        tasks: [
+          {
+            task_id: taskId,
+            task_name: taskName,
+            bank_ids: selectedBankIds,
+            description: `通过前端创建的任务: ${taskName}`
+          }
+        ],
+        overwrite: false
+      };
+
+      console.log('创建任务:', taskPayload);
+      const taskResponse = await fetch('/v0/bank/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(taskPayload)
+      });
+
+      if (!taskResponse.ok) {
+        throw new Error(`创建任务失败: ${taskResponse.statusText}`);
+      }
+
+      // 2. 生成断面数据
+      const allPerpendicularLines: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+      const sectionsToCreate: any[] = [];
+
+      uploadedData.features.forEach((feature, index) => {
+        const lineId = `line-${index}`;
         
-        allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
-      } else if (feature.geometry.type === 'MultiLineString') {
-        const multiLine = feature.geometry as GeoJSON.MultiLineString;
-        multiLine.coordinates.forEach(coords => {
-          const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
+        // 只处理选中的线段
+        if (!selectedLines.has(lineId)) {
+          return;
+        }
+        
+        if (feature.geometry.type === 'LineString') {
+          const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
           const lineLengthMeters = turf.length(line, { units: 'meters' });
           
           const { featureCollection } = generatePerpendicularLines(
@@ -504,87 +780,148 @@ function EditorPage() {
             globalLength
           );
 
-          // MultiLineString 的各段也归属于同一个岸段索引
+          // 标记每条垂线所属的岸段索引
           featureCollection.features.forEach(f => {
             if (!f.properties) f.properties = {};
             (f.properties as any).shoreLineIndex = index;
-            (f.properties as any).shoreLineId = `line-${index}`;
+            (f.properties as any).shoreLineId = lineId;
           });
+          
           allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+        } else if (feature.geometry.type === 'MultiLineString') {
+          const multiLine = feature.geometry as GeoJSON.MultiLineString;
+          multiLine.coordinates.forEach(coords => {
+            const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
+            const lineLengthMeters = turf.length(line, { units: 'meters' });
+            
+            const { featureCollection } = generatePerpendicularLines(
+              line,
+              0,
+              lineLengthMeters,
+              globalInterval,
+              globalLength
+            );
+
+            // MultiLineString 的各段也归属于同一个岸段索引
+            featureCollection.features.forEach(f => {
+              if (!f.properties) f.properties = {};
+              (f.properties as any).shoreLineIndex = index;
+              (f.properties as any).shoreLineId = lineId;
+            });
+            allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+          });
+        }
+      });
+
+      // 3. 构建断面数据并发送到后端
+      allPerpendicularLines.forEach((line, index) => {
+        const props: any = line.properties || {};
+        const sectionId = `sec-${taskId}-${index}`;
+        
+        sectionsToCreate.push({
+          section_id: sectionId,
+          section_name: `断面${index + 1}`,
+          distance: props.distance,
+          bank_id: props.shoreLineId || 'line-0',
+          region_code: 'Mzs',
+          segment_index: index,
+          geometry: line.geometry,
+          section_geometry: line.geometry,
+          basic_param_id: basicParamId
         });
-      }
-    });
 
-    // 简化断面数据结构：只保留必要的属性，并添加唯一ID，同时保留 distance 与所属岸段
-    allPerpendicularLines.forEach((line, index) => {
-      const props: any = line.properties || {};
-      const leftPoint = props.leftPoint;
-      const rightPoint = props.rightPoint;
-      line.properties = {
-        crossLineId: index,
-        distance: props.distance,
-        shoreLineIndex: props.shoreLineIndex,
-        shoreLineId: props.shoreLineId,
-        leftPoint: leftPoint,
-        rightPoint: rightPoint,
-        analysisConfig: { ...globalProperties }
+        // 更新前端断面数据结构
+        line.properties = {
+          sectionId: sectionId,
+          crossLineId: index,
+          distance: props.distance,
+          shoreLineIndex: props.shoreLineIndex,
+          shoreLineId: props.shoreLineId,
+          leftPoint: props.leftPoint,
+          rightPoint: props.rightPoint
+        };
+      });
+
+      // 发送断面到后端
+      const sectionsPayload = {
+        task_id: taskId,
+        sections: sectionsToCreate,
+        inherit_from_basic_param: true,
+        overwrite: false
       };
-    });
 
-    setPerpendicularData(turf.featureCollection(allPerpendicularLines));
-    setShowCrossLines(true);
-    alert(`已为 ${selectedLines.size} 个岸段生成垂线！\n\n提示：可以点击"属性配置"按钮设置分析参数`);
+      console.log(`创建 ${sectionsToCreate.length} 个断面...`);
+      console.log('发送到后端的数据:', JSON.stringify(sectionsPayload, null, 2));
+      const sectionsResponse = await fetch('/v0/bank/sections', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sectionsPayload)
+      });
+
+      if (!sectionsResponse.ok) {
+        const errorText = await sectionsResponse.text();
+        console.error('后端错误响应:', errorText);
+        throw new Error(`创建断面失败: ${sectionsResponse.statusText} - ${errorText}`);
+      }
+
+      const sectionsResult = await sectionsResponse.json();
+      console.log('断面创建成功:', sectionsResult);
+
+      // 获取第一个断面的参数作为全局参数
+      if (sectionsResult.success && sectionsResult.sections && sectionsResult.sections.length > 0) {
+        const firstSection = sectionsResult.sections[0];
+        const params = await fetchSectionParams(firstSection.section_id);
+        if (params) {
+          console.log('获取到断面参数:', params);
+          // 设置为全局参数
+          setGlobalProperties(params);
+        }
+      }
+
+      setPerpendicularData(turf.featureCollection(allPerpendicularLines));
+      setShowCrossLines(true);
+      alert(`任务创建成功！\n已为 ${selectedLines.size} 个岸段生成 ${allPerpendicularLines.length} 条断面！`);
+    } catch (err: any) {
+      console.error('生成断面失败:', err);
+      alert(`生成断面失败: ${err.message}`);
+    }
   };
 
-  // 开始分析：将所有垂线发送到后端
+  // 开始分析：运行任务中的所有断面
   const handleStartAnalysis = async () => {
     if (!perpendicularData || perpendicularData.features.length === 0) {
       alert('请先绘制断面');
       return;
     }
 
-    const taskName = window.prompt('请输入任务名称：', '');
-    if (!taskName) {
-      alert('任务名称不能为空');
+    if (!currentTaskId) {
+      alert('未找到任务ID，请先绘制断面');
       return;
     }
 
-    const taskUid = `task-${Date.now()}`;
-
-    // 收集所有垂线数据，包括每条垂线的属性配置
-    const allCrossData = perpendicularData.features.map(line => ({
-      distance: line.properties?.distance ?? 0,
-      left: line.properties?.leftPoint as number[],
-      right: line.properties?.rightPoint as number[],
-      analysisConfig: line.properties?.analysisConfig as typeof ANALYSIS_CONFIG_DEFAULT
-    }));
-
     try {
-      // 先向后端创建任务
-      const taskPayload = {
-        uid: taskUid,
-        name: taskName,
-        geojson: uploadedFileName || null
-      };
-
-      console.log('创建任务:', taskPayload);
-
-      const taskResponse = await fetch('http://192.168.1.116:8088/v0/mi/task', {
+      console.log(`开始分析任务: ${currentTaskId}`);
+      
+      const response = await fetch(`/v0/bank/tasks/${currentTaskId}/run`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(taskPayload)
+        headers: { 'Content-Type': 'application/json' }
       });
 
-      if (!taskResponse.ok) {
-        throw new Error(`创建任务失败: ${taskResponse.statusText}`);
+      if (!response.ok) {
+        throw new Error(`运行任务失败: ${response.statusText}`);
       }
 
-      // 任务创建成功后，再发送所有断面
-      await sendCrossLinesToBackend(allCrossData, taskUid);
-      alert(`任务已创建并成功发送 ${allCrossData.length} 条断面到后端！`);
-    } catch (err) {
-      alert('创建任务或发送断面到后端时出错，请检查控制台');
-      console.error(err);
+      const result = await response.json();
+      console.log('任务运行结果:', result);
+      
+      if (result.success) {
+        alert(`任务运行成功！\n状态: ${result.status}\n已处理 ${result.results?.length || 0} 个断面`);
+      } else {
+        alert('任务运行失败，请检查控制台');
+      }
+    } catch (err: any) {
+      console.error('运行任务失败:', err);
+      alert(`运行任务失败: ${err.message}`);
     }
   };
 
@@ -807,7 +1144,7 @@ function EditorPage() {
         setIsSelectingStartEnd(false);
 
         // 异步将 GeoJSON 发送到后端
-        fetch('http://192.168.1.116:8088/v0/mi/geojson', {
+        fetch('/v0/mi/geojson', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1435,19 +1772,46 @@ function EditorPage() {
     config, 
     onSave, 
     onClose,
-    title 
+    title,
+    sectionId
   }: { 
-    config: typeof ANALYSIS_CONFIG_DEFAULT; 
-    onSave: (newConfig: typeof ANALYSIS_CONFIG_DEFAULT) => void;
+    config: SectionParams | null; 
+    onSave: (newConfig: SectionParams) => void;
     onClose: () => void;
     title: string;
+    sectionId?: string;
   }) => {
-    const [year, setYear] = useState(config.year);
-    const years = Array.from({ length: 17 }, (_, i) => (2010 + i).toString());
+    const [params, setParams] = useState<SectionParams>(config || {});
+    const [isSaving, setIsSaving] = useState(false);
 
-    const handleSave = () => {
-      onSave({ ...config, year });
-      onClose();
+    const handleSave = async () => {
+      setIsSaving(true);
+      try {
+        // 如果有sectionId，调用PUT接口更新后端
+        if (sectionId) {
+          const response = await fetch(`/v0/bank/sections/${sectionId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`更新断面参数失败: ${response.statusText} - ${errorText}`);
+          }
+
+          console.log('断面参数更新成功');
+        }
+
+        // 更新前端状态
+        onSave(params);
+        onClose();
+      } catch (err: any) {
+        console.error('保存参数失败:', err);
+        alert(`保存失败: ${err.message}`);
+      } finally {
+        setIsSaving(false);
+      }
     };
 
     return (
@@ -1467,78 +1831,257 @@ function EditorPage() {
           backgroundColor: 'white',
           padding: '20px',
           borderRadius: '8px',
-          maxWidth: '600px',
+          maxWidth: '800px',
           maxHeight: '80vh',
           overflow: 'auto',
           boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
         }}>
           <h3 style={{ marginTop: 0 }}>{title}</h3>
           
-          <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>
-              年份 (year) - 可编辑:
-            </label>
-            <select 
-              value={year} 
-              onChange={(e) => setYear(e.target.value)}
-              style={{ width: '100%', padding: '5px' }}
-            >
-              {years.map(y => <option key={y} value={y}>{y}</option>)}
-            </select>
-          </div>
+          {/* 基础信息 */}
+          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
+            <legend style={{ fontWeight: 'bold' }}>基础信息</legend>
+            
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>参数名称:</label>
+                <input
+                  type="text"
+                  value={params.param_name || ''}
+                  onChange={(e) => setParams({...params, param_name: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+              
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>河段编码:</label>
+                <input
+                  type="text"
+                  value={params.segment || ''}
+                  onChange={(e) => setParams({...params, segment: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
 
-          <div style={{ marginBottom: '15px', opacity: 0.6 }}>
-            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>其他属性（仅展示）:</label>
-            <pre style={{ 
-              backgroundColor: '#f5f5f5', 
-              padding: '10px', 
-              borderRadius: '4px',
-              fontSize: '12px',
-              maxHeight: '300px',
-              overflow: 'auto'
-            }}>
-              {JSON.stringify({
-                'bench-id': config['bench-id'],
-                'ref-id': config['ref-id'],
-                'dem-id': config['dem-id'],
-                'current-timepoint': config['current-timepoint'],
-                'comparison-timepoint': config['comparison-timepoint'],
-                segment: config.segment,
-                set: config.set,
-                'water-qs': config['water-qs'],
-                'tidal-level': config['tidal-level'],
-                hs: config.hs,
-                hc: config.hc,
-                'protection-level': config['protection-level'],
-                'control-level': config['control-level'],
-                'risk-thresholds': config['risk-thresholds'],
-                wNM: config.wNM,
-                wRE: config.wRE,
-                wGE: config.wGE,
-                wRL: config.wRL
-              }, null, 2)}
-            </pre>
-          </div>
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>当前时间点:</label>
+                <input
+                  type="text"
+                  value={params.current_timepoint || ''}
+                  onChange={(e) => setParams({...params, current_timepoint: e.target.value})}
+                  placeholder="YYYY-MM-DD"
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>对比时间点:</label>
+                <input
+                  type="text"
+                  value={params.comparison_timepoint || ''}
+                  onChange={(e) => setParams({...params, comparison_timepoint: e.target.value})}
+                  placeholder="YYYY-MM-DD"
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>数据集名称:</label>
+                <input
+                  type="text"
+                  value={params.set_name || ''}
+                  onChange={(e) => setParams({...params, set_name: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>流量:</label>
+                <input
+                  type="text"
+                  value={params.water_qs || ''}
+                  onChange={(e) => setParams({...params, water_qs: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>潮位:</label>
+                <select
+                  value={params.tidal_level || ''}
+                  onChange={(e) => setParams({...params, tidal_level: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                >
+                  <option value="">请选择</option>
+                  <option value="xc">小潮</option>
+                  <option value="zc">中潮</option>
+                  <option value="dc">大潮</option>
+                </select>
+              </div>
+            </div>
+          </fieldset>
+
+          {/* DEM参数 */}
+          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
+            <legend style={{ fontWeight: 'bold' }}>DEM参数</legend>
+            
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>基准DEM (bench_id):</label>
+                <input
+                  type="text"
+                  value={params.bench_id || ''}
+                  onChange={(e) => setParams({...params, bench_id: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>参考DEM (ref_id):</label>
+                <input
+                  type="text"
+                  value={params.ref_id || ''}
+                  onChange={(e) => setParams({...params, ref_id: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+            </div>
+          </fieldset>
+
+          {/* 水深参数 */}
+          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
+            <legend style={{ fontWeight: 'bold' }}>水深参数</legend>
+            
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>hs:</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={params.hs || ''}
+                  onChange={(e) => setParams({...params, hs: Number(e.target.value)})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>hc:</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={params.hc || ''}
+                  onChange={(e) => setParams({...params, hc: Number(e.target.value)})}
+                  style={{ width: '100%', padding: '5px' }}
+                />
+              </div>
+            </div>
+          </fieldset>
+
+          {/* 防护控制参数 */}
+          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
+            <legend style={{ fontWeight: 'bold' }}>防护控制参数</legend>
+            
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>防护等级:</label>
+                <select
+                  value={params.protection_level || ''}
+                  onChange={(e) => setParams({...params, protection_level: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                >
+                  <option value="">请选择</option>
+                  <option value="systemic">系统防护</option>
+                  <option value="normal">常规防护</option>
+                  <option value="low">低防护</option>
+                  <option value="no">无防护</option>
+                </select>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>控制等级:</label>
+                <select
+                  value={params.control_level || ''}
+                  onChange={(e) => setParams({...params, control_level: e.target.value})}
+                  style={{ width: '100%', padding: '5px' }}
+                >
+                  <option value="">请选择</option>
+                  <option value="strict">严格控制</option>
+                  <option value="normal">常规控制</option>
+                  <option value="low">低控制</option>
+                  <option value="no">无控制</option>
+                </select>
+              </div>
+            </div>
+          </fieldset>
+
+          {/* 风险阈值 */}
+          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
+            <legend style={{ fontWeight: 'bold' }}>风险阈值 (JSON格式)</legend>
+            <textarea
+              value={JSON.stringify(params.risk_thresholds || {}, null, 2)}
+              onChange={(e) => {
+                try {
+                  const parsed = JSON.parse(e.target.value);
+                  setParams({...params, risk_thresholds: parsed});
+                } catch (err) {
+                  // 用户正在编辑，暂不更新
+                }
+              }}
+              rows={8}
+              style={{ width: '100%', padding: '5px', fontFamily: 'monospace', fontSize: '12px' }}
+            />
+            <small style={{ color: '#666' }}>
+              示例: {`{"Dsed": [0.3, 0.5, 0.7], "Zb": [2.0, 4.0, 6.0], ...}`}
+            </small>
+          </fieldset>
+
+          {/* 权重参数 */}
+          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
+            <legend style={{ fontWeight: 'bold' }}>权重参数 (JSON格式)</legend>
+            <textarea
+              value={JSON.stringify(params.weights || {}, null, 2)}
+              onChange={(e) => {
+                try {
+                  const parsed = JSON.parse(e.target.value);
+                  setParams({...params, weights: parsed});
+                } catch (err) {
+                  // 用户正在编辑，暂不更新
+                }
+              }}
+              rows={5}
+              style={{ width: '100%', padding: '5px', fontFamily: 'monospace', fontSize: '12px' }}
+            />
+            <small style={{ color: '#666' }}>
+              示例: {`{"wRE": [0.3, 0.4, 0.3], "wNM": [0.4, 0.3, 0.3], ...}`}
+            </small>
+          </fieldset>
 
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
             <button 
               onClick={onClose}
-              style={{ padding: '8px 16px', cursor: 'pointer' }}
+              disabled={isSaving}
+              style={{ 
+                padding: '8px 16px', 
+                cursor: isSaving ? 'not-allowed' : 'pointer',
+                opacity: isSaving ? 0.6 : 1
+              }}
             >
               取消
             </button>
             <button 
               onClick={handleSave}
+              disabled={isSaving}
               style={{ 
                 padding: '8px 16px', 
                 backgroundColor: '#3b82f6', 
                 color: 'white', 
                 border: 'none',
                 borderRadius: '4px',
-                cursor: 'pointer'
+                cursor: isSaving ? 'not-allowed' : 'pointer',
+                opacity: isSaving ? 0.6 : 1
               }}
             >
-              保存
+              {isSaving ? '保存中...' : '保存'}
             </button>
           </div>
         </div>
@@ -1813,42 +2356,12 @@ function EditorPage() {
       </div>
 
       {/* 全局属性配置弹窗 */}
-      {showGlobalPropertiesModal && (
+      {showGlobalPropertiesModal && globalProperties && (
         <PropertiesModal
           config={globalProperties}
           title="全局属性配置"
           onSave={(newConfig) => {
             setGlobalProperties(newConfig);
-            // 更新所有未自定义属性的垂线
-            if (perpendicularData) {
-              const updatedLines = perpendicularData.features.map(line => {
-                const lineProp: any = line.properties || {};
-                // 检查是否属于某个自定义属性组
-                const belongsToCustomGroup = groups.some(g => {
-                  if (!g.properties || g.end === null) return false;
-                  try {
-                    const mid = [(lineProp.leftPoint[0] + lineProp.rightPoint[0]) / 2, 
-                                 (lineProp.leftPoint[1] + lineProp.rightPoint[1]) / 2];
-                    const snapped = turf.nearestPointOnLine(g.line, turf.point(mid), { units: 'meters' });
-                    const actualDist = snapped.properties.location ?? 0;
-                    const start = Math.min(g.start, g.end);
-                    const end = Math.max(g.start, g.end);
-                    return actualDist >= start && actualDist <= end;
-                  } catch {
-                    return false;
-                  }
-                });
-                
-                if (!belongsToCustomGroup) {
-                  line.properties = {
-                    ...lineProp,
-                    analysisConfig: newConfig
-                  };
-                }
-                return line;
-              });
-              setPerpendicularData(turf.featureCollection(updatedLines as GeoJSON.Feature<GeoJSON.LineString>[]));
-            }
             alert('全局属性配置已更新');
           }}
           onClose={() => setShowGlobalPropertiesModal(false)}
@@ -1863,24 +2376,32 @@ function EditorPage() {
           if (!perpendicularData || !perpendicularData.features[index]) return null;
           
           const currentLine = perpendicularData.features[index];
-          const currentConfig = currentLine.properties?.analysisConfig || globalProperties;
+          const currentConfig = (currentLine.properties as any)?.properties || globalProperties;
+          const sectionId = (currentLine.properties as any)?.sectionId;
+          
+          if (!currentConfig) {
+            alert('断面参数未加载，请稍后再试');
+            setEditingPropertiesGroupId(null);
+            return null;
+          }
           
           return (
             <PropertiesModal
               config={currentConfig}
               title={`断面 #${index + 1} 属性配置`}
+              sectionId={sectionId}
               onSave={(newConfig) => {
+                // 更新前端状态
                 const updatedFeatures = [...perpendicularData.features];
                 updatedFeatures[index] = {
                   ...currentLine,
                   properties: {
                     ...currentLine.properties,
-                    analysisConfig: newConfig
+                    properties: newConfig
                   }
                 };
                 setPerpendicularData(turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]));
                 alert(`断面 #${index + 1} 的属性配置已保存`);
-                setEditingPropertiesGroupId(null);
               }}
               onClose={() => setEditingPropertiesGroupId(null)}
             />
@@ -1890,9 +2411,17 @@ function EditorPage() {
         // 组属性配置
         const group = groups.find(g => g.id === editingPropertiesGroupId);
         if (!group) return null;
+        
+        const groupConfig = group.properties || globalProperties;
+        if (!groupConfig) {
+          alert('参数未加载，请先创建断面');
+          setEditingPropertiesGroupId(null);
+          return null;
+        }
+        
         return (
           <PropertiesModal
-            config={{...globalProperties, ...(group.properties || {})}}
+            config={groupConfig}
             title={`组 ${groups.findIndex(g => g.id === editingPropertiesGroupId) + 1} 属性配置`}
             onSave={(newConfig) => {
               setGroups(prev => {

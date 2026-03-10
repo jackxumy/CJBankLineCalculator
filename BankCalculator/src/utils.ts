@@ -99,7 +99,7 @@ export async function sendCrossLinesToBackend(
 
       console.log(`正在发送断面 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m):`, payload);
 
-      const response = await fetch('http://192.168.1.116:8088/v0/mi/risk-level', {
+      const response = await fetch('/v0/mi/risk-level', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)

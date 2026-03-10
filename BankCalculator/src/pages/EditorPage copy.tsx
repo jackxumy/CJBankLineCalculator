@@ -167,7 +167,7 @@ async function sendCrossLinesToBackend(
 
       console.log(`正在发送垂线 ${index + 1}/${crossData.length} (距离: ${item.distance.toFixed(2)}m, UID: ${sectionUid}):`, payload);
 
-      const response = await fetch('http://192.168.1.116:8088/v0/mi/risk-level', {
+      const response = await fetch('http://192.168.1.102:8088/v0/mi/risk-level', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -538,7 +538,7 @@ function EditorPage() {
       
       console.log('向后端发送任务信息:', taskPayload);
       
-      // const taskResponse = await fetch('http://192.168.1.116:8088/v0/mi/task', {
+      // const taskResponse = await fetch('http://192.168.1.102:8088/v0/mi/task', {
       //   method: 'POST',
       //   headers: { 'Content-Type': 'application/json' },
       //   body: JSON.stringify(taskPayload)
@@ -777,7 +777,7 @@ function EditorPage() {
         // 发送 GeoJSON 到后端
         try {
           console.log('向后端发送 GeoJSON 文件:', file.name);
-          const response = await fetch('http://192.168.1.116:8088/v0/mi/geojson', {
+          const response = await fetch('http://192.168.1.102:8088/v0/mi/geojson', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({

@@ -7,140 +7,161 @@ import '../App.css';
 // 与 EditorPage 保持一致的 Mapbox token
 mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg';
 
-// 后端返回的断面结构假设
-interface BackendCrossSection {
-  distance: number;          // 在线上的里程（米）
-  shoreLineIndex?: number;   // 所属岸段索引
-  shoreLineId?: string;      // 所属岸段ID，例如 line-0
-  color?: string;            // 风险颜色（十六进制），如果已有
+// 后端返回的任务结构
+interface Task {
+  id: number;
+  task_id: string;
+  task_name: string;
+  bank_ids: string[];
+  description: string;
+  created_at: string;
 }
+
+// 断面结构（带模型结果）
+interface SectionResult {
+  section_id: string;
+  distance: number;
+  bank_id: string;
+  geometry: any;
+  risk_level?: string; // high, medium, low, no
+  risk_score?: number;
+}
+
+// 颜色映射参考 App copy.tsx 中的 RISK_COLORS
+const RISK_COLORS: Record<string, string> = {
+  'high': '#ef4444',
+  'medium': '#f97316',
+  'low': '#facc15',
+  'no': '#10b981',
+  'default': '#94a3b8'
+};
 
 function ResultPage() {
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
 
-  const [shoreGeoJSON, setShoreGeoJSON] = useState<GeoJSON.FeatureCollection | null>(null);
-  const [crossSections, setCrossSections] = useState<BackendCrossSection[]>([]);
+  const [taskList, setTaskList] = useState<Task[]>([]);
+  const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 点击按钮：从后端获取岸段和断面并做可视化
-  const handleLoadFromBackend = async () => {
+  // 获取所有任务列表
+  useEffect(() => {
+    const fetchTasks = async () => {
+      try {
+        const res = await fetch('/v0/bank/tasks');
+        if (!res.ok) throw new Error('获取任务列表失败');
+        const data = await res.json();
+        if (data.success) {
+          setTaskList(data.tasks || []);
+        }
+      } catch (err: any) {
+        console.error('获取任务列表失败:', err);
+        setError('无法加载任务列表');
+      }
+    };
+    fetchTasks();
+  }, []);
+
+  // 点击任务：获取任务详情（包含所有断面及其结果）并在地图可视化
+  const handleTaskClick = async (taskId: string) => {
+    setSelectedTask(taskId);
     setLoading(true);
     setError(null);
 
     try {
-      // 先获取岸段 GeoJSON
-      const geoRes = await fetch('http://192.168.1.116:8088/v0/mi/cgeojsonget');
-      if (!geoRes.ok) {
-        throw new Error(`获取岸段失败: ${geoRes.status} ${geoRes.statusText}`);
+      // 1. 获取任务完整数据（包含断面信息）
+      const res = await fetch(`/v0/bank/tasks/${taskId}/full`);
+      if (!res.ok) throw new Error('获取任务详情失败');
+      const data = await res.json();
+      
+      if (!data.success || !data.data) {
+        throw new Error('返回数据格式错误');
       }
+
+      const { sections } = data.data;
+      const sectionResults: SectionResult[] = sections;
+
+      // 2. 获取所有岸段空间数据
+      const geoRes = await fetch('/v0/bank/banks');
+      if (!geoRes.ok) throw new Error('获取岸段空间数据失败');
       const geoData = await geoRes.json();
-      const geojson: GeoJSON.FeatureCollection =
-        geoData.type === 'FeatureCollection' ? geoData : turf.featureCollection([geoData]);
+      
+      const allBanksGeoJSON: GeoJSON.FeatureCollection = {
+        type: 'FeatureCollection',
+        features: (geoData.banks || []).map((b: any) => ({
+          type: 'Feature',
+          properties: { 
+            index: b.id, 
+            bank_id: b.bank_id,
+            bank_name: b.bank_name 
+          },
+          geometry: b.geometry
+        }))
+      };
 
-      // 确保每条线有 index 属性，用于关联断面
-      geojson.features.forEach((f: any, idx: number) => {
-        if (!f.properties) f.properties = {};
-        if (f.geometry && (f.geometry.type === 'LineString' || f.geometry.type === 'MultiLineString')) {
-          f.properties.index = idx;
-        }
-      });
-
-      setShoreGeoJSON(geojson);
-
-      // 再获取断面
-      const crossRes = await fetch('http://192.168.1.116:8088/v0/mi/crossget');
-      if (!crossRes.ok) {
-        throw new Error(`获取断面失败: ${crossRes.status} ${crossRes.statusText}`);
-      }
-      const crossData = await crossRes.json();
-
-      // 假设后端返回数组，每个元素至少包含 distance、shoreLineIndex/shoreLineId、color
-      const list: BackendCrossSection[] = Array.isArray(crossData) ? crossData : [];
-      setCrossSections(list);
-
-      // 把岸段更新到地图
+      // 3. 更新地图全量岸段底色（灰色）
       const map = mapRef.current;
       if (map) {
         const src = map.getSource('uploaded-data') as mapboxgl.GeoJSONSource | null;
-        if (src) src.setData(geojson);
+        if (src) src.setData(allBanksGeoJSON);
 
-        // 自动缩放到岸段范围
-        if (geojson.features.length > 0) {
-          const bbox = turf.bbox(geojson);
-          map.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 50 });
+        // 自动缩放到相关岸段范围
+        const relevantFeatures = allBanksGeoJSON.features.filter(f => 
+          sectionResults.some(s => s.bank_id === (f.properties as any).bank_id)
+        );
+if (relevantFeatures.length > 0) {
+          const bbox = turf.bbox({ type: 'FeatureCollection', features: relevantFeatures });
+          map.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 80 });
         }
       }
 
-      // 基于新的断面数据做颜色插值
-      applyShorelineGradient(geojson, list);
+      // 4. 执行插值可视化
+      applyShorelineGradient(allBanksGeoJSON, sectionResults);
+
     } catch (e: any) {
       console.error(e);
-      setError(e.message || '获取数据失败');
+      setError(e.message || '加载任务数据失败');
     } finally {
       setLoading(false);
     }
   };
 
-  // 使用 distance + 岸线隶属信息对岸段做颜色插值
+  // 颜色插值逻辑
   const applyShorelineGradient = (
-    geojson: GeoJSON.FeatureCollection | null,
-    crosses: BackendCrossSection[]
+    geojson: GeoJSON.FeatureCollection,
+    sections: SectionResult[]
   ) => {
     const map = mapRef.current;
-    if (!map || !geojson || crosses.length === 0) return;
+    if (!map || !geojson) return;
 
-    // 这里简单假设颜色已经在 crossSections.color 中给出
-    // 若后端只给风险等级，可在此处映射到颜色
-    const defaultColor = '#94a3b8';
+    geojson.features.forEach((feature: any) => {
+      const bankId = feature.properties?.bank_id;
+      if (!bankId) return;
 
-    geojson.features.forEach((feature: any, idx: number) => {
-      if (!feature.geometry || feature.geometry.type !== 'LineString') return;
+      // 找到属于该岸段的所有断面
+      const bankSections = sections.filter(s => s.bank_id === bankId);
+      if (bankSections.length === 0) return;
+
       const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
-      const lineIndex = feature.properties?.index ?? idx;
-
-      const related = crosses.filter(
-        c => (c.shoreLineIndex !== undefined && c.shoreLineIndex === lineIndex) ||
-             (c.shoreLineId && c.shoreLineId === `line-${lineIndex}`)
-      );
-      if (related.length === 0) return;
+      if (line.geometry.type !== 'LineString') return; 
 
       const totalLength = turf.length(line, { units: 'meters' });
       if (totalLength <= 0) return;
 
-      // 按 distance 排序
-      const sorted = [...related].sort((a, b) => a.distance - b.distance);
-
-      const grayColor = defaultColor;
+      const sorted = [...bankSections].sort((a, b) => a.distance - b.distance);
       const rawStops: { val: number; color: string }[] = [];
 
-      // 选区这里简单用整条线（0 ~ totalLength）
-      const selStart = 0;
-      const selEnd = totalLength;
-
-      // 1. 起点之前的灰色段
-      rawStops.push({ val: 0, color: grayColor });
-
-      // 2. 选区起点颜色（如果有点在起点）
-      const firstColor = sorted[0].color || '#10b981';
-      rawStops.push({ val: selStart / totalLength, color: firstColor });
-
-      // 3. 中间采样点
-      sorted.forEach(pt => {
-        const d = Math.max(selStart, Math.min(selEnd, pt.distance));
-        const t = d / totalLength;
-        rawStops.push({ val: t, color: pt.color || firstColor });
+      sorted.forEach(s => {
+        const color = RISK_COLORS[s.risk_level || 'no'] || RISK_COLORS.no;
+        rawStops.push({ val: s.distance / totalLength, color });
       });
 
-      // 4. 选区终点颜色
-      const lastColor = sorted[sorted.length - 1].color || firstColor;
-      rawStops.push({ val: selEnd / totalLength, color: lastColor });
+      if (rawStops.length > 0) {
+        if (rawStops[0].val > 0) rawStops.unshift({ val: 0, color: rawStops[0].color });
+        if (rawStops[rawStops.length - 1].val < 1) rawStops.push({ val: 1, color: rawStops[rawStops.length - 1].color });
+      }
 
-      // 5. 终点后的灰色段
-      rawStops.push({ val: 1, color: grayColor });
-
-      // 构建严格递增的 stops
       const stops: any[] = ['interpolate', ['linear'], ['line-progress']];
       let lastVal = -1;
       rawStops
@@ -153,30 +174,22 @@ function ResultPage() {
           }
         });
 
-      const layerId = `shoreline-layer-${lineIndex}`;
-      const sourceId = `shoreline-source-${lineIndex}`;
+      const layerId = `shoreline-result-${bankId}`;
+      const sourceId = `shoreline-source-${bankId}`;
 
-      // 为每条线单独建一个 source + layer，应用各自的渐变
-      if (!map.getSource(sourceId)) {
-        map.addSource(sourceId, { type: 'geojson', data: line });
-      } else {
-        (map.getSource(sourceId) as mapboxgl.GeoJSONSource).setData(line);
-      }
+      if (map.getLayer(layerId)) map.removeLayer(layerId);
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
 
-      if (!map.getLayer(layerId)) {
-        map.addLayer({
-          id: layerId,
-          type: 'line',
-          source: sourceId,
-          paint: {
-            'line-width': 4,
-            'line-color': '#10b981',
-            'line-gradient': stops
-          }
-        });
-      } else {
-        map.setPaintProperty(layerId, 'line-gradient', stops);
-      }
+      map.addSource(sourceId, { type: 'geojson', data: line, lineMetrics: true });
+      map.addLayer({
+        id: layerId,
+        type: 'line',
+        source: sourceId,
+        paint: {
+          'line-width': 6,
+          'line-gradient': stops
+        }
+      });
     });
   };
 
@@ -218,21 +231,38 @@ function ResultPage() {
   return (
     <div className="map-wrapper">
       <div ref={mapContainer} className="map-full" />
-      <div className="upload-control">
-        <h4>结果可视化</h4>
-        <button
-          className="generate-button"
-          onClick={handleLoadFromBackend}
-          disabled={loading}
-        >
-          {loading ? '加载中…' : '从后端获取断面与岸段'}
-        </button>
-        {error && (
-          <p style={{ color: 'red', marginTop: '8px' }}>错误: {error}</p>
+      <div className="upload-control result-sidebar">
+        <h4>任务列表</h4>
+        <div className="task-list-container">
+          {taskList.length === 0 && !loading && <p className="empty-hint">暂无任务</p>}
+          {taskList.map(task => (
+            <div 
+              key={task.task_id} 
+              className={`task-item ${selectedTask === task.task_id ? 'active' : ''}`}
+              onClick={() => handleTaskClick(task.task_id)}
+            >
+              <div className="task-title">{task.task_name}</div>
+              <div className="task-meta">
+                ID: {task.task_id} | {new Date(task.created_at).toLocaleDateString()}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {loading && <div className="loading-spinner">数据加载中...</div>}
+        {error && <p className="error-message">错误: {error}</p>}
+        
+        {selectedTask && !loading && (
+          <div className="result-info">
+            <h5>当前分析结果</h5>
+            <div className="legend">
+              <div className="legend-item"><span className="dot high"></span>极高风险</div>
+              <div className="legend-item"><span className="dot medium"></span>高风险</div>
+              <div className="legend-item"><span className="dot low"></span>一般风险</div>
+              <div className="legend-item"><span className="dot no"></span>低/无风险</div>
+            </div>
+          </div>
         )}
-        <p style={{ fontSize: '13px', color: '#64748b', marginTop: '8px' }}>
-          点击按钮后，将从 /v0/mi/cgeojsonget 加载岸段，从 /v0/mi/crossget 加载断面，并按 distance 对对应岸段进行颜色插值。
-        </p>
       </div>
     </div>
   );
