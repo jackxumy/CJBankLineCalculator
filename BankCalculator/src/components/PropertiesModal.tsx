@@ -5,19 +5,44 @@ export default function PropertiesModal({
   config,
   onSave,
   onClose,
-  title
+  title,
+  sectionId
 }: {
   config: AnalysisConfig;
   onSave: (newConfig: AnalysisConfig) => void;
   onClose: () => void;
   title: string;
+  sectionId?: string;
 }) {
-  const [year, setYear] = useState(config.year);
+  const [year, setYear] = useState<string>(config.year);
   const years = Array.from({ length: 17 }, (_, i) => (2010 + i).toString());
+  const [isSaving, setIsSaving] = useState(false);
 
-  const handleSave = () => {
-    onSave({ ...config, year });
-    onClose();
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      const updatedConfig = { ...config, year };
+      
+      if (sectionId) {
+        // 如果有 sectionId，同步到后端断面结果
+        const response = await fetch(`/v0/bank/sections/${sectionId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updatedConfig)
+        });
+
+        if (!response.ok) {
+          throw new Error('同步到后端失败');
+        }
+      }
+
+      onSave(updatedConfig as any);
+      onClose();
+    } catch (err) {
+      alert('保存失败，请重试');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -46,8 +71,10 @@ export default function PropertiesModal({
           </pre>
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-          <button onClick={onClose} style={{ padding: '8px 16px' }}>取消</button>
-          <button onClick={handleSave} style={{ padding: '8px 16px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: 4 }}>保存</button>
+          <button onClick={onClose} disabled={isSaving} style={{ padding: '8px 16px' }}>取消</button>
+          <button onClick={handleSave} disabled={isSaving} style={{ padding: '8px 16px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: 4 }}>
+            {isSaving ? '保存中...' : '保存'}
+          </button>
         </div>
       </div>
     </div>

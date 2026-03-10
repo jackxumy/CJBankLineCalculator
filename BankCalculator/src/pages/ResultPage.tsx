@@ -20,19 +20,22 @@ interface Task {
 // 断面结构（带模型结果）
 interface SectionResult {
   section_id: string;
+  id?: number;
+  section_name?: string;
   distance: number;
   bank_id: string;
   geometry: any;
-  risk_level?: string; // high, medium, low, no
+  risk_level?: string | number; // 字符串(high, medium, low, no) 或 数字(1, 2, 3, 4)
   risk_score?: number;
 }
 
-// 颜色映射参考 App copy.tsx 中的 RISK_COLORS
+// 颜色映射：支持数字 ID 和 字符串
+// 风险等级映射：0 最低，3 最高
 const RISK_COLORS: Record<string, string> = {
-  'high': '#ef4444',
-  'medium': '#f97316',
-  'low': '#facc15',
-  'no': '#10b981',
+  '0': '#10b981', // 最低风险 - 绿
+  '1': '#facc15', // 低-中 - 黄
+  '2': '#f97316', // 较高 - 橙
+  '3': '#ef4444', // 最高 - 红
   'default': '#94a3b8'
 };
 
@@ -44,6 +47,20 @@ function ResultPage() {
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showSections, setShowSections] = useState(true);
+
+  // 切换断面可见性
+  useEffect(() => {
+    if (!mapRef.current) return;
+    const map = mapRef.current;
+    
+    if (map.getLayer('sections-line')) {
+      map.setLayoutProperty('sections-line', 'visibility', showSections ? 'visible' : 'none');
+    }
+    if (map.getLayer('sections-line-hit')) {
+      map.setLayoutProperty('sections-line-hit', 'visibility', showSections ? 'visible' : 'none');
+    }
+  }, [showSections]);
 
   // 获取所有任务列表
   useEffect(() => {
@@ -81,43 +98,70 @@ function ResultPage() {
 
       const { sections } = data.data;
       const sectionResults: SectionResult[] = sections;
+      let enrichedSections: SectionResult[] | null = null;
 
-      // 2. 获取所有岸段空间数据
+      // 打印每个断面的完整 JSON 到控制台，方便调试
+      try {
+        console.log(`任务 ${taskId} 返回断面数量:`, Array.isArray(sections) ? sections.length : 0);
+        (sections || []).forEach((sec: any, idx: number) => {
+          console.log(`Section[${idx}] =>`, sec);
+        });
+
+        // 基于每个断面的数据库 id，从 /v0/bank/results/{result_id} 获取计算结果并补充 risk_level
+        const enriched = await Promise.all((sections || []).map(async (sec: any) => {
+          // 后端 results 接口使用的是结果表的 id（示例中断面对象包含 id 字段）
+          const resultId = sec.id;
+          if (!resultId) return sec;
+
+          try {
+            const r = await fetch(`/v0/bank/results/${resultId}`);
+            if (!r.ok) {
+              console.warn(`获取 result ${resultId} 失败:`, r.status);
+              return sec;
+            }
+            const jr = await r.json();
+            if (jr && jr.success && jr.result) {
+              // 将后端返回的 risk_level（数字）附加到断面对象
+              sec.risk_level = jr.result.risk_level;
+            }
+          } catch (err) {
+            console.warn(`请求 result ${resultId} 出错:`, err);
+          }
+
+          return sec;
+        }));
+
+        // 使用补充后的断面集合继续后续渲染
+        enrichedSections = enriched as SectionResult[];
+      } catch (logErr) {
+        console.warn('打印断面 JSON 或获取结果时出错:', logErr);
+      }
+
+      // 2. 获取所有岸段列表以支持名称（不再需要原始几何，但可用于过滤）
       const geoRes = await fetch('/v0/bank/banks');
-      if (!geoRes.ok) throw new Error('获取岸段空间数据失败');
+      if (!geoRes.ok) throw new Error('获取岸段数据失败');
       const geoData = await geoRes.json();
-      
-      const allBanksGeoJSON: GeoJSON.FeatureCollection = {
-        type: 'FeatureCollection',
-        features: (geoData.banks || []).map((b: any) => ({
-          type: 'Feature',
-          properties: { 
-            index: b.id, 
-            bank_id: b.bank_id,
-            bank_name: b.bank_name 
-          },
-          geometry: b.geometry
-        }))
-      };
+      console.log('获取岸段数量:', geoData.banks?.length || 0);
 
-      // 3. 更新地图全量岸段底色（灰色）
+      const sectionsToUseFinal = enrichedSections && enrichedSections.length > 0 ? enrichedSections : sectionResults;
+
+      // 3. 执行基于断面中点的岸线生成与颜色插值
+      applyShorelineGradient(sectionsToUseFinal);
+
+      // 4. 渲染具体的断面线
+      renderSections(sectionsToUseFinal);
+
+      // 自动缩放到生成的断面范围
       const map = mapRef.current;
-      if (map) {
-        const src = map.getSource('uploaded-data') as mapboxgl.GeoJSONSource | null;
-        if (src) src.setData(allBanksGeoJSON);
-
-        // 自动缩放到相关岸段范围
-        const relevantFeatures = allBanksGeoJSON.features.filter(f => 
-          sectionResults.some(s => s.bank_id === (f.properties as any).bank_id)
-        );
-if (relevantFeatures.length > 0) {
-          const bbox = turf.bbox({ type: 'FeatureCollection', features: relevantFeatures });
+      if (map && sectionsToUseFinal.length > 0) {
+        const sectionFeatures = sectionsToUseFinal
+          .filter(s => s.geometry)
+          .map(s => ({ type: 'Feature', geometry: s.geometry, properties: {} }));
+        if (sectionFeatures.length > 0) {
+          const bbox = turf.bbox({ type: 'FeatureCollection', features: sectionFeatures as any });
           map.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 80 });
         }
       }
-
-      // 4. 执行插值可视化
-      applyShorelineGradient(allBanksGeoJSON, sectionResults);
 
     } catch (e: any) {
       console.error(e);
@@ -127,67 +171,175 @@ if (relevantFeatures.length > 0) {
     }
   };
 
-  // 颜色插值逻辑
-  const applyShorelineGradient = (
-    geojson: GeoJSON.FeatureCollection,
-    sections: SectionResult[]
-  ) => {
+  // 渲染断面集合几何并在地图显示
+  const renderSections = (sections: SectionResult[]) => {
     const map = mapRef.current;
-    if (!map || !geojson) return;
+    if (!map) return;
 
-    geojson.features.forEach((feature: any) => {
-      const bankId = feature.properties?.bank_id;
-      if (!bankId) return;
+    // 清理旧的断面图层和数据源
+    ['sections-line-hit', 'sections-line'].forEach(layer => {
+      if (map.getLayer(layer)) map.removeLayer(layer);
+    });
+    if (map.getSource('sections-source')) map.removeSource('sections-source');
 
-      // 找到属于该岸段的所有断面
-      const bankSections = sections.filter(s => s.bank_id === bankId);
-      if (bankSections.length === 0) return;
+    // 转换断面数据为 GeoJSON
+    const features = sections.filter(s => s.geometry).map(s => {
+      const lvlNum = Number(s.risk_level ?? 0);
+      const safeLevel = isNaN(lvlNum) ? 0 : Math.max(0, Math.min(3, lvlNum));
+      const color = RISK_COLORS[String(safeLevel)] || RISK_COLORS.default;
+      
+      return {
+        type: 'Feature',
+        geometry: s.geometry,
+        properties: {
+          id: s.section_id,
+          name: s.section_name || s.section_id,
+          risk_level: s.risk_level || '未知',
+          color: color
+        }
+      };
+    });
 
-      const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
-      if (line.geometry.type !== 'LineString') return; 
+    map.addSource('sections-source', {
+      type: 'geojson',
+      data: turf.featureCollection(features as any)
+    });
 
-      const totalLength = turf.length(line, { units: 'meters' });
-      if (totalLength <= 0) return;
+    // 添加断面显示层 (带宽度，由风险值决定颜色)
+    map.addLayer({
+      id: 'sections-line',
+      type: 'line',
+      source: 'sections-source',
+      layout: { 
+        'line-join': 'round', 
+        'line-cap': 'round',
+        'visibility': showSections ? 'visible' : 'none'
+      },
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': 4,
+        'line-opacity': 0.9
+      }
+    });
 
-      const sorted = [...bankSections].sort((a, b) => a.distance - b.distance);
-      const rawStops: { val: number; color: string }[] = [];
+    // 增加一个透明的宽层方便鼠标点击交互
+    map.addLayer({
+      id: 'sections-line-hit',
+      type: 'line',
+      source: 'sections-source',
+      paint: {
+        'line-width': 12,
+        'line-opacity': 0
+      },
+      layout: {
+        'visibility': showSections ? 'visible' : 'none'
+      }
+    });
 
-      sorted.forEach(s => {
-        const color = RISK_COLORS[s.risk_level || 'no'] || RISK_COLORS.no;
-        rawStops.push({ val: s.distance / totalLength, color });
+    // 悬浮显示气泡
+    map.on('click', 'sections-line-hit', (e) => {
+      if (!e.features || e.features.length === 0) return;
+      const f = e.features[0];
+      const p = f.properties;
+      if (!p) return;
+      
+      new mapboxgl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(`
+          <div style="padding: 4px; font-family: sans-serif;">
+            <p style="margin:0; font-weight:bold; color:#1e293b;">${p.name}</p>
+            <p style="margin:4px 0 0; font-size:12px; color:#64748b;">断面ID: ${p.id}</p>
+            <p style="margin:4px 0 0; font-size:12px; color:#64748b;">风险等级: 
+              <span style="color:${p.color}; font-weight:bold;">${p.risk_level}</span>
+            </p>
+          </div>
+        `)
+        .addTo(map);
+    });
+
+    map.on('mouseenter', 'sections-line-hit', () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', 'sections-line-hit', () => { map.getCanvas().style.cursor = ''; });
+  };
+
+  // 颜色插值逻辑: 基于同一岸段下所有断面中点生成一条折线，并根据中点的风险值插值颜色
+  const applyShorelineGradient = (sections: SectionResult[]) => {
+    const map = mapRef.current;
+    if (!map || !sections || sections.length === 0) return;
+
+    // 1. 按 bank_id 分组
+    const groups: Record<string, SectionResult[]> = {};
+    sections.forEach(s => {
+      const bid = s.bank_id || 'unknown';
+      if (!groups[bid]) groups[bid] = [];
+      groups[bid].push(s);
+    });
+
+    // 2. 遍历每个岸段组
+    Object.keys(groups).forEach(bankId => {
+      const bankSections = groups[bankId].sort((a, b) => a.distance - b.distance);
+      if (bankSections.length < 2) return; // 至少需要 2 个中点才能连成线
+
+      // 计算每个断面中点并构建 LineString
+      const midpoints: number[][] = [];
+      const riskStops: { val: number; color: string }[] = [];
+
+      bankSections.forEach(s => {
+        if (!s.geometry || s.geometry.type !== 'LineString') return;
+        
+        // 计算中点 (断面为 2 个坐标的 LineString)
+        const coords = s.geometry.coordinates;
+        const mid = [
+          (coords[0][0] + coords[1][0]) / 2,
+          (coords[0][1] + coords[1][1]) / 2
+        ];
+        midpoints.push(mid);
       });
 
-      if (rawStops.length > 0) {
-        if (rawStops[0].val > 0) rawStops.unshift({ val: 0, color: rawStops[0].color });
-        if (rawStops[rawStops.length - 1].val < 1) rawStops.push({ val: 1, color: rawStops[rawStops.length - 1].color });
-      }
+      if (midpoints.length < 2) return;
 
+      const newLine = turf.lineString(midpoints);
+      const totalDist = turf.length(newLine, { units: 'meters' });
+
+      // 构建颜色梯度参数
+      let currentDist = 0;
+      bankSections.forEach((s, idx) => {
+        if (idx > 0) {
+          const prevMid = midpoints[idx - 1];
+          const currMid = midpoints[idx];
+          currentDist += turf.distance(prevMid, currMid, { units: 'meters' });
+        }
+
+        const lvlNum = Number(s.risk_level ?? 0);
+        const safeLevel = isNaN(lvlNum) ? 0 : Math.max(0, Math.min(3, lvlNum));
+        const color = RISK_COLORS[String(safeLevel)] || RISK_COLORS.default;
+        
+        const progress = totalDist > 0 ? (currentDist / totalDist) : 0;
+        riskStops.push({ val: progress, color });
+      });
+
+      // Mapbox interpolate 表达式格式
       const stops: any[] = ['interpolate', ['linear'], ['line-progress']];
-      let lastVal = -1;
-      rawStops
-        .sort((a, b) => a.val - b.val)
-        .forEach(s => {
-          const currentVal = Math.max(0, Math.min(1, s.val));
-          if (currentVal > lastVal) {
-            stops.push(currentVal, s.color);
-            lastVal = currentVal;
-          }
-        });
+      riskStops.forEach(rs => {
+        const val = Math.max(0, Math.min(1, rs.val));
+        stops.push(val, rs.color);
+      });
 
-      const layerId = `shoreline-result-${bankId}`;
-      const sourceId = `shoreline-source-${bankId}`;
+      // 渲染新生成的中间折线
+      const layerId = `midline-result-${bankId}`;
+      const sourceId = `midline-source-${bankId}`;
 
       if (map.getLayer(layerId)) map.removeLayer(layerId);
       if (map.getSource(sourceId)) map.removeSource(sourceId);
 
-      map.addSource(sourceId, { type: 'geojson', data: line, lineMetrics: true });
+      map.addSource(sourceId, { type: 'geojson', data: newLine, lineMetrics: true });
       map.addLayer({
         id: layerId,
         type: 'line',
         source: sourceId,
         paint: {
-          'line-width': 6,
-          'line-gradient': stops
+          'line-width': 10,
+          'line-gradient': stops as any,
+          'line-opacity': 0.8
         }
       });
     });
@@ -232,7 +384,15 @@ if (relevantFeatures.length > 0) {
     <div className="map-wrapper">
       <div ref={mapContainer} className="map-full" />
       <div className="upload-control result-sidebar">
-        <h4>任务列表</h4>
+        <div className="sidebar-header">
+          <h4>任务列表</h4>
+          <button 
+            className={`toggle-sections-btn ${!showSections ? 'hidden' : ''}`}
+            onClick={() => setShowSections(!showSections)}
+          >
+            {showSections ? '隐藏断面' : '显示断面'}
+          </button>
+        </div>
         <div className="task-list-container">
           {taskList.length === 0 && !loading && <p className="empty-hint">暂无任务</p>}
           {taskList.map(task => (
