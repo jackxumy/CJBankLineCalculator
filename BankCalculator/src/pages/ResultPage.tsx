@@ -62,6 +62,21 @@ function ResultPage() {
     }
   }, [showSections]);
 
+  // 风险解析辅助：判断 risk_level 是否为 0-3 的有效数字
+  const getRiskInfo = (risk: any) => {
+    if (risk === null || risk === undefined) {
+      return { valid: false, color: RISK_COLORS.default, label: '未知', level: null };
+    }
+
+    const n = Number(risk);
+    if (!isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3) {
+      return { valid: true, color: RISK_COLORS[String(n)] || RISK_COLORS.default, label: n, level: n };
+    }
+
+    // 非 0-3 的值视为未知（灰色）
+    return { valid: false, color: RISK_COLORS.default, label: '未知', level: null };
+  };
+
   // 获取所有任务列表
   useEffect(() => {
     const fetchTasks = async () => {
@@ -85,6 +100,35 @@ function ResultPage() {
     setSelectedTask(taskId);
     setLoading(true);
     setError(null);
+
+    // 清除地图上所有之前任务的图层和数据源
+    const map = mapRef.current;
+    if (map) {
+      // 清除断面图层
+      ['sections-line-hit', 'sections-line'].forEach(layer => {
+        if (map.getLayer(layer)) map.removeLayer(layer);
+      });
+      if (map.getSource('sections-source')) map.removeSource('sections-source');
+
+      // 清除所有中线图层（以 midline- 开头的）
+      const style = map.getStyle();
+      if (style && style.layers) {
+        style.layers.forEach((layer: any) => {
+          if (layer.id && layer.id.startsWith('midline-')) {
+            if (map.getLayer(layer.id)) map.removeLayer(layer.id);
+          }
+        });
+      }
+      
+      // 清除所有中线数据源（以 midline- 开头的）
+      if (style && style.sources) {
+        Object.keys(style.sources).forEach((sourceId: string) => {
+          if (sourceId.startsWith('midline-')) {
+            if (map.getSource(sourceId)) map.removeSource(sourceId);
+          }
+        });
+      }
+    }
 
     try {
       // 1. 获取任务完整数据（包含断面信息）
@@ -184,17 +228,17 @@ function ResultPage() {
 
     // 转换断面数据为 GeoJSON
     const features = sections.filter(s => s.geometry).map(s => {
-      const lvlNum = Number(s.risk_level ?? 0);
-      const safeLevel = isNaN(lvlNum) ? 0 : Math.max(0, Math.min(3, lvlNum));
-      const color = RISK_COLORS[String(safeLevel)] || RISK_COLORS.default;
-      
+      const info = getRiskInfo(s.risk_level);
+      const color = info.color;
+      const displayRisk = info.valid ? info.level : info.label;
+
       return {
         type: 'Feature',
         geometry: s.geometry,
         properties: {
           id: s.section_id,
           name: s.section_name || s.section_id,
-          risk_level: s.risk_level || '未知',
+          risk_level: displayRisk,
           color: color
         }
       };
@@ -309,10 +353,9 @@ function ResultPage() {
           currentDist += turf.distance(prevMid, currMid, { units: 'meters' });
         }
 
-        const lvlNum = Number(s.risk_level ?? 0);
-        const safeLevel = isNaN(lvlNum) ? 0 : Math.max(0, Math.min(3, lvlNum));
-        const color = RISK_COLORS[String(safeLevel)] || RISK_COLORS.default;
-        
+        const info = getRiskInfo(s.risk_level);
+        const color = info.color;
+
         const progress = totalDist > 0 ? (currentDist / totalDist) : 0;
         riskStops.push({ val: progress, color });
       });
