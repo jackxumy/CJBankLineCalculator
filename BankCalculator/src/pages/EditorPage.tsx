@@ -151,6 +151,7 @@ const ensureDefaultBasicParams = async (): Promise<number | null> => {
     const listResponse = await fetch('/v0/bank/basic-params');
     if (listResponse.ok) {
       const listData = await listResponse.json();
+      console.log('基础参数列表响应:', listData);
       if (listData.success && listData.params && listData.params.length > 0) {
         // 使用第一个基础参数
         currentBasicParamId = listData.params[0].id;
@@ -159,43 +160,60 @@ const ensureDefaultBasicParams = async (): Promise<number | null> => {
       }
     }
 
-    // 如果没有基础参数，创建一个默认的
+    // 如果没有基础参数，创建一个默认的（使用后端给定的标准模板内容）
     console.log('创建默认基础参数模板...');
     const defaultParams = {
       params: [
         {
-          param_id: `PARAM_DEFAULT_${Date.now()}`,
+          id: 53,
+          param_id: 'PARAM_DEFAULT_TEMPLATE',
           param_name: '默认参数模板',
           segment: 'Mzs',
-          current_timepoint: new Date().toISOString().split('T')[0],
+          current_timepoint: '202304',
           set_name: 'standard',
-          water_qs: '45000',
+          water_qs: '10000',
           tidal_level: 'zc',
-          bench_id: 'dem_2024.tif',
-          ref_id: 'dem_2020.tif',
+          bench_id: 'tiff\\Mzs\\2023\\standard\\202304\\202404.tif',
+          ref_id: 'tiff\\Mzs\\2019\\standard\\201904\\201904.tif',
           hs: 0.5,
-          hc: 2.0,
+          hc: 2,
           protection_level: 'systemic',
           control_level: 'strict',
-          comparison_timepoint: '2020-01-15',
+          comparison_timepoint: '201904',
           risk_thresholds: {
-            Dsed: [0.3, 0.5, 0.7],
-            Zb: [2.0, 4.0, 6.0],
-            Sa: [15, 25, 35],
-            Ln: [0.5, 1.0, 1.5],
-            PQ: [1000, 2000, 3000],
-            Ky: [0.5, 0.3, 0.1],
-            Zd: [0.1, 0.2, 0.3],
-            all: [0.2, 0.4, 0.6]
+            Ky: [1.7, 1.35, 1],
+            Ln: [0.04, 0.12, 0.2],
+            PQ: [0.5, 1, 2.3],
+            Sa: [0.2, 0.3, 0.5],
+            Zb: [20, 30, 40],
+            Zd: [0.1, 0.15, 0.3],
+            all: [0.25, 0.5, 0.75],
+            Dsed: [0.7, 1, 1.5]
           },
           weights: {
-            wRE: [0.3, 0.4, 0.3],
-            wNM: [0.4, 0.3, 0.3],
-            wGE: [0.4, 0.4, 0.2],
-            wRL: [0.3, 0.3, 0.4]
+            wGE: [0.6, 0.2, 0.2],
+            wNM: [0.43, 0.32, 0.25],
+            wRE: [0.48, 0.16, 0.36],
+            wRL: [0.32, 0.43, 0.25]
           },
           other_params: {
-            note: '系统自动创建的默认参数'
+            pq_data: {
+              '2010': 2.59,
+              '2011': 0.15,
+              '2012': 2.42,
+              '2013': 0,
+              '2014': 0.67,
+              '2015': 1.29,
+              '2016': 3.2,
+              '2017': 1.1,
+              '2018': 0.29,
+              '2019': 1.68,
+              '2020': 3.68,
+              '2021': 1.35,
+              '2022': 1.1,
+              '2023': 0
+            },
+            is_default: true
           }
         }
       ],
@@ -278,6 +296,10 @@ function EditorPage() {
   // 生成的垂线数据
   const [perpendicularData, setPerpendicularData] = useState<GeoJSON.FeatureCollection | null>(null);
 
+  // 参数模板列表与选择（从后端获取并允许用户选择）
+  const [basicParamsList, setBasicParamsList] = useState<any[]>([]);
+  const [selectedBasicParamIdState, setSelectedBasicParamIdState] = useState<string | number | null>(null);
+
   // 所有选择组
   const [groups, setGroups] = useState<SelectionGroup[]>([]);
   const groupsRef = useRef(groups);
@@ -335,6 +357,91 @@ function EditorPage() {
   useEffect(() => {
     configRef.current = { interval: globalInterval, length: globalLength };
   }, [globalInterval, globalLength]);
+
+  // 挂载时拉取可用的基础参数模板列表
+  useEffect(() => {
+    const fetchBasicParams = async () => {
+      try {
+        const res = await fetch('/v0/bank/basic-params');
+        if (!res.ok) {
+          console.warn('获取基础参数模板列表失败:', res.statusText);
+          return;
+        }
+        const data = await res.json();
+        if (data && data.params) {
+          setBasicParamsList(data.params);
+          console.log('拉取到的基础参数模板列表:', data.params);
+          // 如果后端有模板，默认选第一个（可由用户切换）
+          if (data.params.length > 0) {
+            const first = data.params[0];
+            // 使用 param_id 字符串作为标识（API 路由使用 param_id，不是数字 id）
+            const paramId = first.param_id ?? first.id ?? null;
+            if (paramId !== null) {
+              setSelectedBasicParamIdState(String(paramId));
+              // 同步到全局变量 currentBasicParamId（保留数字 id 供某些旧接口使用）
+              currentBasicParamId = first.id ?? null;
+              // 同步全局属性以供 UI 使用
+              // 若需要完整详情，可后续用户选择时 fetch 单个模板
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('加载基础参数模板列表出错:', err);
+      }
+    };
+
+    fetchBasicParams();
+  }, []);
+
+  // 当用户选择模板时，拉取模板详情并设置为全局属性
+  const handleSelectBasicParam = async (paramIdStr: string | null) => {
+    if (!paramIdStr) {
+      setSelectedBasicParamIdState(null);
+      currentBasicParamId = null;
+      setGlobalProperties(null);
+      return;
+    }
+
+    // 使用 param_id（字符串）请求后端 GET /v0/bank/basic-params/{param_id}
+    try {
+      const res = await fetch(`/v0/bank/basic-params/${encodeURIComponent(paramIdStr)}`);
+      if (!res.ok) {
+        console.warn('获取模板详情失败:', res.status);
+        setSelectedBasicParamIdState(null);
+        return;
+      }
+      const data = await res.json();
+      if (data && data.param) {
+        console.log('获取到模板详情:', data.param);
+        // 转换为 SectionParams 结构的部分字段
+        const params: SectionParams = {
+          param_name: data.param.param_name,
+          segment: data.param.segment,
+          current_timepoint: data.param.current_timepoint,
+          set_name: data.param.set_name,
+          water_qs: data.param.water_qs,
+          tidal_level: data.param.tidal_level,
+          bench_id: data.param.bench_id,
+          ref_id: data.param.ref_id,
+          hs: data.param.hs,
+          hc: data.param.hc,
+          protection_level: data.param.protection_level,
+          control_level: data.param.control_level,
+          comparison_timepoint: data.param.comparison_timepoint,
+          risk_thresholds: data.param.risk_thresholds,
+          weights: data.param.weights,
+          other_params: data.param.other_params
+        };
+
+        setGlobalProperties(params);
+        setSelectedBasicParamIdState(paramIdStr);
+        // 同步到模块级变量 currentBasicParamId（使用数字 id，供某些内部函数如 ensureDefaultBasicParams 使用）
+        currentBasicParamId = data.param.id ?? null;
+      }
+    } catch (err) {
+      console.warn('加载模板详情失败:', err);
+    }
+  };
 
   // 切换岸段选择模式
   const toggleShoreLineSelection = () => {
@@ -2102,6 +2209,23 @@ function EditorPage() {
             style={{ display: 'none' }}
           />
         </label>
+        <div style={{ marginTop: 8 }}>
+          <label style={{ fontSize: 12, marginRight: 8 }}>选择参数模板：</label>
+          <select
+            value={selectedBasicParamIdState ?? ''}
+            onChange={(e) => handleSelectBasicParam(e.target.value || null)}
+            style={{ padding: '4px 6px', fontSize: 13 }}
+          >
+            <option value="">（不使用模板）</option>
+            {basicParamsList.map((p: any, idx: number) => {
+              const paramId = p.param_id ?? p.id ?? idx;
+              const name = p.param_name || p.paramName || String(paramId);
+              return (
+                <option key={String(paramId)} value={String(paramId)}>{name}</option>
+              );
+            })}
+          </select>
+        </div>
         {uploadedData && (
           <div className="upload-info">
             已加载 {uploadedData.features.length} 个要素

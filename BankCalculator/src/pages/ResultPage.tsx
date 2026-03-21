@@ -154,7 +154,7 @@ function ResultPage() {
         // 基于每个断面的数据库 id，从 /v0/bank/results/{result_id} 获取计算结果并补充 risk_level
         const enriched = await Promise.all((sections || []).map(async (sec: any) => {
           // 后端 results 接口使用的是结果表的 id（示例中断面对象包含 id 字段）
-          const resultId = sec.id;
+          const resultId = sec.section_id;
           if (!resultId) return sec;
 
           try {
@@ -232,6 +232,16 @@ function ResultPage() {
       const color = info.color;
       const displayRisk = info.valid ? info.level : info.label;
 
+      // 风险等级的中文标签映射
+      const RISK_LABELS: Record<number, string> = {
+        3: '极高风险',
+        2: '高风险',
+        1: '一般风险',
+        0: '低/无风险'
+      };
+
+      const riskLabel = info.valid && info.level !== null ? RISK_LABELS[info.level] : '未知';
+
       return {
         type: 'Feature',
         geometry: s.geometry,
@@ -239,6 +249,7 @@ function ResultPage() {
           id: s.section_id,
           name: s.section_name || s.section_id,
           risk_level: displayRisk,
+          risk_label: riskLabel,
           color: color
         }
       };
@@ -294,7 +305,7 @@ function ResultPage() {
             <p style="margin:0; font-weight:bold; color:#1e293b;">${p.name}</p>
             <p style="margin:4px 0 0; font-size:12px; color:#64748b;">断面ID: ${p.id}</p>
             <p style="margin:4px 0 0; font-size:12px; color:#64748b;">风险等级: 
-              <span style="color:${p.color}; font-weight:bold;">${p.risk_level}</span>
+              <span style="color:${p.color}; font-weight:bold;">${p.risk_label}</span>
             </p>
           </div>
         `)
