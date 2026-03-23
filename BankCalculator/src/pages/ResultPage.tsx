@@ -215,6 +215,64 @@ function ResultPage() {
     }
   };
 
+  // 删除当前选中的任务
+  const handleDeleteTask = async () => {
+    if (!selectedTask) return;
+
+    const confirmDelete = window.confirm('确定要删除当前选中的任务吗？此操作不可恢复。');
+    if (!confirmDelete) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/v0/bank/tasks/${selectedTask}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('删除任务失败');
+
+      const data = await res.json().catch(() => ({}));
+      if (data && data.success === false) {
+        throw new Error(data.message || '删除任务失败');
+      }
+
+      // 从任务列表中移除已删除任务
+      setTaskList(prev => prev.filter(task => task.task_id !== selectedTask));
+
+      // 清空当前选择
+      setSelectedTask(null);
+
+      // 清理地图上的图层和数据源
+      const map = mapRef.current;
+      if (map) {
+        ['sections-line-hit', 'sections-line'].forEach(layer => {
+          if (map.getLayer(layer)) map.removeLayer(layer);
+        });
+        if (map.getSource('sections-source')) map.removeSource('sections-source');
+
+        const style = map.getStyle();
+        if (style && style.layers) {
+          style.layers.forEach((layer: any) => {
+            if (layer.id && typeof layer.id === 'string' && layer.id.startsWith('midline-')) {
+              if (map.getLayer(layer.id)) map.removeLayer(layer.id);
+            }
+          });
+        }
+
+        if (style && style.sources) {
+          Object.keys(style.sources).forEach((sourceId: string) => {
+            if (sourceId.startsWith('midline-')) {
+              if (map.getSource(sourceId)) map.removeSource(sourceId);
+            }
+          });
+        }
+      }
+    } catch (e: any) {
+      console.error('删除任务出错:', e);
+      setError(e.message || '删除任务失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // 渲染断面集合几何并在地图显示
   const renderSections = (sections: SectionResult[]) => {
     const map = mapRef.current;
@@ -462,6 +520,14 @@ function ResultPage() {
             </div>
           ))}
         </div>
+
+        <button
+          className="delete-task-btn"
+          disabled={!selectedTask || loading}
+          onClick={handleDeleteTask}
+        >
+          删除选中任务
+        </button>
 
         {loading && <div className="loading-spinner">数据加载中...</div>}
         {error && <p className="error-message">错误: {error}</p>}
