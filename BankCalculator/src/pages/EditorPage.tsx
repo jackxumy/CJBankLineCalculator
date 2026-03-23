@@ -1,249 +1,16 @@
-﻿import { useEffect, useRef, useState } from 'react';
-import mapboxgl from 'mapbox-gl';
+﻿import { useEffect, useState } from 'react';
 import * as turf from '@turf/turf';
-import 'mapbox-gl/dist/mapbox-gl.css';
 import '../App.css';
-
-// 设置Mapbox访问令牌
-mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg'
-
-// 断面参数接口（从后端获取）
-interface SectionParams {
-  param_name?: string;
-  segment?: string;
-  current_timepoint?: string;
-  set_name?: string;
-  water_qs?: string;
-  tidal_level?: string;
-  bench_id?: string;
-  ref_id?: string;
-  hs?: number;
-  hc?: number;
-  protection_level?: string;
-  control_level?: string;
-  comparison_timepoint?: string;
-  risk_thresholds?: {
-    Dsed?: number[];
-    Zb?: number[];
-    Sa?: number[];
-    Ln?: number[];
-    PQ?: number[];
-    Ky?: number[];
-    Zd?: number[];
-    all?: number[];
-  };
-  weights?: {
-    wRE?: number[];
-    wNM?: number[];
-    wGE?: number[];
-    wRL?: number[];
-  };
-  other_params?: Record<string, any>;
-}
-
-/**
- * 在线上以固定间距生成垂线
- * @param line 主线
- * @param startDist 起点距离 (米)
- * @param endDist 终点距离 (米)
- * @param interval 间距 (米)
- * @param crossLength 垂线总长度 (米)
- */
-function generatePerpendicularLines(
-  line: GeoJSON.Feature<GeoJSON.LineString>,
-  startDist: number,
-  endDist: number,
-  interval: number,
-  crossLength: number
-) {
-  const perpendicularLines: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-  const endpointData: { distance: number; left: number[]; right: number[] }[] = [];
-
-  // 确保 start < end
-  const actualStart = Math.min(startDist, endDist);
-  const actualEnd = Math.max(startDist, endDist);
-  const lineLength = turf.length(line, { units: 'meters' });
-  const segmentLen = actualEnd - actualStart;
-
-  console.log(`--- 生成垂线数据 (范围: ${actualStart.toFixed(2)}m - ${actualEnd.toFixed(2)}m, 段长: ${segmentLen.toFixed(2)}m, 母线总长: ${lineLength.toFixed(2)}m) ---`);
-
-  for (let d = actualStart; d <= actualEnd; d += interval) {
-    const p1 = turf.along(line, d, { units: 'meters' });
-    // 为了计算切线方向
-    const p2Offset = Math.min(d + 0.1, lineLength);
-    const p2 = turf.along(line, p2Offset, { units: 'meters' });
-
-    const relPos = segmentLen > 0 ? (d - actualStart) / segmentLen : 0;
-    console.log(`垂线位置: ${d.toFixed(2)}m, 整线归一化: ${(d / lineLength).toFixed(4)}, 区段内归一化: ${relPos.toFixed(4)}`);
-
-    let bearing = 0;
-    if (d >= lineLength - 0.1) {
-      const pPrev = turf.along(line, Math.max(0, d - 0.1), { units: 'meters' });
-      bearing = turf.bearing(pPrev, p1);
-    } else {
-      bearing = turf.bearing(p1, p2);
-    }
-
-    const leftEnd = turf.destination(p1, crossLength / 2, bearing - 90, { units: 'meters' });
-    const rightEnd = turf.destination(p1, crossLength / 2, bearing + 90, { units: 'meters' });
-
-    const leftCoords = leftEnd.geometry.coordinates;
-    const rightCoords = rightEnd.geometry.coordinates;
-
-    endpointData.push({
-      distance: d,
-      left: leftCoords,
-      right: rightCoords
-    });
-
-    perpendicularLines.push({
-      type: 'Feature',
-      properties: {
-        distance: d,
-        leftPoint: leftCoords,
-        rightPoint: rightCoords
-      },
-      geometry: {
-        type: 'LineString',
-        coordinates: [
-          leftCoords,
-          rightCoords
-        ]
-      }
-    });
-  }
-
-  return {
-    featureCollection: turf.featureCollection(perpendicularLines),
-    endpointData
-  };
-}
-
-// 定义选择组接口
-interface SelectionGroup {
-  id: string;
-  line: GeoJSON.Feature<GeoJSON.LineString>;
-  lineIndex: number | undefined; // 线在上传数据中的索引，用于判断是否同一条线
-  start: number;
-  end: number | null;
-  interval: number;
-  // 上一次实际应用到垂线上的间距，用于判断用户是否修改了间距
-  lastAppliedInterval: number;
-  length: number;
-  crossData: { distance: number; left: number[]; right: number[] }[];
-  // 该组的属性配置（如果未设置则使用全局配置）
-  properties?: SectionParams;
-}
+import type { SectionParams } from '../types/sections';
+import SectionPropertiesModal from '../components/SectionPropertiesModal';
+import EditorSidebar from '../components/EditorSidebar';
+import EditorMap from '../components/EditorMap';
+import { generatePerpendicularLines } from '../utils/geometry';
+import { ensureDefaultBasicParams, setCurrentBasicParamId } from '../services/basicParamsService';
+import type { SelectionGroup } from '../types/selection';
 
 // 新增：当前任务ID状态
 let currentTaskId: string | null = null;
-let currentBasicParamId: number | null = null; // 默认基础参数ID
-
-// 确保默认基础参数存在
-const ensureDefaultBasicParams = async (): Promise<number | null> => {
-  // 如果已经有缓存的ID，直接返回
-  if (currentBasicParamId !== null) {
-    return currentBasicParamId;
-  }
-
-  try {
-    // 先尝试获取现有的基础参数列表
-    const listResponse = await fetch('/v0/bank/basic-params');
-    if (listResponse.ok) {
-      const listData = await listResponse.json();
-      console.log('基础参数列表响应:', listData);
-      if (listData.success && listData.params && listData.params.length > 0) {
-        // 使用第一个基础参数
-        currentBasicParamId = listData.params[0].id;
-        console.log('使用现有基础参数:', currentBasicParamId);
-        return currentBasicParamId;
-      }
-    }
-
-    // 如果没有基础参数，创建一个默认的（使用后端给定的标准模板内容）
-    console.log('创建默认基础参数模板...');
-    const defaultParams = {
-      params: [
-        {
-          id: 53,
-          param_id: 'PARAM_DEFAULT_TEMPLATE',
-          param_name: '默认参数模板',
-          segment: 'Mzs',
-          current_timepoint: '202304',
-          set_name: 'standard',
-          water_qs: '10000',
-          tidal_level: 'zc',
-          bench_id: 'tiff\\Mzs\\2023\\standard\\202304\\202404.tif',
-          ref_id: 'tiff\\Mzs\\2019\\standard\\201904\\201904.tif',
-          hs: 0.5,
-          hc: 2,
-          protection_level: 'systemic',
-          control_level: 'strict',
-          comparison_timepoint: '201904',
-          risk_thresholds: {
-            Ky: [1.7, 1.35, 1],
-            Ln: [0.04, 0.12, 0.2],
-            PQ: [0.5, 1, 2.3],
-            Sa: [0.2, 0.3, 0.5],
-            Zb: [20, 30, 40],
-            Zd: [0.1, 0.15, 0.3],
-            all: [0.25, 0.5, 0.75],
-            Dsed: [0.7, 1, 1.5]
-          },
-          weights: {
-            wGE: [0.6, 0.2, 0.2],
-            wNM: [0.43, 0.32, 0.25],
-            wRE: [0.48, 0.16, 0.36],
-            wRL: [0.32, 0.43, 0.25]
-          },
-          other_params: {
-            pq_data: {
-              '2010': 2.59,
-              '2011': 0.15,
-              '2012': 2.42,
-              '2013': 0,
-              '2014': 0.67,
-              '2015': 1.29,
-              '2016': 3.2,
-              '2017': 1.1,
-              '2018': 0.29,
-              '2019': 1.68,
-              '2020': 3.68,
-              '2021': 1.35,
-              '2022': 1.1,
-              '2023': 0
-            },
-            is_default: true
-          }
-        }
-      ],
-      overwrite: false
-    };
-
-    const createResponse = await fetch('/v0/bank/basic-params', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(defaultParams)
-    });
-
-    if (!createResponse.ok) {
-      console.error('创建默认基础参数失败:', createResponse.statusText);
-      return null;
-    }
-
-    const createData = await createResponse.json();
-    if (createData.success && createData.params && createData.params.length > 0) {
-      currentBasicParamId = createData.params[0].id;
-      console.log('默认基础参数创建成功，ID:', currentBasicParamId);
-      return currentBasicParamId;
-    }
-
-    return null;
-  } catch (err) {
-    console.error('确保默认基础参数出错:', err);
-    return null;
-  }
-};
 
 // 从后端获取断面参数
 const fetchSectionParams = async (sectionId: string): Promise<SectionParams | null> => {
@@ -287,12 +54,8 @@ const fetchSectionParams = async (sectionId: string): Promise<SectionParams | nu
 };
 
 function EditorPage() {
-  const mapContainer = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<mapboxgl.Map | null>(null);
-
   // 上传的 GeoJSON 数据 (主线)
   const [uploadedData, setUploadedData] = useState<GeoJSON.FeatureCollection | null>(null);
-  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   // 生成的垂线数据
   const [perpendicularData, setPerpendicularData] = useState<GeoJSON.FeatureCollection | null>(null);
 
@@ -302,8 +65,6 @@ function EditorPage() {
 
   // 所有选择组
   const [groups, setGroups] = useState<SelectionGroup[]>([]);
-  const groupsRef = useRef(groups);
-  useEffect(() => { groupsRef.current = groups; }, [groups]);
 
   // 全局垂线配置（用于首次绘制整个 GeoJSON）
   const [globalInterval, setGlobalInterval] = useState<number>(100);
@@ -316,47 +77,27 @@ function EditorPage() {
   
   // 全局属性配置
   const [globalProperties, setGlobalProperties] = useState<SectionParams | null>(null);
-  const globalPropertiesRef = useRef(globalProperties);
-  useEffect(() => { globalPropertiesRef.current = globalProperties; }, [globalProperties]);
   // 属性配置弹窗状态
   const [showGlobalPropertiesModal, setShowGlobalPropertiesModal] = useState<boolean>(false);
   const [editingPropertiesGroupId, setEditingPropertiesGroupId] = useState<string | null>(null);
   
   // 新增状态：控制岸段选择模式
   const [isSelectingShoreLines, setIsSelectingShoreLines] = useState<boolean>(false);
-  const isSelectingShoreLinesRef = useRef(isSelectingShoreLines);
-  useEffect(() => { isSelectingShoreLinesRef.current = isSelectingShoreLines; }, [isSelectingShoreLines]);
   
   // 新增状态：控制起止点选择模式
   const [isSelectingStartEnd, setIsSelectingStartEnd] = useState<boolean>(false);
-  const isSelectingStartEndRef = useRef(isSelectingStartEnd);
-  useEffect(() => { isSelectingStartEndRef.current = isSelectingStartEnd; }, [isSelectingStartEnd]);
   
   // 新增状态：选中的用于生成垂线的线段（存储线的唯一标识）
   const [selectedLines, setSelectedLines] = useState<Set<string>>(new Set());
-  const selectedLinesRef = useRef(selectedLines);
-  useEffect(() => { selectedLinesRef.current = selectedLines; }, [selectedLines]);
   
   // 新增状态：控制断面选择模式
   const [isSelectingCrossLines, setIsSelectingCrossLines] = useState<boolean>(false);
-  const isSelectingCrossLinesRef = useRef(isSelectingCrossLines);
-  useEffect(() => { isSelectingCrossLinesRef.current = isSelectingCrossLines; }, [isSelectingCrossLines]);
   
   // 新增状态：断面编辑模式 ('select' 选择现有断面, 'add' 新建断面)
   const [crossLineEditMode, setCrossLineEditMode] = useState<'select' | 'add'>('select');
-  const crossLineEditModeRef = useRef(crossLineEditMode);
-  useEffect(() => { crossLineEditModeRef.current = crossLineEditMode; }, [crossLineEditMode]);
   
   // 新增状态：选中的断面索引
   const [selectedCrossLineIndex, setSelectedCrossLineIndex] = useState<number | null>(null);
-  const selectedCrossLineIndexRef = useRef(selectedCrossLineIndex);
-  useEffect(() => { selectedCrossLineIndexRef.current = selectedCrossLineIndex; }, [selectedCrossLineIndex]);
-
-  // 使用 Ref 跟踪配置值，确保事件监听器中能获取到最新值
-  const configRef = useRef({ interval: globalInterval, length: globalLength });
-  useEffect(() => {
-    configRef.current = { interval: globalInterval, length: globalLength };
-  }, [globalInterval, globalLength]);
 
   // 挂载时拉取可用的基础参数模板列表
   useEffect(() => {
@@ -378,8 +119,8 @@ function EditorPage() {
             const paramId = first.param_id ?? first.id ?? null;
             if (paramId !== null) {
               setSelectedBasicParamIdState(String(paramId));
-              // 同步到全局变量 currentBasicParamId（保留数字 id 供某些旧接口使用）
-              currentBasicParamId = first.id ?? null;
+              // 同步到服务中的基础参数ID（保留数字 id 供后续使用）
+              setCurrentBasicParamId(first.id ?? null);
               // 同步全局属性以供 UI 使用
               // 若需要完整详情，可后续用户选择时 fetch 单个模板
             }
@@ -397,7 +138,7 @@ function EditorPage() {
   const handleSelectBasicParam = async (paramIdStr: string | null) => {
     if (!paramIdStr) {
       setSelectedBasicParamIdState(null);
-      currentBasicParamId = null;
+      setCurrentBasicParamId(null);
       setGlobalProperties(null);
       return;
     }
@@ -435,8 +176,8 @@ function EditorPage() {
 
         setGlobalProperties(params);
         setSelectedBasicParamIdState(paramIdStr);
-        // 同步到模块级变量 currentBasicParamId（使用数字 id，供某些内部函数如 ensureDefaultBasicParams 使用）
-        currentBasicParamId = data.param.id ?? null;
+        // 同步到服务中的基础参数ID
+        setCurrentBasicParamId(data.param.id ?? null);
       }
     } catch (err) {
       console.warn('加载模板详情失败:', err);
@@ -527,7 +268,7 @@ function EditorPage() {
       bearing = turf.bearing(pointOnLine, nextPoint);
     }
 
-    const currentLength = configRef.current.length;
+    const currentLength = globalLength;
     const leftEnd = turf.destination(pointOnLine, currentLength / 2, bearing - 90, { units: 'meters' });
     const rightEnd = turf.destination(pointOnLine, currentLength / 2, bearing + 90, { units: 'meters' });
 
@@ -588,7 +329,7 @@ function EditorPage() {
         if (params) {
           console.log('获取到断面参数:', params);
           // 如果这是第一个断面，设置为全局参数
-          if (!globalPropertiesRef.current) {
+          if (!globalProperties) {
             setGlobalProperties(params);
           }
         }
@@ -1227,9 +968,6 @@ function EditorPage() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // 记录上传文件名，供任务使用
-    setUploadedFileName(file.name);
-
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
@@ -1268,10 +1006,6 @@ function EditorPage() {
           console.error('上传 GeoJSON 到后端出错:', err);
         });
 
-        if (mapRef.current && geojson.features.length > 0) {
-          const bbox = turf.bbox(geojson);
-          mapRef.current.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 50 });
-        }
       } catch (err) {
         alert('解析 GeoJSON 失败，请检查文件格式');
       }
@@ -1279,558 +1013,7 @@ function EditorPage() {
     reader.readAsText(file);
   };
 
-  // 核心逻辑：同步垂线到地图数据源
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const updateMapSources = () => {
-      const crossLinesSource = map.getSource('perpendicular-lines') as mapboxgl.GeoJSONSource;
-      if (crossLinesSource) {
-        crossLinesSource.setData(perpendicularData || turf.featureCollection([]));
-      }
-    };
-
-    if (map.isStyleLoaded()) {
-      updateMapSources();
-    } else {
-      map.once('idle', updateMapSources);
-    }
-  }, [perpendicularData]);
-
-  // 同步上传的数据到地图
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !uploadedData) return;
-
-    const updateSource = () => {
-      const source = map.getSource('uploaded-data') as mapboxgl.GeoJSONSource;
-      if (source) {
-        source.setData(uploadedData);
-      }
-    };
-
-    if (map.isStyleLoaded()) {
-      updateSource();
-    } else {
-      map.once('idle', updateSource);
-    }
-  }, [uploadedData]);
-
-  // 同步选中线段的高亮显示
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !uploadedData) return;
-
-    const updateSelectedLines = () => {
-      // 创建一个新的图层来高亮选中的线段
-      const selectedSource = map.getSource('selected-shore-lines') as mapboxgl.GeoJSONSource;
-      if (selectedSource) {
-        const selectedFeatures = uploadedData.features.filter((_, index) => 
-          selectedLines.has(`line-${index}`)
-        );
-        selectedSource.setData(turf.featureCollection(selectedFeatures));
-      }
-    };
-
-    if (map.isStyleLoaded()) {
-      updateSelectedLines();
-    } else {
-      map.once('idle', updateSelectedLines);
-    }
-  }, [selectedLines, uploadedData]);
-
-  // 同步选择组数据到地图
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const updateMapSources = () => {
-      // 更新标记点数据源 (所有起止点)
-      const pointSource = map.getSource('selection-points') as mapboxgl.GeoJSONSource;
-      if (pointSource) {
-        const allPoints: GeoJSON.Feature<GeoJSON.Point>[] = [];
-        groups.forEach(group => {
-          if (group.start !== null) {
-            allPoints.push(turf.along(group.line, group.start, { units: 'meters' }) as GeoJSON.Feature<GeoJSON.Point>);
-          }
-          if (group.end !== null) {
-            allPoints.push(turf.along(group.line, group.end, { units: 'meters' }) as GeoJSON.Feature<GeoJSON.Point>);
-          }
-        });
-        pointSource.setData(turf.featureCollection(allPoints));
-      }
-
-      // 更新主线高亮段
-      const activeLineSource = map.getSource('active-line') as mapboxgl.GeoJSONSource;
-      if (activeLineSource) {
-        const segments: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-        groups.forEach(group => {
-          if (group.start !== null && group.end !== null) {
-            try {
-              const start = Math.min(group.start, group.end);
-              const end = Math.max(group.start, group.end);
-              const segment = turf.lineSliceAlong(group.line, start, end, { units: 'meters' });
-              segment.properties = { groupId: group.id };
-              segments.push(segment as GeoJSON.Feature<GeoJSON.LineString>);
-            } catch (err) {
-              console.warn('切割线段失败', err);
-            }
-          }
-        });
-        activeLineSource.setData(turf.featureCollection(segments));
-      }
-    };
-
-    if (map.isStyleLoaded()) {
-      updateMapSources();
-    } else {
-      map.once('idle', updateMapSources);
-    }
-  }, [groups]);
-
-  // 控制垂线图层显影
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    if (map.getLayer('perpendicular-lines-layer')) {
-      map.setLayoutProperty(
-        'perpendicular-lines-layer',
-        'visibility',
-        showCrossLines ? 'visible' : 'none'
-      );
-    }
-    if (map.getLayer('perpendicular-lines-hit-target')) {
-      map.setLayoutProperty(
-        'perpendicular-lines-hit-target',
-        'visibility',
-        showCrossLines ? 'visible' : 'none'
-      );
-    }
-  }, [showCrossLines]);
-  
-  // 同步选中断面的高亮显示
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !perpendicularData) return;
-
-    const updateSelectedCrossLine = () => {
-      const selectedSource = map.getSource('selected-cross-line') as mapboxgl.GeoJSONSource;
-      if (selectedSource) {
-        if (selectedCrossLineIndex !== null && perpendicularData.features[selectedCrossLineIndex]) {
-          selectedSource.setData(turf.featureCollection([perpendicularData.features[selectedCrossLineIndex]]));
-        } else {
-          selectedSource.setData(turf.featureCollection([]));
-        }
-      }
-    };
-
-    if (map.isStyleLoaded()) {
-      updateSelectedCrossLine();
-    } else {
-      map.once('idle', updateSelectedCrossLine);
-    }
-  }, [selectedCrossLineIndex, perpendicularData]);
-
-  useEffect(() => {
-    if (!mapContainer.current) return;
-
-    // 初始化地图
-    const map = new mapboxgl.Map({
-      container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/light-v10',
-      center: [119.89600633, 32.22907004],
-      zoom: 7,
-    });
-
-    mapRef.current = map;
-    map.addControl(new mapboxgl.NavigationControl(), 'top-right');
-
-    map.on('load', () => {
-      // 初始化数据源
-      map.addSource('perpendicular-lines', { type: 'geojson', data: turf.featureCollection([]) });
-      map.addSource('uploaded-data', { type: 'geojson', data: turf.featureCollection([]) });
-      map.addSource('selection-points', { type: 'geojson', data: turf.featureCollection([]) });
-      map.addSource('snap-point', { type: 'geojson', data: turf.featureCollection([]) });
-      map.addSource('active-line', { type: 'geojson', data: turf.featureCollection([]), lineMetrics: true });
-      map.addSource('selected-shore-lines', { type: 'geojson', data: turf.featureCollection([]) });
-
-      // 上传线的点击捕获层（透明但宽，便于点击）
-      map.addLayer({
-        id: 'uploaded-lines-hit-target',
-        type: 'line',
-        source: 'uploaded-data',
-        filter: ['==', '$type', 'LineString'],
-        paint: {
-          'line-width': 30,
-          'line-opacity': 0
-        }
-      });
-
-      // 上传线的基础显示层
-      map.addLayer({
-        id: 'uploaded-lines',
-        type: 'line',
-        source: 'uploaded-data',
-        filter: ['==', '$type', 'LineString'],
-        paint: {
-          'line-color': '#94a3b8',
-          'line-width': 2
-        }
-      });
-
-      // 高亮选中的岸段
-      map.addLayer({
-        id: 'selected-shore-lines-layer',
-        type: 'line',
-        source: 'selected-shore-lines',
-        filter: ['==', '$type', 'LineString'],
-        paint: {
-          'line-color': '#f59e0b',
-          'line-width': 4
-        }
-      });
-
-      // 高亮选中的线段
-      map.addLayer({
-        id: 'active-line-layer',
-        type: 'line',
-        source: 'active-line',
-        paint: {
-          'line-color': '#10b981',
-          'line-width': 6
-        }
-      });
-
-      // 断面点击捕获层（透明但宽）
-      map.addLayer({
-        id: 'perpendicular-lines-hit-target',
-        type: 'line',
-        source: 'perpendicular-lines',
-        paint: {
-          'line-width': 20,
-          'line-opacity': 0
-        }
-      });
-      
-      // 断面显示层
-      map.addLayer({
-        id: 'perpendicular-lines-layer',
-        type: 'line',
-        source: 'perpendicular-lines',
-        paint: { 'line-color': '#ef4444', 'line-width': 2 }
-      });
-      
-      // 选中断面高亮层
-      map.addSource('selected-cross-line', { type: 'geojson', data: turf.featureCollection([]) });
-      map.addLayer({
-        id: 'selected-cross-line-layer',
-        type: 'line',
-        source: 'selected-cross-line',
-        paint: { 'line-color': '#3b82f6', 'line-width': 4 }
-      });
-
-      // 起止点标记
-      map.addLayer({
-        id: 'points-layer',
-        type: 'circle',
-        source: 'selection-points',
-        paint: {
-          'circle-radius': 8,
-          'circle-color': '#3b82f6',
-          'circle-stroke-width': 2,
-          'circle-stroke-color': '#ffffff'
-        }
-      });
-
-      // 渲染吸附点（鼠标靠近线时的反馈）
-      map.addLayer({
-        id: 'snap-point-layer',
-        type: 'circle',
-        source: 'snap-point',
-        paint: {
-          'circle-radius': 5,
-          'circle-color': '#ffffff',
-          'circle-stroke-width': 2,
-          'circle-stroke-color': '#3b82f6'
-        }
-      });
-
-      const hitLayers = ['uploaded-lines-hit-target'];
-      const crossLineHitLayers = ['perpendicular-lines-hit-target'];
-
-      // 点击事件处理
-      map.on('click', (e) => {
-        // 模式3：断面编辑模式
-        if (isSelectingCrossLinesRef.current) {
-          const editMode = crossLineEditModeRef.current;
-          
-          if (editMode === 'select') {
-            // 选择现有断面
-            const crossLineFeatures = map.queryRenderedFeatures(e.point, { layers: crossLineHitLayers });
-            console.log(`点击断面，查询到 ${crossLineFeatures?.length || 0} 个要素`);
-            
-            if (crossLineFeatures && crossLineFeatures.length > 0) {
-              const clickedFeature = crossLineFeatures[0];
-              const crossLineId = clickedFeature.properties?.crossLineId;
-              
-              console.log(`点击的断面ID: ${crossLineId}`);
-              
-              if (crossLineId !== undefined && crossLineId !== null) {
-                setSelectedCrossLineIndex(crossLineId);
-                console.log(`选中断面索引: ${crossLineId}`);
-              } else {
-                console.warn('断面没有crossLineId属性，尝试坐标匹配');
-                // 备用方案：使用坐标匹配
-                if (perpendicularData) {
-                  const clickedGeometry = clickedFeature.geometry as GeoJSON.LineString;
-                  const clickedCoords = clickedGeometry.coordinates;
-                  
-                  const index = perpendicularData.features.findIndex(feature => {
-                    if (feature.geometry.type !== 'LineString') return false;
-                    const coords = feature.geometry.coordinates;
-                    const tolerance = 0.00001;
-                    return Math.abs(coords[0][0] - clickedCoords[0][0]) < tolerance && 
-                           Math.abs(coords[0][1] - clickedCoords[0][1]) < tolerance &&
-                           Math.abs(coords[1][0] - clickedCoords[1][0]) < tolerance && 
-                           Math.abs(coords[1][1] - clickedCoords[1][1]) < tolerance;
-                  });
-                  
-                  if (index !== -1) {
-                    setSelectedCrossLineIndex(index);
-                    console.log(`通过坐标匹配选中断面索引: ${index}`);
-                  } else {
-                    console.warn('无法通过坐标匹配找到断面');
-                  }
-                }
-              }
-            }
-          } else if (editMode === 'add') {
-            // 新建断面：点击岸段上的点
-            const shoreLineFeatures = map.queryRenderedFeatures(e.point, { layers: hitLayers });
-            
-            if (shoreLineFeatures && shoreLineFeatures.length > 0) {
-              const clickedFeature = shoreLineFeatures[0];
-              const lineGeo = clickedFeature.geometry as GeoJSON.LineString;
-              const lineFeature = turf.feature(lineGeo, clickedFeature.properties) as GeoJSON.Feature<GeoJSON.LineString>;
-              
-              // 计算点击位置在线上的距离
-              const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-              const distanceOnLine = snapped.properties.location ?? 0;
-              
-              console.log(`点击岸段新建断面，距离: ${distanceOnLine.toFixed(2)}m`);
-              createCrossLineAtPoint(lineFeature, distanceOnLine);
-            }
-          }
-          return;
-        }
-        
-        const features = map.queryRenderedFeatures(e.point, { layers: hitLayers });
-        const feature = features?.[0];
-        
-        if (!feature) return;
-
-        // 构建当前点击的线要素
-        const lineGeo = feature.geometry as GeoJSON.LineString;
-        const lineFeature = turf.feature(lineGeo, feature.properties) as GeoJSON.Feature<GeoJSON.LineString>;
-        
-        // 获取线的索引作为唯一标识
-        const lineIndex = feature.properties?.index;
-        const lineId = lineIndex !== undefined ? `line-${lineIndex}` : `line-${Math.random()}`;
-
-        // 模式1：选择岸段模式
-        if (isSelectingShoreLinesRef.current) {
-          setSelectedLines(prev => {
-            const newSet = new Set(prev);
-            if (newSet.has(lineId)) {
-              newSet.delete(lineId);
-              console.log(`取消选择岸段: ${lineId}`);
-            } else {
-              newSet.add(lineId);
-              console.log(`选择岸段: ${lineId}`);
-            }
-            return newSet;
-          });
-          return;
-        }
-        
-        // 模式2：选择起止点模式
-        if (!isSelectingStartEndRef.current) {
-          return; // 如果未开启起止点选择模式，不处理
-        }
-
-        const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-        const dist = snapped.properties.location ?? 0;
-        const totalLineLength = turf.length(lineFeature, { units: 'meters' });
-
-        const currentGroups = groupsRef.current;
-        const activeIndex = currentGroups.findIndex(g => g.end === null);
-        const { interval, length } = configRef.current;
-
-        if (activeIndex === -1) {
-          // 创建新组
-          console.log(`[设置起点] 线索引: ${lineIndex}, 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
-          const newGroup: SelectionGroup = {
-            id: Math.random().toString(36).substr(2, 9),
-            line: lineFeature,
-            lineIndex: lineIndex,
-            start: dist,
-            end: null,
-            interval: interval,
-            lastAppliedInterval: interval,
-            length: length,
-            crossData: []
-          };
-          setGroups(prev => [...prev, newGroup]);
-        } else {
-          // 检查正在进行的组是否在同一条线上（通过lineIndex判断）
-          const activeGroup = currentGroups[activeIndex];
-          const isSameLine = lineIndex !== undefined && lineIndex === activeGroup.lineIndex;
-
-          if (isSameLine) {
-            // 在同一条线上，结束该组（不立即生成垂线）
-            console.log(`[设置终点] 线索引: ${lineIndex}, 距离: ${dist.toFixed(2)}m, 整线归一化: ${(dist / totalLineLength).toFixed(4)}`);
-            
-            setGroups(prev => {
-              const updated = [...prev];
-              const idx = updated.findIndex(g => g.id === activeGroup.id);
-              if (idx !== -1) {
-                updated[idx] = { ...activeGroup, end: dist };
-              }
-              return updated;
-            });
-          } else {
-            // 在不同线上，重置起点
-            console.log(`[跨线点击] 从线${activeGroup.lineIndex}跳到线${lineIndex}，重置起点: ${dist.toFixed(2)}m`);
-            
-            const newGroup: SelectionGroup = {
-              id: Math.random().toString(36).substr(2, 9),
-              line: lineFeature,
-              lineIndex: lineIndex,
-              start: dist,
-              end: null,
-              interval: interval,
-              lastAppliedInterval: interval,
-              length: length,
-              crossData: []
-            };
-            
-            setGroups(prev => {
-              const filtered = prev.filter(g => g.end !== null);
-              return [...filtered, newGroup];
-            });
-          }
-        }
-      });
-
-      // 断面鼠标悬停效果
-      map.on('mousemove', crossLineHitLayers, (e) => {
-        if (isSelectingCrossLinesRef.current && crossLineEditModeRef.current === 'select') {
-          map.getCanvas().style.cursor = 'pointer';
-          
-          // 显示断面中点作为视觉反馈
-          const features = e.features;
-          if (features && features.length > 0) {
-            const feature = features[0];
-            const geometry = feature.geometry as GeoJSON.LineString;
-            const coords = geometry.coordinates;
-            
-            // 计算中点
-            const midPoint = turf.point([
-              (coords[0][0] + coords[1][0]) / 2,
-              (coords[0][1] + coords[1][1]) / 2
-            ]);
-            
-            const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-            if (source) source.setData(midPoint);
-          }
-        }
-      });
-      
-      // 新建模式下，在岸段上显示吸附点
-      map.on('mousemove', hitLayers, (e) => {
-        if (isSelectingCrossLinesRef.current && crossLineEditModeRef.current === 'add') {
-          map.getCanvas().style.cursor = 'crosshair';
-          
-          const feature = e.features?.[0];
-          if (!feature) return;
-
-          const lineGeo = feature.geometry as GeoJSON.LineString;
-          const lineFeature = turf.feature(lineGeo) as GeoJSON.Feature<GeoJSON.LineString>;
-
-          const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-          const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-          if (source) source.setData(snapped);
-          return;
-        }
-        
-        // 只在选择岸段或选择起止点模式下显示吸附效果
-        if (!isSelectingShoreLinesRef.current && !isSelectingStartEndRef.current) {
-          return;
-        }
-        
-        const feature = e.features?.[0];
-        if (!feature) return;
-
-        const lineGeo = feature.geometry as GeoJSON.LineString;
-        const lineFeature = turf.feature(lineGeo) as GeoJSON.Feature<GeoJSON.LineString>;
-
-        const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-        const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-        if (source) source.setData(snapped);
-
-        map.getCanvas().style.cursor = 'pointer';
-      });
-
-      // 鼠标离开捕获区域：清空吸附点
-      map.on('mouseleave', hitLayers, () => {
-        const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-        if (source) source.setData(turf.featureCollection([]));
-
-        map.getCanvas().style.cursor = '';
-      });
-      
-      // 断面鼠标悬停效果
-      map.on('mousemove', crossLineHitLayers, (e) => {
-        if (isSelectingCrossLinesRef.current) {
-          map.getCanvas().style.cursor = 'pointer';
-          
-          // 显示断面中点作为视觉反馈
-          const features = e.features;
-          if (features && features.length > 0) {
-            const feature = features[0];
-            const geometry = feature.geometry as GeoJSON.LineString;
-            const coords = geometry.coordinates;
-            
-            // 计算中点
-            const midPoint = turf.point([
-              (coords[0][0] + coords[1][0]) / 2,
-              (coords[0][1] + coords[1][1]) / 2
-            ]);
-            
-            const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-            if (source) source.setData(midPoint);
-          }
-        }
-      });
-      
-      map.on('mouseleave', crossLineHitLayers, () => {
-        if (isSelectingCrossLinesRef.current) {
-          map.getCanvas().style.cursor = '';
-          
-          // 清除断面中点
-          const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
-          if (source) source.setData(turf.featureCollection([]));
-        }
-      });
-    });
-
-    return () => {
-      map.remove();
-      mapRef.current = null;
-    };
-  }, []);
+  // 地图相关逻辑已移动到 EditorMap 组件中
 
   // 清除所有组
   const onClear = () => {
@@ -1874,614 +1057,71 @@ function EditorPage() {
   const totalCrossLinesCount = perpendicularData?.features.length || 0;
   const totalSelectedSegments = groups.filter(g => g.end !== null).length;
 
-  // 属性配置弹窗组件
-  const PropertiesModal = ({ 
-    config, 
-    onSave, 
-    onClose,
-    title,
-    sectionId
-  }: { 
-    config: SectionParams | null; 
-    onSave: (newConfig: SectionParams) => void;
-    onClose: () => void;
-    title: string;
-    sectionId?: string;
-  }) => {
-    const [params, setParams] = useState<SectionParams>(config || {});
-    const [isSaving, setIsSaving] = useState(false);
-
-    const handleSave = async () => {
-      setIsSaving(true);
-      try {
-        // 如果有sectionId，调用PUT接口更新后端
-        if (sectionId) {
-          const response = await fetch(`/v0/bank/sections/${sectionId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(params)
-          });
-
-          if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`更新断面参数失败: ${response.statusText} - ${errorText}`);
-          }
-
-          console.log('断面参数更新成功');
-        }
-
-        // 更新前端状态
-        onSave(params);
-        onClose();
-      } catch (err: any) {
-        console.error('保存参数失败:', err);
-        alert(`保存失败: ${err.message}`);
-      } finally {
-        setIsSaving(false);
-      }
-    };
-
-    return (
-      <div style={{
-        position: 'fixed',
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        backgroundColor: 'rgba(0,0,0,0.5)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 10000
-      }}>
-        <div style={{
-          backgroundColor: 'white',
-          padding: '20px',
-          borderRadius: '8px',
-          maxWidth: '800px',
-          maxHeight: '80vh',
-          overflow: 'auto',
-          boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
-        }}>
-          <h3 style={{ marginTop: 0 }}>{title}</h3>
-          
-          {/* 基础信息 */}
-          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
-            <legend style={{ fontWeight: 'bold' }}>基础信息</legend>
-            
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>参数名称:</label>
-                <input
-                  type="text"
-                  value={params.param_name || ''}
-                  onChange={(e) => setParams({...params, param_name: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-              
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>河段编码:</label>
-                <input
-                  type="text"
-                  value={params.segment || ''}
-                  onChange={(e) => setParams({...params, segment: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>当前时间点:</label>
-                <input
-                  type="text"
-                  value={params.current_timepoint || ''}
-                  onChange={(e) => setParams({...params, current_timepoint: e.target.value})}
-                  placeholder="YYYY-MM-DD"
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>对比时间点:</label>
-                <input
-                  type="text"
-                  value={params.comparison_timepoint || ''}
-                  onChange={(e) => setParams({...params, comparison_timepoint: e.target.value})}
-                  placeholder="YYYY-MM-DD"
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>数据集名称:</label>
-                <input
-                  type="text"
-                  value={params.set_name || ''}
-                  onChange={(e) => setParams({...params, set_name: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>流量:</label>
-                <input
-                  type="text"
-                  value={params.water_qs || ''}
-                  onChange={(e) => setParams({...params, water_qs: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>潮位:</label>
-                <select
-                  value={params.tidal_level || ''}
-                  onChange={(e) => setParams({...params, tidal_level: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                >
-                  <option value="">请选择</option>
-                  <option value="xc">小潮</option>
-                  <option value="zc">中潮</option>
-                  <option value="dc">大潮</option>
-                </select>
-              </div>
-            </div>
-          </fieldset>
-
-          {/* DEM参数 */}
-          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
-            <legend style={{ fontWeight: 'bold' }}>DEM参数</legend>
-            
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>基准DEM (bench_id):</label>
-                <input
-                  type="text"
-                  value={params.bench_id || ''}
-                  onChange={(e) => setParams({...params, bench_id: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>参考DEM (ref_id):</label>
-                <input
-                  type="text"
-                  value={params.ref_id || ''}
-                  onChange={(e) => setParams({...params, ref_id: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-            </div>
-          </fieldset>
-
-          {/* 水深参数 */}
-          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
-            <legend style={{ fontWeight: 'bold' }}>水深参数</legend>
-            
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>hs:</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={params.hs || ''}
-                  onChange={(e) => setParams({...params, hs: Number(e.target.value)})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>hc:</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={params.hc || ''}
-                  onChange={(e) => setParams({...params, hc: Number(e.target.value)})}
-                  style={{ width: '100%', padding: '5px' }}
-                />
-              </div>
-            </div>
-          </fieldset>
-
-          {/* 防护控制参数 */}
-          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
-            <legend style={{ fontWeight: 'bold' }}>防护控制参数</legend>
-            
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>防护等级:</label>
-                <select
-                  value={params.protection_level || ''}
-                  onChange={(e) => setParams({...params, protection_level: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                >
-                  <option value="">请选择</option>
-                  <option value="systemic">系统防护</option>
-                  <option value="normal">常规防护</option>
-                  <option value="low">低防护</option>
-                  <option value="no">无防护</option>
-                </select>
-              </div>
-
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>控制等级:</label>
-                <select
-                  value={params.control_level || ''}
-                  onChange={(e) => setParams({...params, control_level: e.target.value})}
-                  style={{ width: '100%', padding: '5px' }}
-                >
-                  <option value="">请选择</option>
-                  <option value="strict">严格控制</option>
-                  <option value="normal">常规控制</option>
-                  <option value="low">低控制</option>
-                  <option value="no">无控制</option>
-                </select>
-              </div>
-            </div>
-          </fieldset>
-
-          {/* 风险阈值 */}
-          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
-            <legend style={{ fontWeight: 'bold' }}>风险阈值 (JSON格式)</legend>
-            <textarea
-              value={JSON.stringify(params.risk_thresholds || {}, null, 2)}
-              onChange={(e) => {
-                try {
-                  const parsed = JSON.parse(e.target.value);
-                  setParams({...params, risk_thresholds: parsed});
-                } catch (err) {
-                  // 用户正在编辑，暂不更新
-                }
-              }}
-              rows={8}
-              style={{ width: '100%', padding: '5px', fontFamily: 'monospace', fontSize: '12px' }}
-            />
-            <small style={{ color: '#666' }}>
-              示例: {`{"Dsed": [0.3, 0.5, 0.7], "Zb": [2.0, 4.0, 6.0], ...}`}
-            </small>
-          </fieldset>
-
-          {/* 权重参数 */}
-          <fieldset style={{ marginBottom: '15px', padding: '10px', borderRadius: '4px' }}>
-            <legend style={{ fontWeight: 'bold' }}>权重参数 (JSON格式)</legend>
-            <textarea
-              value={JSON.stringify(params.weights || {}, null, 2)}
-              onChange={(e) => {
-                try {
-                  const parsed = JSON.parse(e.target.value);
-                  setParams({...params, weights: parsed});
-                } catch (err) {
-                  // 用户正在编辑，暂不更新
-                }
-              }}
-              rows={5}
-              style={{ width: '100%', padding: '5px', fontFamily: 'monospace', fontSize: '12px' }}
-            />
-            <small style={{ color: '#666' }}>
-              示例: {`{"wRE": [0.3, 0.4, 0.3], "wNM": [0.4, 0.3, 0.3], ...}`}
-            </small>
-          </fieldset>
-
-          <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-            <button 
-              onClick={onClose}
-              disabled={isSaving}
-              style={{ 
-                padding: '8px 16px', 
-                cursor: isSaving ? 'not-allowed' : 'pointer',
-                opacity: isSaving ? 0.6 : 1
-              }}
-            >
-              取消
-            </button>
-            <button 
-              onClick={handleSave}
-              disabled={isSaving}
-              style={{ 
-                padding: '8px 16px', 
-                backgroundColor: '#3b82f6', 
-                color: 'white', 
-                border: 'none',
-                borderRadius: '4px',
-                cursor: isSaving ? 'not-allowed' : 'pointer',
-                opacity: isSaving ? 0.6 : 1
-              }}
-            >
-              {isSaving ? '保存中...' : '保存'}
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
   return (
     <div className="map-wrapper">
-      <div ref={mapContainer} className="map-full" />
-      <div className="upload-control">
-        <label className="upload-button">
-          上传 GeoJSON
-          <input
-            type="file"
-            accept=".geojson,application/json"
-            onChange={handleFileUpload}
-            style={{ display: 'none' }}
-          />
-        </label>
-        <div style={{ marginTop: 8 }}>
-          <label style={{ fontSize: 12, marginRight: 8 }}>选择参数模板：</label>
-          <select
-            value={selectedBasicParamIdState ?? ''}
-            onChange={(e) => handleSelectBasicParam(e.target.value || null)}
-            style={{ padding: '4px 6px', fontSize: 13 }}
-          >
-            <option value="">（不使用模板）</option>
-            {basicParamsList.map((p: any, idx: number) => {
-              const paramId = p.param_id ?? p.id ?? idx;
-              const name = p.param_name || p.paramName || String(paramId);
-              return (
-                <option key={String(paramId)} value={String(paramId)}>{name}</option>
-              );
-            })}
-          </select>
-        </div>
-        {uploadedData && (
-          <div className="upload-info">
-            已加载 {uploadedData.features.length} 个要素
-            <br />
-            已选线段: {totalSelectedSegments} | 垂线总数: {totalCrossLinesCount}
-          </div>
-        )}
-        
-        <div className="config-section">
-          <h4>1️⃣ 全局垂线配置</h4>
-          <div className="config-item">
-            <label>垂线间距 (m):</label>
-            <input
-              type="number"
-              value={globalInterval}
-              onChange={(e) => setGlobalInterval(Number(e.target.value))}
-              min="10"
-              step="10"
-            />
-          </div>
-          <div className="config-item">
-            <label>垂线总长 (m):</label>
-            <input
-              type="number"
-              value={globalLength}
-              onChange={(e) => setGlobalLength(Number(e.target.value))}
-              min="100"
-              step="100"
-            />
-          </div>
-          <div style={{marginTop: '10px', marginBottom: '10px'}}>
-            <button 
-              className={`toggle-button ${isSelectingShoreLines ? 'active' : ''}`}
-              onClick={toggleShoreLineSelection}
-              style={{marginRight: '5px'}}
-            >
-              {isSelectingShoreLines ? '✅ 正在选择岸段' : '🎯 选择岸段'}
-            </button>
-            <button 
-              className="generate-button"
-              onClick={selectAllShoreLines}
-              style={{marginRight: '5px'}}
-            >
-              ✔️ 全选岸段
-            </button>
-          </div>
-          <p style={{fontSize: '13px', color: '#64748b', margin: '5px 0'}}>
-            已选择 {selectedLines.size} 个岸段
-            {isSelectingShoreLines && ' (点击地图上的线选择/取消选择)'}
-          </p>
-          <button className="generate-button" onClick={handleGenerateSections}>📏 绘制断面</button>
-          {perpendicularData && perpendicularData.features.length > 0 && (
-            <button 
-              className="generate-button" 
-              onClick={() => setShowGlobalPropertiesModal(true)}
-              style={{ marginTop: '10px', backgroundColor: '#8b5cf6' }}
-            >
-              ⚙️ 属性配置
-            </button>
-          )}
-        </div>
-
-        <div className="config-section">
-          <h4>2️⃣ 选择起止点（在地图上点击）</h4>
-          <button 
-            className={`toggle-button ${isSelectingStartEnd ? 'active' : ''}`}
-            onClick={toggleStartEndSelection}
-            style={{marginBottom: '10px'}}
-          >
-            {isSelectingStartEnd ? '✅ 起止点选择已开启' : '📍 开启起止点选择'}
-          </button>
-          <p style={{fontSize: '13px', color: '#64748b', margin: '5px 0'}}>
-            {isSelectingStartEnd ? '提示：在地图线上点击两次选择起止点' : '点击上方按钮开启起止点选择模式'}
-          </p>
-        </div>
-
-        {groups.length > 0 && (
-          <div className="groups-list">
-            <h4>选择组 ({groups.length})</h4>
-            {groups.map((g, idx) => (
-              <div key={g.id} className={`group-item ${editingGroupId === g.id ? 'editing' : ''}`}>
-                <div className="group-header">
-                  <span>组 {idx + 1}: {g.end === null ? '待选终点' : `已选 (${g.start.toFixed(0)}m - ${g.end.toFixed(0)}m)`}</span>
-                  <div className="group-actions">
-                    {g.end !== null && (
-                      <button 
-                        className={`edit-button ${editingGroupId === g.id ? 'active' : ''}`}
-                        onClick={() => handleEditGroup(g.id)}
-                      >
-                        {editingGroupId === g.id ? '✅ 编辑中' : '✏️ 编辑'}
-                      </button>
-                    )}
-                    <button onClick={() => deleteGroup(g.id)}>删除</button>
-                  </div>
-                </div>
-                {editingGroupId === g.id && g.end !== null && (
-                  <div className="group-config">
-                    <div className="config-item">
-                      <label>间距 (m):</label>
-                      <input
-                        type="number"
-                        value={g.interval}
-                        onChange={(e) => updateGroupConfig(g.id, 'interval', Number(e.target.value))}
-                        min="10"
-                        step="10"
-                      />
-                    </div>
-                    <div className="config-item">
-                      <label>长度 (m):</label>
-                      <input
-                        type="number"
-                        value={g.length}
-                        onChange={(e) => updateGroupConfig(g.id, 'length', Number(e.target.value))}
-                        min="100"
-                        step="100"
-                      />
-                    </div>
-                    <button 
-                      className="generate-button" 
-                      onClick={() => setEditingPropertiesGroupId(g.id)}
-                      style={{ marginBottom: '10px', backgroundColor: '#8b5cf6' }}
-                    >
-                      ⚙️ 属性配置
-                    </button>
-                    <button className="apply-button" onClick={handleApplyCustomSegments}>✅ 应用配置</button>
-                  </div>
-                )}
-                {g.crossData.length > 0 && (
-                  <div className="group-info">
-                    垂线: {g.crossData.length} 条 | 间距: {g.interval}m | 长度: {g.length}m
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="config-section">
-          <h4>3️⃣ 断面操作</h4>
-          <button 
-            className={`toggle-button ${isSelectingCrossLines ? 'active' : ''}`}
-            onClick={toggleCrossLineSelection}
-            style={{marginBottom: '10px'}}
-          >
-            {isSelectingCrossLines ? '✅ 断面编辑已开启' : '🎯 开启断面编辑'}
-          </button>
-          
-          {isSelectingCrossLines && (
-            <div style={{marginBottom: '10px', display: 'flex', gap: '5px'}}>
-              <button
-                className={`toggle-button ${crossLineEditMode === 'select' ? 'active' : ''}`}
-                onClick={() => {
-                  setCrossLineEditMode('select');
-                  setSelectedCrossLineIndex(null);
-                }}
-                style={{flex: 1}}
-              >
-                ✏️ 选择断面
-              </button>
-              <button
-                className={`toggle-button ${crossLineEditMode === 'add' ? 'active' : ''}`}
-                onClick={() => {
-                  setCrossLineEditMode('add');
-                  setSelectedCrossLineIndex(null);
-                }}
-                style={{flex: 1}}
-              >
-                ➕ 新建断面
-              </button>
-            </div>
-          )}
-          
-          {selectedCrossLineIndex !== null && (
-            <div style={{marginBottom: '10px', padding: '10px', backgroundColor: '#f0f9ff', borderRadius: '4px'}}>
-              <p style={{margin: '0 0 10px 0', fontWeight: 'bold', color: '#0369a1'}}>已选中断面 #{selectedCrossLineIndex + 1}</p>
-              <div style={{display: 'flex', gap: '5px', flexWrap: 'wrap'}}>
-                <button 
-                  onClick={() => translateSelectedCrossLine(-10)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ⬅️ -10m
-                </button>
-                <button 
-                  onClick={() => translateSelectedCrossLine(-1)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ⬅️ -1m
-                </button>
-                <button 
-                  onClick={() => translateSelectedCrossLine(1)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ➡️ +1m
-                </button>
-                <button 
-                  onClick={() => translateSelectedCrossLine(10)}
-                  style={{padding: '5px 10px', fontSize: '12px'}}
-                >
-                  ➡️ +10m
-                </button>
-              </div>
-              <div style={{display: 'flex', gap: '5px', marginTop: '10px'}}>
-                <button 
-                  onClick={configureSelectedCrossLineProperties}
-                  style={{flex: 1, padding: '8px', backgroundColor: '#8b5cf6', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
-                >
-                  ⚙️ 属性配置
-                </button>
-                <button 
-                  onClick={deleteSelectedCrossLine}
-                  style={{flex: 1, padding: '8px', backgroundColor: '#ef4444', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
-                >
-                  🗑️ 删除
-                </button>
-              </div>
-            </div>
-          )}
-          <p style={{fontSize: '13px', color: '#64748b', margin: '5px 0'}}>
-            {isSelectingCrossLines 
-              ? (crossLineEditMode === 'select' 
-                  ? '💡 点击地图上的断面进行选择' 
-                  : '💡 点击岸段上的点新建断面')
-              : '点击上方按钮开启断面编辑模式'
-            }
-          </p>
-        </div>
-        
-        <div className="config-section">
-          <h4>4️⃣ 开始分析</h4>
-          <button 
-            className="analysis-button" 
-            onClick={handleStartAnalysis}
-            disabled={!perpendicularData || perpendicularData.features.length === 0}
-          >
-            🚀 开始分析（发送全部垂线）
-          </button>
-          <p style={{fontSize: '13px', color: '#64748b', margin: '5px 0'}}>
-            {perpendicularData ? `当前共 ${perpendicularData.features.length} 条垂线` : '请先绘制断面'}
-          </p>
-        </div>
-
-        <div className="config-section">
-          <h4>⚙️ 工具</h4>
-          <button 
-            className={`toggle-button ${!showCrossLines ? 'off' : ''}`}
-            onClick={() => setShowCrossLines(!showCrossLines)}
-          >
-            {showCrossLines ? '👁️ 隐藏垂线' : '👁️ 显示垂线'}
-          </button>
-          <button className="clear-button" onClick={onClear}>🧹 清空选择</button>
-        </div>
-      </div>
+      <EditorMap
+        perpendicularData={perpendicularData}
+        uploadedData={uploadedData}
+        groups={groups}
+        showCrossLines={showCrossLines}
+        isSelectingShoreLines={isSelectingShoreLines}
+        isSelectingStartEnd={isSelectingStartEnd}
+        isSelectingCrossLines={isSelectingCrossLines}
+        crossLineEditMode={crossLineEditMode}
+        selectedLines={selectedLines}
+        setSelectedLines={setSelectedLines}
+        setGroups={setGroups}
+        selectedCrossLineIndex={selectedCrossLineIndex}
+        setSelectedCrossLineIndex={setSelectedCrossLineIndex}
+        globalInterval={globalInterval}
+        globalLength={globalLength}
+        createCrossLineAtPoint={createCrossLineAtPoint}
+      />
+      <EditorSidebar
+        uploadedData={uploadedData}
+        basicParamsList={basicParamsList}
+        selectedBasicParamIdState={selectedBasicParamIdState}
+        totalSelectedSegments={totalSelectedSegments}
+        totalCrossLinesCount={totalCrossLinesCount}
+        globalInterval={globalInterval}
+        setGlobalInterval={setGlobalInterval}
+        globalLength={globalLength}
+        setGlobalLength={setGlobalLength}
+        isSelectingShoreLines={isSelectingShoreLines}
+        toggleShoreLineSelection={toggleShoreLineSelection}
+        selectAllShoreLines={selectAllShoreLines}
+        selectedLinesSize={selectedLines.size}
+        handleGenerateSections={handleGenerateSections}
+        perpendicularData={perpendicularData}
+        setShowGlobalPropertiesModal={setShowGlobalPropertiesModal}
+        isSelectingStartEnd={isSelectingStartEnd}
+        toggleStartEndSelection={toggleStartEndSelection}
+        groups={groups}
+        editingGroupId={editingGroupId}
+        handleEditGroup={handleEditGroup}
+        deleteGroup={deleteGroup}
+        updateGroupConfig={updateGroupConfig}
+        setEditingPropertiesGroupId={setEditingPropertiesGroupId}
+        handleApplyCustomSegments={handleApplyCustomSegments}
+        isSelectingCrossLines={isSelectingCrossLines}
+        toggleCrossLineSelection={toggleCrossLineSelection}
+        crossLineEditMode={crossLineEditMode}
+        setCrossLineEditMode={setCrossLineEditMode}
+        selectedCrossLineIndex={selectedCrossLineIndex}
+        translateSelectedCrossLine={translateSelectedCrossLine}
+        configureSelectedCrossLineProperties={configureSelectedCrossLineProperties}
+        deleteSelectedCrossLine={deleteSelectedCrossLine}
+        showCrossLines={showCrossLines}
+        setShowCrossLines={setShowCrossLines}
+        handleStartAnalysis={handleStartAnalysis}
+        onClear={onClear}
+        handleFileUpload={handleFileUpload}
+        handleSelectBasicParam={handleSelectBasicParam}
+      />
 
       {/* 全局属性配置弹窗 */}
       {showGlobalPropertiesModal && globalProperties && (
-        <PropertiesModal
+        <SectionPropertiesModal
           config={globalProperties}
           title="全局属性配置"
           onSave={(newConfig) => {
@@ -2510,7 +1150,7 @@ function EditorPage() {
           }
           
           return (
-            <PropertiesModal
+            <SectionPropertiesModal
               config={currentConfig}
               title={`断面 #${index + 1} 属性配置`}
               sectionId={sectionId}
@@ -2544,7 +1184,7 @@ function EditorPage() {
         }
         
         return (
-          <PropertiesModal
+          <SectionPropertiesModal
             config={groupConfig}
             title={`组 ${groups.findIndex(g => g.id === editingPropertiesGroupId) + 1} 属性配置`}
             onSave={(newConfig) => {
