@@ -6,6 +6,41 @@ import type { SelectionGroup } from '../types/selection';
 
 mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg';
 
+function buildCrossLineArrowPoints(
+  data: GeoJSON.FeatureCollection | null,
+): GeoJSON.FeatureCollection<GeoJSON.Point> {
+  if (!data || !data.features.length) {
+    return turf.featureCollection([]) as GeoJSON.FeatureCollection<GeoJSON.Point>;
+  }
+
+  const arrowPoints: GeoJSON.Feature<GeoJSON.Point>[] = [];
+
+  data.features.forEach((feature) => {
+    if (feature.geometry.type !== 'LineString') return;
+    const coords = feature.geometry.coordinates;
+    if (!coords || coords.length < 2) return;
+
+    const start = coords[0];
+    const end = coords[coords.length - 1];
+    const bearing = turf.bearing(turf.point(start), turf.point(end));
+    // 参考 Mapbox 图标默认朝向与正北夹角，做 -90 度修正
+    const iconRotate = Number(bearing - 90);
+
+    arrowPoints.push({
+      type: 'Feature',
+      properties: {
+        iconRotate,
+      },
+      geometry: {
+        type: 'Point',
+        coordinates: end,
+      },
+    });
+  });
+
+  return turf.featureCollection(arrowPoints) as GeoJSON.FeatureCollection<GeoJSON.Point>;
+}
+
 interface EditorMapProps {
   perpendicularData: GeoJSON.FeatureCollection | null;
   uploadedData: GeoJSON.FeatureCollection | null;
@@ -92,6 +127,11 @@ function EditorMap(props: EditorMapProps) {
       const crossLinesSource = map.getSource('perpendicular-lines') as mapboxgl.GeoJSONSource;
       if (crossLinesSource) {
         crossLinesSource.setData(perpendicularData || turf.featureCollection([]));
+      }
+
+      const crossArrowsSource = map.getSource('perpendicular-arrows') as mapboxgl.GeoJSONSource;
+      if (crossArrowsSource) {
+        crossArrowsSource.setData(buildCrossLineArrowPoints(perpendicularData));
       }
     };
 
@@ -206,6 +246,9 @@ function EditorMap(props: EditorMapProps) {
     if (map.getLayer('perpendicular-lines-hit-target')) {
       map.setLayoutProperty('perpendicular-lines-hit-target', 'visibility', showCrossLines ? 'visible' : 'none');
     }
+    if (map.getLayer('perpendicular-arrows-layer')) {
+      map.setLayoutProperty('perpendicular-arrows-layer', 'visibility', showCrossLines ? 'visible' : 'none');
+    }
   }, [showCrossLines]);
 
   // 同步选中断面的高亮显示
@@ -247,6 +290,7 @@ function EditorMap(props: EditorMapProps) {
 
     map.on('load', () => {
       map.addSource('perpendicular-lines', { type: 'geojson', data: turf.featureCollection([]) });
+      map.addSource('perpendicular-arrows', { type: 'geojson', data: turf.featureCollection([]) });
       map.addSource('uploaded-data', { type: 'geojson', data: turf.featureCollection([]) });
       map.addSource('selection-points', { type: 'geojson', data: turf.featureCollection([]) });
       map.addSource('snap-point', { type: 'geojson', data: turf.featureCollection([]) });
@@ -310,7 +354,26 @@ function EditorMap(props: EditorMapProps) {
         id: 'perpendicular-lines-layer',
         type: 'line',
         source: 'perpendicular-lines',
-        paint: { 'line-color': '#ef4444', 'line-width': 2 },
+        paint: { 'line-color': '#ef4444', 'line-width': 4 },
+      });
+
+      map.addLayer({
+        id: 'perpendicular-arrows-layer',
+        type: 'symbol',
+        source: 'perpendicular-arrows',
+        layout: {
+          'text-field': '▶',
+          'text-size': 20,
+          'text-rotate': ['get', 'iconRotate'],
+          'text-rotation-alignment': 'map',
+          'text-allow-overlap': true,
+          'text-ignore-placement': true,
+        },
+        paint: {
+          'text-color': '#ef4444',
+          'text-halo-color': '#ffffff',
+          'text-halo-width': 2,
+        },
       });
 
       map.addSource('selected-cross-line', { type: 'geojson', data: turf.featureCollection([]) });

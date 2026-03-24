@@ -1,0 +1,235 @@
+import * as turf from '@turf/turf';
+import type { ChangeEvent } from 'react';
+import { ensureDefaultBasicParams } from '../../services/basicParamsService';
+import { setCurrentTaskId } from './taskState';
+
+export function uploadMainGeoJsonAction(params: {
+  e: ChangeEvent<HTMLInputElement>;
+  setUploadedData: (v: GeoJSON.FeatureCollection | null) => void;
+  setSelectedLines: (v: Set<string>) => void;
+  setIsSelectingShoreLines: (v: boolean) => void;
+  setIsSelectingStartEnd: (v: boolean) => void;
+}) {
+  const { e, setUploadedData, setSelectedLines, setIsSelectingShoreLines, setIsSelectingStartEnd } = params;
+
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    try {
+      const json = JSON.parse(event.target?.result as string);
+      const geojson = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
+
+      geojson.features.forEach((feature: any, index: number) => {
+        if (!feature.properties) {
+          feature.properties = {};
+        }
+        feature.properties.index = index;
+      });
+
+      setUploadedData(geojson);
+      setSelectedLines(new Set());
+      setIsSelectingShoreLines(false);
+      setIsSelectingStartEnd(false);
+
+      fetch('/v0/mi/geojson', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: file.name,
+          data: geojson,
+        }),
+      })
+        .then((res) => {
+          if (!res.ok) {
+            console.error('上传 GeoJSON 到后端失败:', res.status, res.statusText);
+          } else {
+            console.log('GeoJSON 已发送到后端');
+          }
+        })
+        .catch((err) => {
+          console.error('上传 GeoJSON 到后端出错:', err);
+        });
+    } catch {
+      alert('解析 GeoJSON 失败，请检查文件格式');
+    }
+  };
+  reader.readAsText(file);
+}
+
+export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
+  e: ChangeEvent<HTMLInputElement>;
+  setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
+  setShowCrossLines: (v: boolean) => void;
+}) {
+  const { e, setPerpendicularData, setShowCrossLines } = params;
+
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  try {
+    const text = await file.text();
+    const json = JSON.parse(text);
+    const geojson = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
+
+    const lineFeatures = geojson.features.filter((f: any) => f.geometry && f.geometry.type === 'LineString') as GeoJSON.Feature<
+      GeoJSON.LineString
+    >[];
+
+    if (lineFeatures.length === 0) {
+      alert('GeoJSON 中未找到 LineString 类型的断面要素');
+      return;
+    }
+
+    const basicParamId = await ensureDefaultBasicParams();
+    if (!basicParamId) {
+      alert('初始化默认参数失败，请检查后端连接');
+      return;
+    }
+
+    const taskName = window.prompt('请输入任务名称：', '导入断面任务');
+    if (!taskName) {
+      alert('任务名称不能为空');
+      return;
+    }
+
+    const taskId = `task-${Date.now()}`;
+    setCurrentTaskId(taskId);
+
+    const bankIdSet = new Set<string>();
+    lineFeatures.forEach((f) => {
+      const props: any = f.properties || {};
+      const bankId = props.bank_id || props.shoreLineId || props.bankId || 'line-0';
+      bankIdSet.add(bankId);
+    });
+
+    const selectedBankIds = Array.from(bankIdSet);
+    if (selectedBankIds.length === 0) {
+      selectedBankIds.push('line-0');
+    }
+
+    const taskPayload = {
+      tasks: [
+        {
+          task_id: taskId,
+          task_name: taskName,
+          bank_ids: selectedBankIds,
+          description: `通过前端导入断面任务: ${taskName}`,
+        },
+      ],
+      overwrite: false,
+    };
+
+    console.log('创建导入断面任务:', taskPayload);
+    const taskResponse = await fetch('/v0/bank/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(taskPayload),
+    });
+
+    if (!taskResponse.ok) {
+      throw new Error(`创建任务失败: ${taskResponse.statusText}`);
+    }
+
+    const sectionsToCreate: any[] = [];
+
+    lineFeatures.forEach((line, index) => {
+      const props: any = line.properties || {};
+      const sectionId = props.section_id || `sec-${taskId}-import-${index}`;
+      const bankId = props.bank_id || props.shoreLineId || props.bankId || 'line-0';
+      const distance = props.distance ?? 0;
+
+      sectionsToCreate.push({
+        section_id: sectionId,
+        section_name: props.section_name || props.name || `导入断面${index + 1}`,
+        distance,
+        bank_id: bankId,
+        region_code: 'Mzs',
+        segment_index: index,
+        geometry: line.geometry,
+        section_geometry: line.geometry,
+        basic_param_id: basicParamId,
+      });
+
+      const coords = line.geometry.coordinates as number[][];
+      const left = coords[0];
+      const right = coords[coords.length - 1];
+
+      line.properties = {
+        ...props,
+        sectionId,
+        crossLineId: index,
+        distance,
+        shoreLineId: bankId,
+        leftPoint: left,
+        rightPoint: right,
+      };
+    });
+
+    const sectionsPayload = {
+      task_id: taskId,
+      sections: sectionsToCreate,
+      inherit_from_basic_param: true,
+      overwrite: false,
+    };
+
+    console.log('导入断面创建 payload:', JSON.stringify(sectionsPayload, null, 2));
+    const sectionsResponse = await fetch('/v0/bank/sections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sectionsPayload),
+    });
+
+    if (!sectionsResponse.ok) {
+      const errorText = await sectionsResponse.text();
+      console.error('导入断面后端错误响应:', errorText);
+      throw new Error(`创建断面失败: ${sectionsResponse.statusText} - ${errorText}`);
+    }
+
+    const sectionsResult = await sectionsResponse.json();
+    console.log('导入断面创建成功:', sectionsResult);
+
+    setPerpendicularData(turf.featureCollection(lineFeatures));
+    setShowCrossLines(true);
+
+    alert(`导入断面任务创建成功！共导入 ${lineFeatures.length} 条断面。`);
+  } catch (err: any) {
+    console.error('导入断面失败:', err);
+    alert(`导入断面失败: ${err.message}`);
+  } finally {
+    e.target.value = '';
+  }
+}
+
+export function exportSectionsSampleAction(params: { perpendicularData: GeoJSON.FeatureCollection | null }) {
+  const { perpendicularData } = params;
+
+  if (!perpendicularData || perpendicularData.features.length === 0) {
+    alert('当前没有可导出的断面，请先生成或导入断面');
+    return;
+  }
+
+  const features = perpendicularData.features
+    .filter((f) => f.geometry && f.geometry.type === 'LineString')
+    .map((f) => ({
+      type: 'Feature' as const,
+      geometry: f.geometry,
+      properties: {},
+    }));
+
+  const exportData = {
+    type: 'FeatureCollection' as const,
+    features,
+  };
+
+  const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `sections-sample-${Date.now()}.geojson`;
+  a.click();
+  URL.revokeObjectURL(url);
+}

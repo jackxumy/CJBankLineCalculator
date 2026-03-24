@@ -1,4 +1,5 @@
 ﻿import { useState } from 'react';
+import { Edit3, BarChart2, Home, Layout } from 'lucide-react';
 import HomePage from './pages/HomePage';
 import EditorPage from './pages/EditorPage';
 import ResultPage from './pages/ResultPage';
@@ -13,35 +14,43 @@ function App() {
     return <HomePage onNavigate={() => setPage('editor')} />;
   }
 
-  if (page === 'editor') {
-    return (
-      <>
-        <div style={{ position: 'absolute', top: 10, left: 10, zIndex: 1000 }}>
-          <button
-            onClick={() => setPage('result')}
-            style={{ padding: '6px 10px', fontSize: 12 }}
-          >
-            切换到结果可视化
-          </button>
-        </div>
-        <EditorPage />
-      </>
-    );
-  }
-
-  // result 页面
-  return (
-    <>
-      <div style={{ position: 'absolute', top: 10, left: 10, zIndex: 1000 }}>
-        <button
+  const renderNav = () => (
+    <div className="main-nav">
+      <div className="nav-logo" onClick={() => setPage('home')}>
+        <Layout size={20} />
+        <span>崩岸计算器</span>
+      </div>
+      <div className="nav-tabs">
+        <button 
+          type="button"
+          className={`nav-tab ${page === 'editor' ? 'active' : ''}`}
           onClick={() => setPage('editor')}
-          style={{ padding: '6px 10px', fontSize: 12 }}
         >
-          返回编辑页面
+          <Edit3 size={18} />
+            断面编辑器
+        </button>
+        <button 
+          type="button"
+          className={`nav-tab ${page === 'result' ? 'active' : ''}`}
+          onClick={() => setPage('result')}
+        >
+          <BarChart2 size={18} />
+          结果查看器
         </button>
       </div>
-      <ResultPage />
-    </>
+      <button className="nav-home" type="button" onClick={() => setPage('home')} title="返回首页" aria-label="返回首页">
+        <Home size={18} />
+      </button>
+    </div>
+  );
+
+  return (
+    <div className="app-container">
+      {renderNav()}
+      <main className="app-main">
+        {page === 'editor' ? <EditorPage /> : <ResultPage />}
+      </main>
+    </div>
   );
 }
 

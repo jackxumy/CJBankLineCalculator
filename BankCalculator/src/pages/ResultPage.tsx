@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import mapboxgl from 'mapbox-gl';
 import * as turf from '@turf/turf';
 import 'mapbox-gl/dist/mapbox-gl.css';
@@ -15,6 +15,10 @@ interface Task {
   bank_ids: string[];
   description: string;
   created_at: string;
+  status?: string;
+  run_started_at?: string | null;
+  run_completed_at?: string | null;
+  error_message?: string | null;
 }
 
 // 断面结构（带模型结果）
@@ -28,6 +32,28 @@ interface SectionResult {
   risk_level?: string | number; // 字符串(high, medium, low, no) 或 数字(1, 2, 3, 4)
   risk_score?: number;
 }
+
+type TaskProgressSnapshot = {
+  taskId: string;
+  taskName?: string;
+  status?: string;
+  runStartedAt?: string | null;
+  runCompletedAt?: string | null;
+  expectedTotal: number;
+  processedCount: number;
+  successCount: number;
+  errorCount: number;
+  lastUpdatedAt: string;
+  errors: Array<{
+    section_id: string;
+    section_name?: string;
+    bank_id?: string;
+    message: string;
+    raw?: any;
+    detail?: any;
+    detailError?: string;
+  }>;
+};
 
 // 颜色映射：支持数字 ID 和 字符串
 // 风险等级映射：0 最低，3 最高
@@ -43,11 +69,23 @@ function ResultPage() {
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
 
+  const pollTimerRef = useRef<number | null>(null);
+  const activePollTaskIdRef = useRef<string | null>(null);
+  const lastSectionsByTaskRef = useRef<Record<string, SectionResult[]>>({});
+
+  const sectionClickHandlerRef = useRef<((e: any) => void) | null>(null);
+  const sectionEnterHandlerRef = useRef<(() => void) | null>(null);
+  const sectionLeaveHandlerRef = useRef<(() => void) | null>(null);
+
   const [taskList, setTaskList] = useState<Task[]>([]);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSections, setShowSections] = useState(true);
+
+  const [progressOpen, setProgressOpen] = useState(false);
+  const [progress, setProgress] = useState<TaskProgressSnapshot | null>(null);
+  const [expandedErrorIds, setExpandedErrorIds] = useState<Record<string, boolean>>({});
 
   // 切换断面可见性
   useEffect(() => {
@@ -61,6 +99,21 @@ function ResultPage() {
       map.setLayoutProperty('sections-line-hit', 'visibility', showSections ? 'visible' : 'none');
     }
   }, [showSections]);
+
+  const stopPolling = () => {
+    if (pollTimerRef.current) {
+      window.clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    activePollTaskIdRef.current = null;
+  };
+
+  useEffect(() => {
+    return () => {
+      stopPolling();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 风险解析辅助：判断 risk_level 是否为 0-3 的有效数字
   const getRiskInfo = (risk: any) => {
@@ -95,11 +148,228 @@ function ResultPage() {
     fetchTasks();
   }, []);
 
+  const parseResultsList = (data: any): any[] => {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.results)) return data.results;
+    if (Array.isArray(data.data)) return data.data;
+    if (Array.isArray(data.items)) return data.items;
+    return [];
+  };
+
+  const normalizeResultRecord = (r: any) => {
+    const sectionId = r?.section_id ?? r?.sectionId ?? r?.sectionID;
+    const riskLevel = r?.risk_level ?? r?.riskLevel ?? r?.risk;
+    const status = r?.status ?? r?.state ?? r?.code;
+    const message = r?.error_message ?? r?.errorMessage ?? r?.error ?? r?.message;
+    return { sectionId, riskLevel, status, message, raw: r };
+  };
+
+  const isTaskCompleted = (taskInfo: any) => {
+    const st = String(taskInfo?.status ?? '').toLowerCase();
+    if (st === 'completed' || st === 'success' || st === 'done') return true;
+    if (taskInfo?.run_completed_at) return true;
+    if (taskInfo?.runCompletedAt) return true;
+    return false;
+  };
+
+  const loadErrorDetail = async (taskId: string, sectionId: string) => {
+    // 仅在当前任务仍为选中时才更新
+    if (!taskId || taskId !== selectedTask) return;
+
+    try {
+      const res = await fetch(`/v0/bank/results/${sectionId}`);
+      const text = await res.text();
+      let json: any = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+
+      setProgress(prev => {
+        if (!prev || prev.taskId !== taskId) return prev;
+        const nextErrors = prev.errors.map(e => {
+          if (e.section_id !== sectionId) return e;
+          if (!res.ok) {
+            return { ...e, detailError: `HTTP ${res.status}: ${text?.slice(0, 500)}` };
+          }
+          return { ...e, detail: json ?? text };
+        });
+        return { ...prev, errors: nextErrors };
+      });
+    } catch (err: any) {
+      setProgress(prev => {
+        if (!prev || prev.taskId !== taskId) return prev;
+        const nextErrors = prev.errors.map(e => {
+          if (e.section_id !== sectionId) return e;
+          return { ...e, detailError: err?.message || '获取错误详情失败' };
+        });
+        return { ...prev, errors: nextErrors };
+      });
+    }
+  };
+
+  const updateProgressAndMap = async (taskId: string, taskName: string | undefined, baseSections: SectionResult[]) => {
+    const startedAt = new Date().toISOString();
+    const map = mapRef.current;
+
+    let taskInfo: any = null;
+    let resultsList: any[] = [];
+
+    try {
+      const taskRes = await fetch(`/v0/bank/tasks/${taskId}`);
+      if (taskRes.ok) {
+        const jt = await taskRes.json().catch(() => null);
+        taskInfo = jt?.task ?? jt?.data ?? jt;
+      }
+    } catch (err) {
+      // 忽略：任务状态接口可能不可用，但轮询结果仍可继续
+    }
+
+    // 兼容：部分后端只在 /full 中返回 status/run_completed_at 等字段
+    if (!taskInfo || (!taskInfo.status && !taskInfo.run_completed_at && !taskInfo.runCompletedAt)) {
+      try {
+        const fullRes = await fetch(`/v0/bank/tasks/${taskId}/full`);
+        if (fullRes.ok) {
+          const jf = await fullRes.json().catch(() => null);
+          const d = jf?.data ?? jf;
+          taskInfo = d?.task ?? d?.data?.task ?? taskInfo;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    try {
+      const resultsRes = await fetch(`/v0/bank/results?task_id=${encodeURIComponent(taskId)}`);
+      if (resultsRes.ok) {
+        const jr = await resultsRes.json().catch(() => null);
+        resultsList = parseResultsList(jr);
+      }
+    } catch (err) {
+      // 忽略：临时网络错误不应中断轮询
+    }
+
+    if (activePollTaskIdRef.current !== taskId) return;
+
+    const latestBySection: Record<string, ReturnType<typeof normalizeResultRecord>> = {};
+    resultsList.forEach(r => {
+      const nr = normalizeResultRecord(r);
+      if (!nr.sectionId) return;
+      latestBySection[String(nr.sectionId)] = nr;
+    });
+
+    const resultBySection: Record<string, { riskLevel?: any; status?: any; message?: any; raw?: any }> = {};
+    const errorsFromResults: TaskProgressSnapshot['errors'] = [];
+    Object.keys(latestBySection).forEach(sectionId => {
+      const nr = latestBySection[sectionId];
+      resultBySection[sectionId] = {
+        riskLevel: nr.riskLevel,
+        status: nr.status,
+        message: nr.message,
+        raw: nr.raw
+      };
+
+      const st = String(nr.status ?? '').toUpperCase();
+      const hasError = (nr.message && String(nr.message).trim().length > 0) || (st && st !== 'SUCCESS' && st !== 'COMPLETED' && st !== '200');
+      const riskIsValidNumber = (() => {
+        const n = Number(nr.riskLevel);
+        return !isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3;
+      })();
+
+      if (hasError && !riskIsValidNumber) {
+        errorsFromResults.push({
+          section_id: String(sectionId),
+          message: String(nr.message ?? nr.status ?? '未知错误'),
+          raw: nr.raw
+        });
+      }
+    });
+
+    const mergedSections = baseSections.map(s => {
+      const hit = resultBySection[s.section_id];
+      if (!hit) return s;
+      return { ...s, risk_level: hit.riskLevel ?? s.risk_level };
+    });
+
+    // 统计成功数：以 risk_level(0-3) 为准
+    const successCount = mergedSections.reduce((acc, s) => {
+      const n = Number(s.risk_level);
+      if (!isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3) return acc + 1;
+      return acc;
+    }, 0);
+
+    // 如果任务已完成，但仍有部分断面没有结果，则把它们当作“无结果/计算失败”展示出来
+    const completed = isTaskCompleted(taskInfo);
+    const missingAsErrors: TaskProgressSnapshot['errors'] = [];
+    if (completed) {
+      mergedSections.forEach(s => {
+        const hasAnyResult = Boolean(resultBySection[s.section_id]);
+        const n = Number(s.risk_level);
+        const riskOk = !isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3;
+        if (!hasAnyResult || !riskOk) {
+          const already = errorsFromResults.some(e => e.section_id === s.section_id);
+          if (!already) {
+            missingAsErrors.push({
+              section_id: s.section_id,
+              section_name: s.section_name,
+              bank_id: s.bank_id,
+              message: hasAnyResult ? '计算未返回有效风险等级' : '未返回结果（可能计算失败）'
+            });
+          }
+        }
+      });
+    }
+
+    const allErrors = [...errorsFromResults, ...missingAsErrors].map(e => {
+      const sec = baseSections.find(s => s.section_id === e.section_id);
+      return {
+        ...e,
+        section_name: e.section_name ?? sec?.section_name,
+        bank_id: e.bank_id ?? sec?.bank_id
+      };
+    });
+
+    const expectedTotal = baseSections.length;
+    const processedCount = completed ? expectedTotal : Math.min(expectedTotal, successCount + allErrors.length);
+
+    setProgress({
+      taskId,
+      taskName,
+      status: taskInfo?.status,
+      runStartedAt: taskInfo?.run_started_at ?? taskInfo?.runStartedAt ?? null,
+      runCompletedAt: taskInfo?.run_completed_at ?? taskInfo?.runCompletedAt ?? null,
+      expectedTotal,
+      processedCount,
+      successCount,
+      errorCount: allErrors.length,
+      lastUpdatedAt: startedAt,
+      errors: allErrors
+    });
+
+    // 轮询驱动地图刷新（断面颜色 + 岸段插值）
+    if (map) {
+      renderSections(mergedSections);
+      applyShorelineGradient(mergedSections);
+    }
+
+    const shouldStop = completed || (expectedTotal > 0 && processedCount >= expectedTotal);
+    if (shouldStop) {
+      stopPolling();
+    }
+  };
+
   // 点击任务：获取任务详情（包含所有断面及其结果）并在地图可视化
   const handleTaskClick = async (taskId: string) => {
+    stopPolling();
+
     setSelectedTask(taskId);
     setLoading(true);
     setError(null);
+    setProgressOpen(true);
+    setProgress(null);
+    setExpandedErrorIds({});
 
     // 清除地图上所有之前任务的图层和数据源
     const map = mapRef.current;
@@ -131,74 +401,31 @@ function ResultPage() {
     }
 
     try {
-      // 1. 获取任务完整数据（包含断面信息）
-      const res = await fetch(`/v0/bank/tasks/${taskId}/full`);
-      if (!res.ok) throw new Error('获取任务详情失败');
-      const data = await res.json();
-      
-      if (!data.success || !data.data) {
-        throw new Error('返回数据格式错误');
-      }
-
-      const { sections } = data.data;
-      const sectionResults: SectionResult[] = sections;
-      let enrichedSections: SectionResult[] | null = null;
-
-      // 打印每个断面的完整 JSON 到控制台，方便调试
-      try {
-        console.log(`任务 ${taskId} 返回断面数量:`, Array.isArray(sections) ? sections.length : 0);
-        (sections || []).forEach((sec: any, idx: number) => {
-          console.log(`Section[${idx}] =>`, sec);
-        });
-
-        // 基于每个断面的数据库 id，从 /v0/bank/results/{result_id} 获取计算结果并补充 risk_level
-        const enriched = await Promise.all((sections || []).map(async (sec: any) => {
-          // 后端 results 接口使用的是结果表的 id（示例中断面对象包含 id 字段）
-          const resultId = sec.section_id;
-          if (!resultId) return sec;
-
-          try {
-            const r = await fetch(`/v0/bank/results/${resultId}`);
-            if (!r.ok) {
-              console.warn(`获取 result ${resultId} 失败:`, r.status);
-              return sec;
-            }
-            const jr = await r.json();
-            if (jr && jr.success && jr.result) {
-              // 将后端返回的 risk_level（数字）附加到断面对象
-              sec.risk_level = jr.result.risk_level;
-            }
-          } catch (err) {
-            console.warn(`请求 result ${resultId} 出错:`, err);
-          }
-
-          return sec;
+      // 1) 先拉取断面列表（含几何），先渲染“未着色”的断面
+      const sectionsRes = await fetch(`/v0/bank/sections?task_id=${encodeURIComponent(taskId)}`);
+      if (!sectionsRes.ok) throw new Error('获取断面列表失败');
+      const js = await sectionsRes.json().catch(() => null);
+      const sectionsRaw: any[] = (js?.sections ?? js?.data ?? js) || [];
+      const sectionResults: SectionResult[] = (Array.isArray(sectionsRaw) ? sectionsRaw : [])
+        .filter(s => s && (s.geometry || s.section_geometry))
+        .map((s: any) => ({
+          section_id: s.section_id,
+          section_name: s.section_name,
+          distance: Number(s.distance ?? 0),
+          bank_id: s.bank_id ?? 'unknown',
+          geometry: s.geometry ?? s.section_geometry,
+          risk_level: s.risk_level
         }));
 
-        // 使用补充后的断面集合继续后续渲染
-        enrichedSections = enriched as SectionResult[];
-      } catch (logErr) {
-        console.warn('打印断面 JSON 或获取结果时出错:', logErr);
-      }
+      lastSectionsByTaskRef.current[taskId] = sectionResults;
 
-      // 2. 获取所有岸段列表以支持名称（不再需要原始几何，但可用于过滤）
-      const geoRes = await fetch('/v0/bank/banks');
-      if (!geoRes.ok) throw new Error('获取岸段数据失败');
-      const geoData = await geoRes.json();
-      console.log('获取岸段数量:', geoData.banks?.length || 0);
+      // 2) 地图初始渲染（先灰色/未知风险），并缩放到断面范围
+      renderSections(sectionResults);
+      applyShorelineGradient(sectionResults);
 
-      const sectionsToUseFinal = enrichedSections && enrichedSections.length > 0 ? enrichedSections : sectionResults;
-
-      // 3. 执行基于断面中点的岸线生成与颜色插值
-      applyShorelineGradient(sectionsToUseFinal);
-
-      // 4. 渲染具体的断面线
-      renderSections(sectionsToUseFinal);
-
-      // 自动缩放到生成的断面范围
       const map = mapRef.current;
-      if (map && sectionsToUseFinal.length > 0) {
-        const sectionFeatures = sectionsToUseFinal
+      if (map && sectionResults.length > 0) {
+        const sectionFeatures = sectionResults
           .filter(s => s.geometry)
           .map(s => ({ type: 'Feature', geometry: s.geometry, properties: {} }));
         if (sectionFeatures.length > 0) {
@@ -206,6 +433,21 @@ function ResultPage() {
           map.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 80 });
         }
       }
+
+      // 3) 打开进度窗口并开始轮询（任务状态 + 结果列表），驱动地图插值持续更新
+      activePollTaskIdRef.current = taskId;
+
+      // 任务名用于弹窗展示（优先用列表中的名称）
+      const taskName = taskList.find(t => t.task_id === taskId)?.task_name;
+
+      // 立即执行一次，再开启定时轮询
+      await updateProgressAndMap(taskId, taskName, sectionResults);
+
+      pollTimerRef.current = window.setInterval(() => {
+        if (activePollTaskIdRef.current !== taskId) return;
+        const latestSections = lastSectionsByTaskRef.current[taskId] ?? sectionResults;
+        updateProgressAndMap(taskId, taskName, latestSections);
+      }, 2000);
 
     } catch (e: any) {
       console.error(e);
@@ -238,7 +480,10 @@ function ResultPage() {
       setTaskList(prev => prev.filter(task => task.task_id !== selectedTask));
 
       // 清空当前选择
+      stopPolling();
       setSelectedTask(null);
+      setProgressOpen(false);
+      setProgress(null);
 
       // 清理地图上的图层和数据源
       const map = mapRef.current;
@@ -278,12 +523,6 @@ function ResultPage() {
     const map = mapRef.current;
     if (!map) return;
 
-    // 清理旧的断面图层和数据源
-    ['sections-line-hit', 'sections-line'].forEach(layer => {
-      if (map.getLayer(layer)) map.removeLayer(layer);
-    });
-    if (map.getSource('sections-source')) map.removeSource('sections-source');
-
     // 转换断面数据为 GeoJSON
     const features = sections.filter(s => s.geometry).map(s => {
       const info = getRiskInfo(s.risk_level);
@@ -313,65 +552,90 @@ function ResultPage() {
       };
     });
 
-    map.addSource('sections-source', {
-      type: 'geojson',
-      data: turf.featureCollection(features as any)
-    });
 
-    // 添加断面显示层 (带宽度，由风险值决定颜色)
-    map.addLayer({
-      id: 'sections-line',
-      type: 'line',
-      source: 'sections-source',
-      layout: { 
-        'line-join': 'round', 
-        'line-cap': 'round',
-        'visibility': showSections ? 'visible' : 'none'
-      },
-      paint: {
-        'line-color': ['get', 'color'],
-        'line-width': 4,
-        'line-opacity': 0.9
-      }
-    });
+    // 更新/创建 source（支持高频刷新）
+    const fc = turf.featureCollection(features as any);
+    const existingSource = map.getSource('sections-source') as mapboxgl.GeoJSONSource | undefined;
+    if (existingSource) {
+      existingSource.setData(fc as any);
+    } else {
+      map.addSource('sections-source', {
+        type: 'geojson',
+        data: fc as any
+      });
+    }
 
-    // 增加一个透明的宽层方便鼠标点击交互
-    map.addLayer({
-      id: 'sections-line-hit',
-      type: 'line',
-      source: 'sections-source',
-      paint: {
-        'line-width': 12,
-        'line-opacity': 0
-      },
-      layout: {
-        'visibility': showSections ? 'visible' : 'none'
-      }
-    });
+    // 若图层不存在则创建一次；后续仅更新 source 数据与可见性
+    if (!map.getLayer('sections-line')) {
+      map.addLayer({
+        id: 'sections-line',
+        type: 'line',
+        source: 'sections-source',
+        layout: {
+          'line-join': 'round',
+          'line-cap': 'round',
+          'visibility': showSections ? 'visible' : 'none'
+        },
+        paint: {
+          'line-color': ['get', 'color'],
+          'line-width': 8,
+          'line-opacity': 0.9
+        }
+      });
+    }
 
-    // 悬浮显示气泡
-    map.on('click', 'sections-line-hit', (e) => {
-      if (!e.features || e.features.length === 0) return;
-      const f = e.features[0];
-      const p = f.properties;
-      if (!p) return;
-      
-      new mapboxgl.Popup()
-        .setLngLat(e.lngLat)
-        .setHTML(`
-          <div style="padding: 4px; font-family: sans-serif;">
-            <p style="margin:0; font-weight:bold; color:#1e293b;">${p.name}</p>
-            <p style="margin:4px 0 0; font-size:12px; color:#64748b;">断面ID: ${p.id}</p>
-            <p style="margin:4px 0 0; font-size:12px; color:#64748b;">风险等级: 
-              <span style="color:${p.color}; font-weight:bold;">${p.risk_label}</span>
-            </p>
-          </div>
-        `)
-        .addTo(map);
-    });
+    if (!map.getLayer('sections-line-hit')) {
+      map.addLayer({
+        id: 'sections-line-hit',
+        type: 'line',
+        source: 'sections-source',
+        paint: {
+          'line-width': 12,
+          'line-opacity': 0
+        },
+        layout: {
+          'visibility': showSections ? 'visible' : 'none'
+        }
+      });
+    }
 
-    map.on('mouseenter', 'sections-line-hit', () => { map.getCanvas().style.cursor = 'pointer'; });
-    map.on('mouseleave', 'sections-line-hit', () => { map.getCanvas().style.cursor = ''; });
+    // 事件只绑定一次（防止轮询刷新导致重复绑定）
+    if (!sectionClickHandlerRef.current) {
+      sectionClickHandlerRef.current = (e: any) => {
+        if (!e.features || e.features.length === 0) return;
+        const f = e.features[0];
+        const p = f.properties;
+        if (!p) return;
+
+        new mapboxgl.Popup()
+          .setLngLat(e.lngLat)
+          .setHTML(`
+            <div style="padding: 4px; font-family: sans-serif;">
+              <p style="margin:0; font-weight:bold; color:#1e293b;">${p.name}</p>
+              <p style="margin:4px 0 0; font-size:12px; color:#64748b;">断面ID: ${p.id}</p>
+              <p style="margin:4px 0 0; font-size:12px; color:#64748b;">风险等级:
+                <span style="color:${p.color}; font-weight:bold;">${p.risk_label}</span>
+              </p>
+            </div>
+          `)
+          .addTo(map);
+      };
+      sectionEnterHandlerRef.current = () => {
+        map.getCanvas().style.cursor = 'pointer';
+      };
+      sectionLeaveHandlerRef.current = () => {
+        map.getCanvas().style.cursor = '';
+      };
+
+      map.off('click', 'sections-line-hit', sectionClickHandlerRef.current);
+      map.on('click', 'sections-line-hit', sectionClickHandlerRef.current);
+
+      map.off('mouseenter', 'sections-line-hit', sectionEnterHandlerRef.current);
+      map.on('mouseenter', 'sections-line-hit', sectionEnterHandlerRef.current);
+
+      map.off('mouseleave', 'sections-line-hit', sectionLeaveHandlerRef.current);
+      map.on('mouseleave', 'sections-line-hit', sectionLeaveHandlerRef.current);
+    }
   };
 
   // 颜色插值逻辑: 基于同一岸段下所有断面中点生成一条折线，并根据中点的风险值插值颜色
@@ -440,20 +704,27 @@ function ResultPage() {
       const layerId = `midline-result-${bankId}`;
       const sourceId = `midline-source-${bankId}`;
 
-      if (map.getLayer(layerId)) map.removeLayer(layerId);
-      if (map.getSource(sourceId)) map.removeSource(sourceId);
+      const existing = map.getSource(sourceId) as mapboxgl.GeoJSONSource | undefined;
+      if (existing) {
+        existing.setData(newLine as any);
+      } else {
+        map.addSource(sourceId, { type: 'geojson', data: newLine as any, lineMetrics: true } as any);
+      }
 
-      map.addSource(sourceId, { type: 'geojson', data: newLine, lineMetrics: true });
-      map.addLayer({
-        id: layerId,
-        type: 'line',
-        source: sourceId,
-        paint: {
-          'line-width': 10,
-          'line-gradient': stops as any,
-          'line-opacity': 0.8
-        }
-      });
+      if (!map.getLayer(layerId)) {
+        map.addLayer({
+          id: layerId,
+          type: 'line',
+          source: sourceId,
+          paint: {
+            'line-width': 20,
+            'line-gradient': stops as any,
+            'line-opacity': 0.8
+          }
+        });
+      } else {
+        map.setPaintProperty(layerId, 'line-gradient', stops as any);
+      }
     });
   };
 
@@ -492,9 +763,88 @@ function ResultPage() {
     };
   }, []);
 
+  const progressPercent = useMemo(() => {
+    if (!progress) return 0;
+    if (progress.expectedTotal <= 0) return 0;
+    return Math.round((progress.processedCount / progress.expectedTotal) * 100);
+  }, [progress]);
+
+  const toggleErrorExpanded = (sectionId: string) => {
+    const willExpand = !expandedErrorIds[sectionId];
+    setExpandedErrorIds(prev => ({ ...prev, [sectionId]: willExpand }));
+    if (willExpand && progress?.taskId && sectionId) loadErrorDetail(progress.taskId, sectionId);
+  };
+
   return (
     <div className="map-wrapper">
       <div ref={mapContainer} className="map-full" />
+
+      {progressOpen && selectedTask && (
+        <div className="progress-drawer" onClick={(e) => e.stopPropagation()}>
+          <div className="progress-modal progress-modal-drawer" >
+            <div className="progress-modal-header">
+              <div>
+                <div className="progress-modal-title">计算进度</div>
+                <div className="progress-modal-subtitle">
+                  任务: {progress?.taskName || selectedTask}
+                  {progress?.status ? ` | 状态: ${progress.status}` : ''}
+                </div>
+              </div>
+              <button className="progress-modal-close" onClick={() => setProgressOpen(false)}>关闭</button>
+            </div>
+
+            <progress
+              className="progress-bar-native"
+              value={progress?.processedCount ?? 0}
+              max={Math.max(1, progress?.expectedTotal ?? 1)}
+            />
+
+            <div className="progress-stats">
+              <div>进度: {progressPercent}%</div>
+              <div>
+                已处理: {progress?.processedCount ?? 0}/{progress?.expectedTotal ?? 0}
+                {' | '}成功: {progress?.successCount ?? 0}
+                {' | '}失败: {progress?.errorCount ?? 0}
+              </div>
+              <div className="progress-updated">最后更新: {progress?.lastUpdatedAt ? new Date(progress.lastUpdatedAt).toLocaleTimeString() : '-'}</div>
+            </div>
+
+            {(progress?.errors?.length ?? 0) > 0 ? (
+              <div className="progress-errors">
+                <div className="progress-errors-title">出错断面</div>
+                <div className="progress-errors-list">
+                  {progress!.errors.map(err => {
+                    const expanded = Boolean(expandedErrorIds[err.section_id]);
+                    return (
+                      <div key={err.section_id} className="progress-error-item">
+                        <div className="progress-error-row">
+                          <div className="progress-error-main">
+                            <div className="progress-error-id">{err.section_name || err.section_id}</div>
+                            <div className="progress-error-msg">{err.message}</div>
+                          </div>
+                          <button className="progress-error-toggle" onClick={() => toggleErrorExpanded(err.section_id)}>
+                            {expanded ? '收起' : '查看详情'}
+                          </button>
+                        </div>
+
+                        {expanded && (
+                          <div className="progress-error-detail">
+                            {err.detailError && <div className="progress-error-detail-error">{err.detailError}</div>}
+                            <pre className="progress-error-pre">{JSON.stringify(err.detail ?? err.raw ?? err, null, 2)}</pre>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="progress-no-errors">暂无断面错误信息</div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="upload-control result-sidebar">
         <div className="sidebar-header">
           <h4>任务列表</h4>
