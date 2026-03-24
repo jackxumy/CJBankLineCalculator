@@ -46,14 +46,21 @@ interface EditorSidebarProps {
   handleEditGroup: (id: string) => void;
   deleteGroup: (id: string) => void;
   updateGroupConfig: (id: string, field: 'interval' | 'length', value: number) => void;
+  reverseCrossLinesInGroup: (groupId: string) => void;
   setEditingPropertiesGroupId: (id: string | null) => void;
   handleApplyCustomSegments: () => void;
   isSelectingCrossLines: boolean;
   toggleCrossLineSelection: () => void;
-  crossLineEditMode: 'select' | 'add';
-  setCrossLineEditMode: (mode: 'select' | 'add') => void;
+  validateAllPendingSections: () => void;
+  crossLineControlMode: 'shoreline' | 'free';
+  setCrossLineControlMode: (mode: 'shoreline' | 'free') => void;
+  crossLineEditMode: 'none' | 'select' | 'add';
+  setCrossLineEditMode: (mode: 'none' | 'select' | 'add') => void;
+  clearSelectedCrossLineSelection: () => void;
   selectedCrossLineIndex: number | null;
   translateSelectedCrossLine: (offset: number) => void;
+  rotateSelectedCrossLine: (angleDegrees: number) => void;
+  scaleSelectedCrossLine: (deltaMeters: number) => void;
   configureSelectedCrossLineProperties: () => void;
   deleteSelectedCrossLine: () => void;
   reverseSelectedCrossLine: () => void;
@@ -92,14 +99,21 @@ function EditorSidebar(props: EditorSidebarProps) {
     handleEditGroup,
     deleteGroup,
     updateGroupConfig,
+    reverseCrossLinesInGroup,
     setEditingPropertiesGroupId,
     handleApplyCustomSegments,
     isSelectingCrossLines,
     toggleCrossLineSelection,
+    validateAllPendingSections,
+    crossLineControlMode,
+    setCrossLineControlMode,
     crossLineEditMode,
     setCrossLineEditMode,
+    clearSelectedCrossLineSelection,
     selectedCrossLineIndex,
     translateSelectedCrossLine,
+    rotateSelectedCrossLine,
+    scaleSelectedCrossLine,
     configureSelectedCrossLineProperties,
     deleteSelectedCrossLine,
     reverseSelectedCrossLine,
@@ -146,6 +160,19 @@ function EditorSidebar(props: EditorSidebarProps) {
                 />
               </label>
             </div>
+            {perpendicularData && perpendicularData.features.length > 0 && (
+              <div className={styles.mt12}>
+                <button
+                  type="button"
+                  className={styles.outlineButton}
+                  onClick={validateAllPendingSections}
+                  title="强制重新校验全部断面（接口 500 时可重试；用于编辑移动后刷新状态）"
+                  aria-label="断面检查"
+                >
+                  <CheckCircle2 size={16} /> 断面检查
+                </button>
+              </div>
+            )}
 
             {perpendicularData && perpendicularData.features.length > 0 && (
               <div className={styles.mt12}>
@@ -296,6 +323,16 @@ function EditorSidebar(props: EditorSidebarProps) {
                           </button>
                           <button
                             type="button"
+                            className={styles.outlineButton}
+                            onClick={() => reverseCrossLinesInGroup(g.id)}
+                            disabled={!perpendicularData || perpendicularData.features.length === 0 || g.end === null}
+                            title={g.end === null ? '请先拾取终点' : '反切该段落范围内的所有断面'}
+                            aria-label={`反切第 ${idx + 1} 段断面方向`}
+                          >
+                            <RotateCw size={14} /> 反切
+                          </button>
+                          <button
+                            type="button"
                             className={styles.primaryButton}
                             onClick={handleApplyCustomSegments}
                           >
@@ -334,13 +371,43 @@ function EditorSidebar(props: EditorSidebarProps) {
               {isSelectingCrossLines ? '完成编辑' : '开启断面精调'}
             </button>
 
+            
+
             {isSelectingCrossLines && (
               <>
                 <div className={styles.buttonGrid}>
                   <button
                     type="button"
+                    className={`${styles.outlineButton} ${crossLineControlMode === 'shoreline' ? styles.active : ''}`}
+                    onClick={() => setCrossLineControlMode('shoreline')}
+                    title="沿岸段线模式：点击岸段生成断面，按钮平移按距离沿岸线移动"
+                    aria-label="岸段线模式"
+                  >
+                    岸段线
+                  </button>
+                  <button
+                    type="button"
+                    className={`${styles.outlineButton} ${crossLineControlMode === 'free' ? styles.active : ''}`}
+                    onClick={() => setCrossLineControlMode('free')}
+                    title="自由模式：可拖动断面，旋转/缩放，并点选起止点创建断面"
+                    aria-label="自由模式"
+                  >
+                    自由
+                  </button>
+                </div>
+
+                <div className={styles.buttonGrid}>
+                  <button
+                    type="button"
                     className={`${styles.outlineButton} ${crossLineEditMode === 'select' ? styles.active : ''}`}
-                    onClick={() => setCrossLineEditMode('select')}
+                    onClick={() => {
+                      if (crossLineEditMode === 'select') {
+                        setCrossLineEditMode('none');
+                        clearSelectedCrossLineSelection();
+                      } else {
+                        setCrossLineEditMode('select');
+                      }
+                    }}
                   >
                     选择
                   </button>
@@ -362,12 +429,23 @@ function EditorSidebar(props: EditorSidebarProps) {
                       </button>
                     </div>
 
-                    <div className={styles.buttonGrid}>
-                      <button type="button" onClick={() => translateSelectedCrossLine(-5)} className={`${styles.outlineButton} ${styles.smallPad}`}>-5m</button>
-                      <button type="button" onClick={() => translateSelectedCrossLine(-1)} className={`${styles.outlineButton} ${styles.smallPad}`}>-1m</button>
-                      <button type="button" onClick={() => translateSelectedCrossLine(1)} className={`${styles.outlineButton} ${styles.smallPad}`}>+1m</button>
-                      <button type="button" onClick={() => translateSelectedCrossLine(5)} className={`${styles.outlineButton} ${styles.smallPad}`}>+5m</button>
-                    </div>
+                    {crossLineControlMode === 'shoreline' ? (
+                      <div className={styles.buttonGrid}>
+                        <button type="button" onClick={() => translateSelectedCrossLine(-5)} className={`${styles.outlineButton} ${styles.smallPad}`}>-5m</button>
+                        <button type="button" onClick={() => translateSelectedCrossLine(-1)} className={`${styles.outlineButton} ${styles.smallPad}`}>-1m</button>
+                        <button type="button" onClick={() => translateSelectedCrossLine(1)} className={`${styles.outlineButton} ${styles.smallPad}`}>+1m</button>
+                        <button type="button" onClick={() => translateSelectedCrossLine(5)} className={`${styles.outlineButton} ${styles.smallPad}`}>+5m</button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className={styles.buttonGrid}>
+                          <button type="button" onClick={() => rotateSelectedCrossLine(-5)} className={`${styles.outlineButton} ${styles.smallPad}`} title="逆时针旋转 5°" aria-label="逆时针旋转">-5°</button>
+                          <button type="button" onClick={() => rotateSelectedCrossLine(5)} className={`${styles.outlineButton} ${styles.smallPad}`} title="顺时针旋转 5°" aria-label="顺时针旋转">+5°</button>
+                          <button type="button" onClick={() => scaleSelectedCrossLine(-10)} className={`${styles.outlineButton} ${styles.smallPad}`} title="缩短 10m" aria-label="缩短">-10m</button>
+                          <button type="button" onClick={() => scaleSelectedCrossLine(10)} className={`${styles.outlineButton} ${styles.smallPad}`} title="拉长 10m" aria-label="拉长">+10m</button>
+                        </div>
+                      </>
+                    )}
 
                     <div className={`${styles.buttonGrid} ${styles.mt8}`}>
                       <button type="button" onClick={reverseSelectedCrossLine} className={styles.outlineButton} title="反转方向" aria-label="反转断面方向">

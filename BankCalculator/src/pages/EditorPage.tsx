@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react';
+﻿import { useEffect, useRef, useState } from 'react';
 import * as turf from '@turf/turf';
 import '../App.css';
 import type { SectionParams } from '../types/sections';
@@ -10,8 +10,13 @@ import type { SelectionGroup } from '../types/selection';
 import {
   configureSelectedCrossLinePropertiesAction,
   createCrossLineAtPointAction,
+  createCrossLineByEndpointsAction,
   deleteSelectedCrossLineAction,
+  persistCrossLineGeometryAction,
+  rotateCrossLineGeometry,
+  reverseCrossLinesInGroupAction,
   reverseSelectedCrossLineAction,
+  scaleCrossLineGeometry,
   translateSelectedCrossLineAction,
 } from './editor/crossLineActions';
 import { applyCustomSegmentsAction } from './editor/customSegments';
@@ -62,12 +67,221 @@ function EditorPage() {
   
   // 新增状态：控制断面选择模式
   const [isSelectingCrossLines, setIsSelectingCrossLines] = useState<boolean>(false);
+
+  // 新增状态：断面编辑控制模式（岸段线/自由）
+  const [crossLineControlMode, setCrossLineControlMode] = useState<'shoreline' | 'free'>('shoreline');
   
-  // 新增状态：断面编辑模式 ('select' 选择现有断面, 'add' 新建断面)
-  const [crossLineEditMode, setCrossLineEditMode] = useState<'select' | 'add'>('select');
+  // 新增状态：断面编辑模式
+  // - 'none': 不进行选择/添加（用于“释放选择”）
+  // - 'select': 选择现有断面
+  // - 'add': 新建断面
+  const [crossLineEditMode, setCrossLineEditMode] = useState<'none' | 'select' | 'add'>('none');
   
   // 新增状态：选中的断面索引
   const [selectedCrossLineIndex, setSelectedCrossLineIndex] = useState<number | null>(null);
+
+  // 断面验证：避免重复触发校验
+  const validationTriggeredRef = useRef<Set<string>>(new Set());
+
+  const patchSectionValidationProps = (sectionId: string, patch: Record<string, any>) => {
+    setPerpendicularData((prev) => {
+      if (!prev) return prev;
+      const features = [...prev.features] as any[];
+      let changed = false;
+
+      for (let i = 0; i < features.length; i++) {
+        const f = features[i];
+        const sid = f?.properties?.sectionId;
+        if (!sid || sid !== sectionId) continue;
+
+        features[i] = {
+          ...f,
+          properties: {
+            ...(f.properties || {}),
+            ...patch,
+          },
+        };
+        changed = true;
+      }
+
+      return changed ? turf.featureCollection(features as any) : prev;
+    });
+  };
+
+  const validateSectionAsync = async (sectionId: string): Promise<'valid' | 'invalid' | 'pending'> => {
+    try {
+      const res = await fetch(`/v0/bank/sections/${sectionId}/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        // 后端若没有返回 JSON，则保持 pending（黄色）
+        data = null;
+      }
+
+      const rawIsValid = data?.is_valid ?? data?.isValid;
+      const rawStatus = data?.validation_status ?? data?.validationStatus;
+      const validationMessage = data?.validation_message ?? data?.validationMessage;
+
+      const isValid: boolean | undefined =
+        rawIsValid === true ? true : rawIsValid === false ? false : undefined;
+
+      const normalizedStatus: string | undefined =
+        typeof rawStatus === 'string' ? String(rawStatus).toLowerCase() : undefined;
+
+      // 只有真正通过/不通过才变色：其它任何状态（含未知字符串）都视为 pending
+      let mappedStatus: 'valid' | 'invalid' | 'pending' = 'pending';
+      if (isValid === true) mappedStatus = 'valid';
+      else if (isValid === false) mappedStatus = 'invalid';
+      else if (normalizedStatus === 'valid') mappedStatus = 'valid';
+      else if (normalizedStatus === 'invalid' || (normalizedStatus && normalizedStatus.startsWith('invalid'))) {
+        mappedStatus = 'invalid';
+      }
+
+      patchSectionValidationProps(sectionId, {
+        is_valid: isValid,
+        validation_status: mappedStatus,
+        validation_status_raw: normalizedStatus,
+        validation_message: validationMessage,
+        validation_error: undefined,
+        validated_at: Date.now(),
+      });
+
+      return mappedStatus;
+    } catch (err: any) {
+      console.warn(`断面验证请求失败: ${sectionId}`, err);
+      // 请求失败不变红，保持黄色 pending；下次可手动刷新或重试
+      patchSectionValidationProps(sectionId, {
+        validation_status: 'pending',
+        is_valid: undefined,
+        validation_status_raw: undefined,
+        validation_error: err?.message || String(err),
+      });
+
+      return 'pending';
+    }
+  };
+
+  // 手动触发断面校验：强制重跑一遍（即使已校验过），避免编辑移动后状态滞后
+  const validateAllPendingSections = async () => {
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      alert('当前没有可检查的断面');
+      return;
+    }
+
+    const sectionIds = new Set<string>();
+    let hasMissingSectionId = false;
+    (perpendicularData.features as any[]).forEach((f) => {
+      const sid = f?.properties?.sectionId as string | undefined;
+      if (!sid) {
+        hasMissingSectionId = true;
+        return;
+      }
+      sectionIds.add(sid);
+    });
+
+    if (sectionIds.size === 0) {
+      alert('当前没有可校验的断面（缺少 sectionId）');
+      return;
+    }
+
+    sectionIds.forEach((sid) => {
+      patchSectionValidationProps(sid, {
+        validation_status: 'pending',
+        is_valid: undefined,
+        validation_status_raw: undefined,
+        validation_message: undefined,
+        validation_error: undefined,
+        validated_at: Date.now(),
+      });
+    });
+
+    // 强制重跑：不受 validationTriggeredRef 的影响
+    await Promise.allSettled(Array.from(sectionIds).map((sid) => validateSectionAsync(sid)));
+
+    if (hasMissingSectionId) {
+      console.warn('存在缺少 sectionId 的断面，无法参与后端校验');
+    }
+  };
+
+  const validateAllSectionsBeforeAnalysis = async (): Promise<{ ok: boolean; reason?: string }> => {
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      return { ok: false, reason: '请先绘制断面' };
+    }
+
+    const sectionIds = new Set<string>();
+    let missingSectionIdCount = 0;
+
+    (perpendicularData.features as any[]).forEach((f) => {
+      const sid = f?.properties?.sectionId as string | undefined;
+      if (!sid) {
+        missingSectionIdCount++;
+        return;
+      }
+      sectionIds.add(sid);
+    });
+
+    if (missingSectionIdCount > 0) {
+      return { ok: false, reason: `存在 ${missingSectionIdCount} 个断面缺少 sectionId，无法校验` };
+    }
+    if (sectionIds.size === 0) {
+      return { ok: false, reason: '没有可校验的断面' };
+    }
+
+    // 分析前强制校验一遍，避免断面被编辑移动后状态滞后
+    sectionIds.forEach((sid) => {
+      patchSectionValidationProps(sid, {
+        validation_status: 'pending',
+        is_valid: undefined,
+        validation_status_raw: undefined,
+        validation_message: undefined,
+        validation_error: undefined,
+        validated_at: Date.now(),
+      });
+    });
+
+    const results = await Promise.allSettled(Array.from(sectionIds).map((sid) => validateSectionAsync(sid)));
+    const mapped = results.map((r) => (r.status === 'fulfilled' ? r.value : 'pending'));
+    const allValid = mapped.every((st) => st === 'valid');
+    if (!allValid) {
+      return { ok: false, reason: '存在未通过或未完成校验的断面，请先修正后再分析' };
+    }
+
+    return { ok: true };
+  };
+
+  // 当断面集合变化时，自动异步触发后端验证
+  useEffect(() => {
+    if (!perpendicularData || perpendicularData.features.length === 0) return;
+
+    const sectionIdsToValidate: string[] = [];
+    (perpendicularData.features as any[]).forEach((f) => {
+      const sectionId = f?.properties?.sectionId as string | undefined;
+      if (!sectionId) return;
+
+      if (validationTriggeredRef.current.has(sectionId)) return;
+      validationTriggeredRef.current.add(sectionId);
+      sectionIdsToValidate.push(sectionId);
+
+      // 初始标记为 pending（黄色）
+      if (!f?.properties?.validation_status) {
+        patchSectionValidationProps(sectionId, { validation_status: 'pending' });
+      }
+    });
+
+    if (sectionIdsToValidate.length === 0) return;
+    sectionIdsToValidate.forEach((sid) => {
+      validateSectionAsync(sid);
+    });
+  }, [perpendicularData]);
 
   // 挂载时拉取可用的基础参数模板列表
   useEffect(() => {
@@ -168,17 +382,25 @@ function EditorPage() {
   
   // 切换断面选择模式
   const toggleCrossLineSelection = () => {
-    setIsSelectingCrossLines(!isSelectingCrossLines);
-    if (isSelectingShoreLines) {
-      setIsSelectingShoreLines(false);
+    const next = !isSelectingCrossLines;
+    setIsSelectingCrossLines(next);
+
+    if (next) {
+      if (isSelectingShoreLines) setIsSelectingShoreLines(false);
+      if (isSelectingStartEnd) setIsSelectingStartEnd(false);
+      // 进入精调时默认不选中任何工具，避免误触
+      setCrossLineEditMode('none');
+      setSelectedCrossLineIndex(null);
+    } else {
+      // 退出精调时取消所有选择并释放断面
+      setSelectedCrossLineIndex(null);
+      setCrossLineEditMode('none');
+      setCrossLineControlMode('shoreline');
     }
-    if (isSelectingStartEnd) {
-      setIsSelectingStartEnd(false);
-    }
-    if (!isSelectingCrossLines) {
-      setSelectedCrossLineIndex(null); // 关闭模式时清空选择
-      setCrossLineEditMode('select'); // 重置为选择模式
-    }
+  };
+
+  const clearSelectedCrossLineSelection = () => {
+    setSelectedCrossLineIndex(null);
   };
   
   // 在指定位置新建断面
@@ -214,6 +436,89 @@ function EditorPage() {
       setPerpendicularData,
     });
   };
+
+  // 仅更新前端断面几何（用于自由模式拖动/旋转/缩放的即时反馈）
+  const updateCrossLineGeometryLocal = (crossLineIndex: number, geometry: GeoJSON.LineString) => {
+    setPerpendicularData((prev) => {
+      if (!prev) return prev;
+      const features = [...prev.features] as GeoJSON.Feature<GeoJSON.Geometry>[];
+      const current: any = features[crossLineIndex];
+      if (!current || current.geometry?.type !== 'LineString') return prev;
+
+      const coords = geometry.coordinates as number[][];
+      if (!coords || coords.length < 2) return prev;
+
+      const leftPoint = coords[0];
+      const rightPoint = coords[coords.length - 1];
+
+      features[crossLineIndex] = {
+        ...current,
+        geometry,
+        properties: {
+          ...(current.properties || {}),
+          crossLineId: (current.properties as any)?.crossLineId ?? crossLineIndex,
+          leftPoint,
+          rightPoint,
+        },
+      };
+
+      return turf.featureCollection(features as any);
+    });
+  };
+
+  // 将断面几何同步到后端（自由模式拖动结束时调用）
+  const persistCrossLineGeometry = async (crossLineIndex: number, geometry: GeoJSON.LineString) => {
+    const feature: any = perpendicularData?.features?.[crossLineIndex];
+    const sectionId = feature?.properties?.sectionId as string | undefined;
+    await persistCrossLineGeometryAction({ sectionId, geometry, silent: true });
+  };
+
+  // 自由模式：旋转选中断面
+  const rotateSelectedCrossLine = async (angleDegrees: number) => {
+    if (selectedCrossLineIndex === null || !perpendicularData) {
+      alert('请先选择要旋转的断面');
+      return;
+    }
+    const feature: any = perpendicularData.features[selectedCrossLineIndex];
+    if (!feature || feature.geometry?.type !== 'LineString') return;
+
+    const nextGeometry = rotateCrossLineGeometry({
+      geometry: feature.geometry as GeoJSON.LineString,
+      angleDegrees,
+    });
+
+    updateCrossLineGeometryLocal(selectedCrossLineIndex, nextGeometry);
+    await persistCrossLineGeometry(selectedCrossLineIndex, nextGeometry);
+  };
+
+  // 自由模式：拉长/缩短选中断面
+  const scaleSelectedCrossLine = async (deltaMeters: number) => {
+    if (selectedCrossLineIndex === null || !perpendicularData) {
+      alert('请先选择要缩放的断面');
+      return;
+    }
+    const feature: any = perpendicularData.features[selectedCrossLineIndex];
+    if (!feature || feature.geometry?.type !== 'LineString') return;
+
+    const nextGeometry = scaleCrossLineGeometry({
+      geometry: feature.geometry as GeoJSON.LineString,
+      deltaMeters,
+    });
+
+    updateCrossLineGeometryLocal(selectedCrossLineIndex, nextGeometry);
+    await persistCrossLineGeometry(selectedCrossLineIndex, nextGeometry);
+  };
+
+  // 自由模式：点选起止点创建断面
+  const createCrossLineByEndpoints = async (start: number[], end: number[]) => {
+    await createCrossLineByEndpointsAction({
+      start,
+      end,
+      uploadedData,
+      perpendicularData,
+      setPerpendicularData,
+    });
+  };
   
   // 为选中的断面配置属性
   const configureSelectedCrossLineProperties = async () => {
@@ -246,6 +551,12 @@ function EditorPage() {
   const handleStartAnalysis = async () => {
     if (!perpendicularData) {
       alert('请先绘制断面');
+      return;
+    }
+
+    const check = await validateAllSectionsBeforeAnalysis();
+    if (!check.ok) {
+      alert(check.reason || '断面校验未通过，已拒绝执行分析');
       return;
     }
 
@@ -308,6 +619,22 @@ function EditorPage() {
     }
   };
 
+  // 反切某段落范围内的所有断面
+  const reverseCrossLinesInGroup = async (groupId: string) => {
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) {
+      alert('未找到要反切的段落');
+      return;
+    }
+
+    await reverseCrossLinesInGroupAction({
+      group,
+      perpendicularData,
+      globalLength,
+      setPerpendicularData,
+    });
+  };
+
   // 切换编辑组状态
   const handleEditGroup = (id: string) => {
     if (editingGroupId === id) {
@@ -344,6 +671,7 @@ function EditorPage() {
         isSelectingShoreLines={isSelectingShoreLines}
         isSelectingStartEnd={isSelectingStartEnd}
         isSelectingCrossLines={isSelectingCrossLines}
+        crossLineControlMode={crossLineControlMode}
         crossLineEditMode={crossLineEditMode}
         selectedLines={selectedLines}
         setSelectedLines={setSelectedLines}
@@ -353,6 +681,9 @@ function EditorPage() {
         globalInterval={globalInterval}
         globalLength={globalLength}
         createCrossLineAtPoint={createCrossLineAtPoint}
+        updateCrossLineGeometryLocal={updateCrossLineGeometryLocal}
+        persistCrossLineGeometry={persistCrossLineGeometry}
+        createCrossLineByEndpoints={createCrossLineByEndpoints}
       />
       <EditorSidebar
         uploadedData={uploadedData}
@@ -378,14 +709,21 @@ function EditorPage() {
         handleEditGroup={handleEditGroup}
         deleteGroup={deleteGroup}
         updateGroupConfig={updateGroupConfig}
+        reverseCrossLinesInGroup={reverseCrossLinesInGroup}
         setEditingPropertiesGroupId={setEditingPropertiesGroupId}
         handleApplyCustomSegments={handleApplyCustomSegments}
         isSelectingCrossLines={isSelectingCrossLines}
         toggleCrossLineSelection={toggleCrossLineSelection}
+        validateAllPendingSections={validateAllPendingSections}
+        crossLineControlMode={crossLineControlMode}
+        setCrossLineControlMode={setCrossLineControlMode}
         crossLineEditMode={crossLineEditMode}
         setCrossLineEditMode={setCrossLineEditMode}
+        clearSelectedCrossLineSelection={clearSelectedCrossLineSelection}
         selectedCrossLineIndex={selectedCrossLineIndex}
         translateSelectedCrossLine={translateSelectedCrossLine}
+        rotateSelectedCrossLine={rotateSelectedCrossLine}
+        scaleSelectedCrossLine={scaleSelectedCrossLine}
         configureSelectedCrossLineProperties={configureSelectedCrossLineProperties}
         deleteSelectedCrossLine={deleteSelectedCrossLine}
         reverseSelectedCrossLine={reverseSelectedCrossLine}

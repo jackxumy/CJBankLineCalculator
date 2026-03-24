@@ -26,10 +26,14 @@ function buildCrossLineArrowPoints(
     // 参考 Mapbox 图标默认朝向与正北夹角，做 -90 度修正
     const iconRotate = Number(bearing - 90);
 
+    const props: any = feature.properties || {};
+
     arrowPoints.push({
       type: 'Feature',
       properties: {
         iconRotate,
+        validation_status: props.validation_status,
+        is_valid: props.is_valid,
       },
       geometry: {
         type: 'Point',
@@ -41,6 +45,22 @@ function buildCrossLineArrowPoints(
   return turf.featureCollection(arrowPoints) as GeoJSON.FeatureCollection<GeoJSON.Point>;
 }
 
+function buildValidationColorExpression() {
+  // pending/unknown => yellow, valid => green, invalid => red
+  return [
+    'case',
+    ['==', ['get', 'validation_status'], 'valid'],
+    '#22c55e',
+    ['==', ['get', 'validation_status'], 'invalid'],
+    '#ef4444',
+    ['==', ['get', 'is_valid'], true],
+    '#22c55e',
+    ['==', ['get', 'is_valid'], false],
+    '#ef4444',
+    '#f59e0b',
+  ] as any;
+}
+
 interface EditorMapProps {
   perpendicularData: GeoJSON.FeatureCollection | null;
   uploadedData: GeoJSON.FeatureCollection | null;
@@ -49,7 +69,8 @@ interface EditorMapProps {
   isSelectingShoreLines: boolean;
   isSelectingStartEnd: boolean;
   isSelectingCrossLines: boolean;
-  crossLineEditMode: 'select' | 'add';
+  crossLineControlMode: 'shoreline' | 'free';
+  crossLineEditMode: 'none' | 'select' | 'add';
   selectedLines: Set<string>;
   setSelectedLines: React.Dispatch<React.SetStateAction<Set<string>>>;
   setGroups: React.Dispatch<React.SetStateAction<SelectionGroup[]>>;
@@ -58,6 +79,9 @@ interface EditorMapProps {
   globalInterval: number;
   globalLength: number;
   createCrossLineAtPoint: (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => void;
+  updateCrossLineGeometryLocal: (crossLineIndex: number, geometry: GeoJSON.LineString) => void;
+  persistCrossLineGeometry: (crossLineIndex: number, geometry: GeoJSON.LineString) => void;
+  createCrossLineByEndpoints: (start: number[], end: number[]) => void;
 }
 
 function EditorMap(props: EditorMapProps) {
@@ -69,6 +93,7 @@ function EditorMap(props: EditorMapProps) {
     isSelectingShoreLines,
     isSelectingStartEnd,
     isSelectingCrossLines,
+    crossLineControlMode,
     crossLineEditMode,
     selectedLines,
     setSelectedLines,
@@ -78,10 +103,18 @@ function EditorMap(props: EditorMapProps) {
     globalInterval,
     globalLength,
     createCrossLineAtPoint,
+    updateCrossLineGeometryLocal,
+    persistCrossLineGeometry,
+    createCrossLineByEndpoints,
   } = props;
 
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
+
+  const perpendicularDataRef = useRef<GeoJSON.FeatureCollection | null>(perpendicularData);
+  useEffect(() => {
+    perpendicularDataRef.current = perpendicularData;
+  }, [perpendicularData]);
 
   const groupsRef = useRef<SelectionGroup[]>(groups);
   useEffect(() => {
@@ -103,10 +136,41 @@ function EditorMap(props: EditorMapProps) {
     isSelectingCrossLinesRef.current = isSelectingCrossLines;
   }, [isSelectingCrossLines]);
 
-  const crossLineEditModeRef = useRef<'select' | 'add'>(crossLineEditMode);
+  const crossLineControlModeRef = useRef<'shoreline' | 'free'>(crossLineControlMode);
+  useEffect(() => {
+    crossLineControlModeRef.current = crossLineControlMode;
+  }, [crossLineControlMode]);
+
+  const crossLineEditModeRef = useRef<'none' | 'select' | 'add'>(crossLineEditMode);
   useEffect(() => {
     crossLineEditModeRef.current = crossLineEditMode;
   }, [crossLineEditMode]);
+
+  // 退出断面精调/释放选择时，清理吸附点与鼠标样式
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (isSelectingCrossLines) return;
+
+    const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
+    if (source) source.setData(turf.featureCollection([]));
+    map.getCanvas().style.cursor = '';
+  }, [isSelectingCrossLines]);
+
+  const updateCrossLineGeometryLocalRef = useRef(updateCrossLineGeometryLocal);
+  useEffect(() => {
+    updateCrossLineGeometryLocalRef.current = updateCrossLineGeometryLocal;
+  }, [updateCrossLineGeometryLocal]);
+
+  const persistCrossLineGeometryRef = useRef(persistCrossLineGeometry);
+  useEffect(() => {
+    persistCrossLineGeometryRef.current = persistCrossLineGeometry;
+  }, [persistCrossLineGeometry]);
+
+  const createCrossLineByEndpointsRef = useRef(createCrossLineByEndpoints);
+  useEffect(() => {
+    createCrossLineByEndpointsRef.current = createCrossLineByEndpoints;
+  }, [createCrossLineByEndpoints]);
 
   const selectedCrossLineIndexRef = useRef<number | null>(selectedCrossLineIndex);
   useEffect(() => {
@@ -354,7 +418,7 @@ function EditorMap(props: EditorMapProps) {
         id: 'perpendicular-lines-layer',
         type: 'line',
         source: 'perpendicular-lines',
-        paint: { 'line-color': '#ef4444', 'line-width': 4 },
+        paint: { 'line-color': buildValidationColorExpression(), 'line-width': 4 },
       });
 
       map.addLayer({
@@ -370,7 +434,7 @@ function EditorMap(props: EditorMapProps) {
           'text-ignore-placement': true,
         },
         paint: {
-          'text-color': '#ef4444',
+          'text-color': buildValidationColorExpression(),
           'text-halo-color': '#ffffff',
           'text-halo-width': 2,
         },
@@ -411,9 +475,167 @@ function EditorMap(props: EditorMapProps) {
       const hitLayers = ['uploaded-lines-hit-target'];
       const crossLineHitLayers = ['perpendicular-lines-hit-target'];
 
+      const freeAddStartRef: { current: number[] | null } = { current: null };
+
+      let infoPopup: mapboxgl.Popup | null = null;
+
+      const closeInfoPopup = () => {
+        if (!infoPopup) return;
+        infoPopup.remove();
+        infoPopup = null;
+      };
+
+      const escapeHtml = (value: any) => {
+        const s = value === null || value === undefined ? '' : String(value);
+        return s
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#039;');
+      };
+
+      const openCrossLineInfoPopup = (lngLat: mapboxgl.LngLat, props: any) => {
+        closeInfoPopup();
+
+        const sectionId = props?.sectionId ?? props?.section_id ?? props?.id;
+        const isValid = props?.is_valid;
+        const status = props?.validation_status;
+        const rawStatus = props?.validation_status_raw;
+        const message = props?.validation_message;
+        const error = props?.validation_error;
+
+        let label = '未验证';
+        let color = '#f59e0b';
+        if (status === 'valid' || isValid === true) {
+          label = '通过';
+          color = '#22c55e';
+        } else if (status === 'invalid' || isValid === false) {
+          label = '未通过';
+          color = '#ef4444';
+        }
+
+        const detailHtml: string[] = [];
+        if (label === '未通过') {
+          const detail = message || rawStatus;
+          if (detail) {
+            detailHtml.push(
+              `<p style="margin:4px 0 0; font-size:12px; color:#64748b;">问题: ${escapeHtml(detail)}</p>`,
+            );
+          }
+        } else if (label === '未验证' && error) {
+          detailHtml.push(
+            `<p style="margin:4px 0 0; font-size:12px; color:#64748b;">上次请求失败: ${escapeHtml(error)}</p>`,
+          );
+        }
+
+        infoPopup = new mapboxgl.Popup()
+          .setLngLat(lngLat)
+          .setHTML(`
+            <div style="padding: 4px; font-family: sans-serif;">
+              <p style="margin:0; font-weight:bold; color:#1e293b;">断面校验状态</p>
+              <p style="margin:4px 0 0; font-size:12px; color:#64748b;">断面ID: ${escapeHtml(sectionId || '未知')}</p>
+              <p style="margin:4px 0 0; font-size:12px; color:#64748b;">状态: <span style="color:${color}; font-weight:bold;">${label}</span></p>
+              ${detailHtml.join('')}
+            </div>
+          `)
+          .addTo(map);
+      };
+
+      let dragState:
+        | {
+            crossLineId: number;
+            startLngLat: mapboxgl.LngLat;
+            startCoords: number[][];
+            lastCoords: number[][];
+          }
+        | null = null;
+
+      const onDragMove = (ev: mapboxgl.MapMouseEvent) => {
+        if (!dragState) return;
+        const dx = ev.lngLat.lng - dragState.startLngLat.lng;
+        const dy = ev.lngLat.lat - dragState.startLngLat.lat;
+        const nextCoords = dragState.startCoords.map((c) => [c[0] + dx, c[1] + dy]);
+        dragState.lastCoords = nextCoords;
+        updateCrossLineGeometryLocalRef.current(dragState.crossLineId, {
+          type: 'LineString',
+          coordinates: nextCoords,
+        });
+      };
+
+      const endDrag = () => {
+        if (!dragState) return;
+        map.dragPan.enable();
+        map.off('mousemove', onDragMove);
+        map.getCanvas().style.cursor = '';
+
+        const finalGeometry: GeoJSON.LineString = {
+          type: 'LineString',
+          coordinates: dragState.lastCoords,
+        };
+
+        persistCrossLineGeometryRef.current(dragState.crossLineId, finalGeometry);
+        dragState = null;
+      };
+
+      map.on('mousedown', 'perpendicular-lines-hit-target', (e) => {
+        if (!isSelectingCrossLinesRef.current) return;
+        if (crossLineControlModeRef.current !== 'free') return;
+        if (crossLineEditModeRef.current !== 'select') return;
+
+        const feature = e.features?.[0];
+        const crossLineId = feature?.properties?.crossLineId as number | undefined;
+        if (crossLineId === undefined || crossLineId === null) return;
+
+        const currentData = perpendicularDataRef.current;
+        const currentFeature: any = currentData?.features?.[crossLineId];
+        if (!currentFeature || currentFeature.geometry?.type !== 'LineString') return;
+
+        const startCoords = (currentFeature.geometry.coordinates as number[][]) || [];
+        if (startCoords.length < 2) return;
+
+        setSelectedCrossLineIndex(crossLineId);
+
+        dragState = {
+          crossLineId,
+          startLngLat: e.lngLat,
+          startCoords: startCoords.map((c) => [c[0], c[1]]),
+          lastCoords: startCoords.map((c) => [c[0], c[1]]),
+        };
+
+        map.dragPan.disable();
+        map.getCanvas().style.cursor = 'move';
+
+        map.on('mousemove', onDragMove);
+        map.once('mouseup', endDrag);
+      });
+
       map.on('click', (e) => {
+        // 所有编辑操作未激活时：点击断面只展示状态，不进入选择/编辑
+        const noEditingActive =
+          !isSelectingShoreLinesRef.current &&
+          !isSelectingStartEndRef.current &&
+          !isSelectingCrossLinesRef.current;
+
+        if (noEditingActive) {
+          const crossLineFeatures = map.queryRenderedFeatures(e.point, { layers: crossLineHitLayers });
+          const hit = crossLineFeatures?.[0];
+          if (hit) {
+            openCrossLineInfoPopup(e.lngLat, hit.properties || {});
+            return;
+          }
+        }
+
         if (isSelectingCrossLinesRef.current) {
+          // 进入断面编辑时，关闭信息弹窗，避免遮挡
+          closeInfoPopup();
           const editMode = crossLineEditModeRef.current;
+          const controlMode = crossLineControlModeRef.current;
+
+          if (editMode === 'none') {
+            setSelectedCrossLineIndex(null);
+            return;
+          }
 
           if (editMode === 'select') {
             const crossLineFeatures = map.queryRenderedFeatures(e.point, { layers: crossLineHitLayers });
@@ -433,22 +655,42 @@ function EditorMap(props: EditorMapProps) {
               }
             }
           } else if (editMode === 'add') {
-            const shoreLineFeatures = map.queryRenderedFeatures(e.point, { layers: hitLayers });
+            if (controlMode === 'shoreline') {
+              const shoreLineFeatures = map.queryRenderedFeatures(e.point, { layers: hitLayers });
 
-            if (shoreLineFeatures && shoreLineFeatures.length > 0) {
-              const clickedFeature = shoreLineFeatures[0];
-              const lineGeo = clickedFeature.geometry as GeoJSON.LineString;
-              const lineFeature = turf.feature(lineGeo, clickedFeature.properties) as GeoJSON.Feature<GeoJSON.LineString>;
+              if (shoreLineFeatures && shoreLineFeatures.length > 0) {
+                const clickedFeature = shoreLineFeatures[0];
+                const lineGeo = clickedFeature.geometry as GeoJSON.LineString;
+                const lineFeature = turf.feature(lineGeo, clickedFeature.properties) as GeoJSON.Feature<GeoJSON.LineString>;
 
-              const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
-              const distanceOnLine = snapped.properties.location ?? 0;
+                const snapped = turf.nearestPointOnLine(lineFeature, [e.lngLat.lng, e.lngLat.lat], { units: 'meters' });
+                const distanceOnLine = snapped.properties.location ?? 0;
 
-              console.log(`点击岸段新建断面，距离: ${distanceOnLine.toFixed(2)}m`);
-              createCrossLineAtPoint(lineFeature, distanceOnLine);
+                console.log(`点击岸段新建断面，距离: ${distanceOnLine.toFixed(2)}m`);
+                createCrossLineAtPoint(lineFeature, distanceOnLine);
+              }
+            } else {
+              const clicked = [e.lngLat.lng, e.lngLat.lat] as number[];
+              if (!freeAddStartRef.current) {
+                freeAddStartRef.current = clicked;
+                const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
+                if (source) source.setData(turf.point(clicked));
+                console.log('自由模式：已选择断面起点');
+              } else {
+                const start = freeAddStartRef.current;
+                freeAddStartRef.current = null;
+                const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
+                if (source) source.setData(turf.featureCollection([]));
+                console.log('自由模式：已选择断面终点，开始创建断面');
+                createCrossLineByEndpointsRef.current(start, clicked);
+              }
             }
           }
           return;
         }
+
+        // 点击到空白处时，收起信息弹窗
+        closeInfoPopup();
 
         const features = map.queryRenderedFeatures(e.point, { layers: hitLayers });
         const feature = features?.[0];
@@ -543,6 +785,26 @@ function EditorMap(props: EditorMapProps) {
               return [...filtered, newGroup];
             });
           }
+        }
+      });
+
+      map.on('mouseenter', 'perpendicular-lines-hit-target', () => {
+        const noEditingActive =
+          !isSelectingShoreLinesRef.current &&
+          !isSelectingStartEndRef.current &&
+          !isSelectingCrossLinesRef.current;
+        if (noEditingActive) {
+          map.getCanvas().style.cursor = 'pointer';
+        }
+      });
+
+      map.on('mouseleave', 'perpendicular-lines-hit-target', () => {
+        const noEditingActive =
+          !isSelectingShoreLinesRef.current &&
+          !isSelectingStartEndRef.current &&
+          !isSelectingCrossLinesRef.current;
+        if (noEditingActive) {
+          map.getCanvas().style.cursor = '';
         }
       });
 

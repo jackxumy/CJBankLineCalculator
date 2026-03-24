@@ -5,6 +5,8 @@ import { ensureDefaultBasicParams } from '../../services/basicParamsService';
 import { fetchSectionParams } from './sectionApi';
 import { getCurrentTaskId } from './taskState';
 
+export type CrossLineControlMode = 'shoreline' | 'free';
+
 export async function reverseSelectedCrossLineAction(params: {
   selectedCrossLineIndex: number | null;
   perpendicularData: GeoJSON.FeatureCollection | null;
@@ -72,6 +74,114 @@ export async function reverseSelectedCrossLineAction(params: {
   } catch (err: any) {
     console.error('反转断面失败:', err);
     alert(`反转断面失败: ${err.message}`);
+  }
+}
+
+export async function reverseCrossLinesInGroupAction(params: {
+  group: { id: string; line: GeoJSON.Feature<GeoJSON.LineString>; start: number; end: number | null; length: number };
+  perpendicularData: GeoJSON.FeatureCollection | null;
+  globalLength: number;
+  setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
+}) {
+  const { group, perpendicularData, globalLength, setPerpendicularData } = params;
+
+  if (group.end === null) {
+    alert('该段落尚未选择终点，无法反切');
+    return;
+  }
+
+  if (!perpendicularData || perpendicularData.features.length === 0) {
+    alert('当前没有断面可反切');
+    return;
+  }
+
+  const start = Math.min(group.start, group.end);
+  const end = Math.max(group.start, group.end);
+  const distanceThreshold = Math.max(globalLength, group.length) / 2 + 100;
+
+  const updatedFeatures = [...perpendicularData.features] as GeoJSON.Feature<GeoJSON.Geometry>[];
+  const reversedIndices: number[] = [];
+
+  updatedFeatures.forEach((feature, index) => {
+    if (feature.geometry.type !== 'LineString') return;
+    const coords = (feature.geometry.coordinates as number[][]) || [];
+    if (coords.length < 2) return;
+
+    const first = coords[0];
+    const last = coords[coords.length - 1];
+    const mid = turf.point([(first[0] + last[0]) / 2, (first[1] + last[1]) / 2]);
+
+    try {
+      const snapped = turf.nearestPointOnLine(group.line, mid, { units: 'meters' });
+      const actualDist = snapped.properties.location ?? 0;
+      const distToLine = turf.distance(mid, snapped, { units: 'meters' });
+
+      if (distToLine > distanceThreshold) return;
+      if (actualDist < start || actualDist > end) return;
+
+      const reversedCoords = [...coords].reverse();
+      const nextProps: any = { ...(feature.properties as any) };
+
+      if (nextProps.leftPoint && nextProps.rightPoint) {
+        const oldLeft = nextProps.leftPoint;
+        nextProps.leftPoint = nextProps.rightPoint;
+        nextProps.rightPoint = oldLeft;
+      }
+
+      updatedFeatures[index] = {
+        ...feature,
+        geometry: {
+          type: 'LineString',
+          coordinates: reversedCoords,
+        },
+        properties: nextProps,
+      } as any;
+
+      reversedIndices.push(index);
+    } catch {
+      // ignore matching failures
+    }
+  });
+
+  if (reversedIndices.length === 0) {
+    alert('在该段落范围内未找到可反切的断面');
+    return;
+  }
+
+  setPerpendicularData(turf.featureCollection(updatedFeatures as any));
+
+  const sectionsToSync = reversedIndices
+    .map((idx) => {
+      const f: any = updatedFeatures[idx];
+      return f?.properties?.sectionId as string | undefined;
+    })
+    .filter(Boolean) as string[];
+
+  if (sectionsToSync.length === 0) {
+    alert(`已反切 ${reversedIndices.length} 条断面（未同步到后端）`);
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    sectionsToSync.map((sectionId) =>
+      fetch(`/v0/bank/sections/${sectionId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reverse: true }),
+      }).then((res) => {
+        if (!res.ok) throw new Error(res.statusText);
+        return true;
+      }),
+    ),
+  );
+
+  const successCount = results.filter((r) => r.status === 'fulfilled').length;
+  const failedCount = results.length - successCount;
+
+  if (failedCount > 0) {
+    alert(`已反切 ${reversedIndices.length} 条断面；后端同步成功 ${successCount}，失败 ${failedCount}`);
+  } else {
+    alert(`已反切 ${reversedIndices.length} 条断面（已同步到后端）`);
   }
 }
 
@@ -415,5 +525,240 @@ export async function configureSelectedCrossLinePropertiesAction(params: {
   } catch (err: any) {
     console.error('获取断面参数失败:', err);
     alert(`获取断面参数失败: ${err.message}`);
+  }
+}
+
+export async function persistCrossLineGeometryAction(params: {
+  sectionId: string | undefined;
+  geometry: GeoJSON.LineString;
+  silent?: boolean;
+}) {
+  const { sectionId, geometry, silent } = params;
+
+  if (!sectionId) {
+    if (!silent) {
+      console.log('断面无 sectionId，仅更新前端几何（未同步后端）');
+    }
+    return;
+  }
+
+  try {
+    const response = await fetch(`/v0/bank/sections/${sectionId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        geometry,
+        section_geometry: geometry,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`更新断面几何失败: ${response.statusText}`);
+    }
+  } catch (err: any) {
+    console.error('同步断面几何到后端失败:', err);
+    alert(`同步断面几何到后端失败: ${err.message}`);
+  }
+}
+
+export function rotateCrossLineGeometry(params: {
+  geometry: GeoJSON.LineString;
+  angleDegrees: number;
+}): GeoJSON.LineString {
+  const { geometry, angleDegrees } = params;
+  const coords = geometry.coordinates as number[][];
+  if (!coords || coords.length < 2) return geometry;
+
+  const left = coords[0];
+  const right = coords[coords.length - 1];
+  const mid = turf.midpoint(turf.point(left), turf.point(right));
+
+  const distLeft = turf.distance(mid, turf.point(left), { units: 'meters' });
+  const distRight = turf.distance(mid, turf.point(right), { units: 'meters' });
+  const bearingLeft = turf.bearing(mid, turf.point(left));
+  const bearingRight = turf.bearing(mid, turf.point(right));
+
+  const newLeft = turf.destination(mid, distLeft, bearingLeft + angleDegrees, { units: 'meters' }).geometry.coordinates;
+  const newRight = turf.destination(mid, distRight, bearingRight + angleDegrees, { units: 'meters' }).geometry.coordinates;
+
+  return {
+    type: 'LineString',
+    coordinates: [newLeft, newRight],
+  };
+}
+
+export function scaleCrossLineGeometry(params: {
+  geometry: GeoJSON.LineString;
+  deltaMeters: number;
+  minLengthMeters?: number;
+}): GeoJSON.LineString {
+  const { geometry, deltaMeters, minLengthMeters = 1 } = params;
+  const coords = geometry.coordinates as number[][];
+  if (!coords || coords.length < 2) return geometry;
+
+  const left = coords[0];
+  const right = coords[coords.length - 1];
+  const mid = turf.midpoint(turf.point(left), turf.point(right));
+
+  const currentLen = turf.distance(turf.point(left), turf.point(right), { units: 'meters' });
+  const nextLen = Math.max(minLengthMeters, currentLen + deltaMeters);
+  const half = nextLen / 2;
+
+  const bearingToLeft = turf.bearing(mid, turf.point(left));
+  const newLeft = turf.destination(mid, half, bearingToLeft, { units: 'meters' }).geometry.coordinates;
+  const newRight = turf.destination(mid, half, bearingToLeft + 180, { units: 'meters' }).geometry.coordinates;
+
+  return {
+    type: 'LineString',
+    coordinates: [newLeft, newRight],
+  };
+}
+
+export async function createCrossLineByEndpointsAction(params: {
+  start: number[];
+  end: number[];
+  uploadedData: GeoJSON.FeatureCollection | null;
+  perpendicularData: GeoJSON.FeatureCollection | null;
+  setPerpendicularData: Dispatch<SetStateAction<GeoJSON.FeatureCollection | null>>;
+}) {
+  const { start, end, uploadedData, perpendicularData, setPerpendicularData } = params;
+
+  const taskId = getCurrentTaskId();
+  const basicParamId = await ensureDefaultBasicParams();
+
+  const newGeometry: GeoJSON.LineString = {
+    type: 'LineString',
+    coordinates: [start, end],
+  };
+
+  // 尝试根据上传岸线推断 bank_id 与 distance（自由模式也可在无岸线情况下工作）
+  let bankId = 'line-0';
+  let distance = 0;
+
+  if (uploadedData && uploadedData.features.length > 0) {
+    const mid = turf.midpoint(turf.point(start), turf.point(end));
+    let bestBankId: string | null = null;
+    let bestDistance = 0;
+    let bestD = Number.POSITIVE_INFINITY;
+
+    uploadedData.features.forEach((f, idx) => {
+      if (!f.geometry || (f.geometry.type !== 'LineString' && f.geometry.type !== 'MultiLineString')) return;
+
+      const handleLine = (line: GeoJSON.Feature<GeoJSON.LineString>, assumedBankId: string) => {
+        try {
+          const snapped = turf.nearestPointOnLine(line, mid, { units: 'meters' });
+          const d = turf.distance(mid, snapped, { units: 'meters' });
+          const loc = snapped.properties.location ?? 0;
+
+          if (d < bestD) {
+            bestD = d;
+            bestBankId = assumedBankId;
+            bestDistance = loc;
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      const assumedBankId = `line-${idx}`;
+      if (f.geometry.type === 'LineString') {
+        handleLine(f as GeoJSON.Feature<GeoJSON.LineString>, assumedBankId);
+      } else {
+        const multi = f.geometry as GeoJSON.MultiLineString;
+        multi.coordinates.forEach((coords) => {
+          const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
+          handleLine(line, assumedBankId);
+        });
+      }
+    });
+
+    if (bestBankId !== null) {
+      bankId = bestBankId;
+      distance = bestDistance;
+    }
+  }
+
+  const nextIndex = perpendicularData ? perpendicularData.features.length : 0;
+  const sectionId = taskId ? `sec-${taskId}-free-${Date.now()}` : undefined;
+
+  // 如果没有 taskId 或 basicParamId，则只做前端创建
+  if (!taskId || !basicParamId || !sectionId) {
+    setPerpendicularData((prev) => {
+      const existing = prev ? (prev.features as GeoJSON.Feature<GeoJSON.LineString>[]) : [];
+      const newCrossLineId = existing.length;
+      const left = start;
+      const right = end;
+
+      const newFeature: GeoJSON.Feature<GeoJSON.LineString> = {
+        type: 'Feature',
+        properties: {
+          crossLineId: newCrossLineId,
+          distance,
+          shoreLineId: bankId,
+          leftPoint: left,
+          rightPoint: right,
+        },
+        geometry: newGeometry,
+      };
+
+      return turf.featureCollection([...existing, newFeature]);
+    });
+
+    alert('已创建断面（未找到任务ID或默认参数，未同步后端）');
+    return;
+  }
+
+  try {
+    const sectionsPayload = {
+      task_id: taskId,
+      sections: [
+        {
+          section_id: sectionId,
+          section_name: `自由断面${nextIndex + 1}`,
+          distance,
+          bank_id: bankId,
+          region_code: 'Mzs',
+          segment_index: nextIndex,
+          geometry: newGeometry,
+          section_geometry: newGeometry,
+          basic_param_id: basicParamId,
+        },
+      ],
+      inherit_from_basic_param: true,
+      overwrite: false,
+    };
+
+    const response = await fetch('/v0/bank/sections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sectionsPayload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`创建断面失败: ${response.statusText}`);
+    }
+
+    setPerpendicularData((prev) => {
+      const existing = prev ? (prev.features as GeoJSON.Feature<GeoJSON.LineString>[]) : [];
+      const newCrossLineId = existing.length;
+
+      const newFeature: GeoJSON.Feature<GeoJSON.LineString> = {
+        type: 'Feature',
+        properties: {
+          sectionId,
+          crossLineId: newCrossLineId,
+          distance,
+          shoreLineId: bankId,
+          leftPoint: start,
+          rightPoint: end,
+        },
+        geometry: newGeometry,
+      };
+
+      return turf.featureCollection([...existing, newFeature]);
+    });
+  } catch (err: any) {
+    console.error('自由创建断面失败:', err);
+    alert(`自由创建断面失败: ${err.message}`);
   }
 }
