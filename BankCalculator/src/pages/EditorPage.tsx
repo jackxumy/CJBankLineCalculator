@@ -38,7 +38,7 @@ function EditorPage() {
 
   // 全局垂线配置（用于首次绘制整个 GeoJSON）
   const [globalInterval, setGlobalInterval] = useState<number>(100);
-  const [globalLength, setGlobalLength] = useState<number>(2000);
+  const [globalLength, setGlobalLength] = useState<number>(1000);
   
   // 当前正在编辑的组ID
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
