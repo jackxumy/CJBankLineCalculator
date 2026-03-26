@@ -66,6 +66,8 @@ interface EditorMapProps {
   uploadedData: GeoJSON.FeatureCollection | null;
   groups: SelectionGroup[];
   showCrossLines: boolean;
+  isFixingShoreLineReversed: boolean;
+  onFixSelectedShoreLineReversed: (params: { shoreLineIndex: number; shoreLineId: string }) => void;
   isSelectingShoreLines: boolean;
   isSelectingStartEnd: boolean;
   isSelectingCrossLines: boolean;
@@ -90,6 +92,8 @@ function EditorMap(props: EditorMapProps) {
     uploadedData,
     groups,
     showCrossLines,
+    isFixingShoreLineReversed,
+    onFixSelectedShoreLineReversed,
     isSelectingShoreLines,
     isSelectingStartEnd,
     isSelectingCrossLines,
@@ -125,6 +129,16 @@ function EditorMap(props: EditorMapProps) {
   useEffect(() => {
     isSelectingShoreLinesRef.current = isSelectingShoreLines;
   }, [isSelectingShoreLines]);
+
+  const isFixingShoreLineReversedRef = useRef(isFixingShoreLineReversed);
+  useEffect(() => {
+    isFixingShoreLineReversedRef.current = isFixingShoreLineReversed;
+  }, [isFixingShoreLineReversed]);
+
+  const onFixSelectedShoreLineReversedRef = useRef(onFixSelectedShoreLineReversed);
+  useEffect(() => {
+    onFixSelectedShoreLineReversedRef.current = onFixSelectedShoreLineReversed;
+  }, [onFixSelectedShoreLineReversed]);
 
   const isSelectingStartEndRef = useRef(isSelectingStartEnd);
   useEffect(() => {
@@ -182,6 +196,11 @@ function EditorMap(props: EditorMapProps) {
     configRef.current = { interval: globalInterval, length: globalLength };
   }, [globalInterval, globalLength]);
 
+  const getShoreLineId = (feature: any, index: number) => {
+    const p = feature?.properties || {};
+    return String(p.bank_id || p.bankId || `line-${index}`);
+  };
+
   // 同步垂线到地图数据源
   useEffect(() => {
     const map = mapRef.current;
@@ -238,8 +257,8 @@ function EditorMap(props: EditorMapProps) {
     const updateSelectedLines = () => {
       const selectedSource = map.getSource('selected-shore-lines') as mapboxgl.GeoJSONSource;
       if (selectedSource) {
-        const selectedFeatures = uploadedData.features.filter((_, index) =>
-          selectedLines.has(`line-${index}`),
+        const selectedFeatures = uploadedData.features.filter((f: any, index: number) =>
+          selectedLines.has(getShoreLineId(f, index)),
         );
         selectedSource.setData(turf.featureCollection(selectedFeatures));
       }
@@ -617,7 +636,8 @@ function EditorMap(props: EditorMapProps) {
           !isSelectingStartEndRef.current &&
           !isSelectingCrossLinesRef.current;
 
-        if (noEditingActive) {
+        // 岸段修正选择开启时，禁用断面信息弹窗（避免干扰点击岸段）
+        if (noEditingActive && !isFixingShoreLineReversedRef.current) {
           const crossLineFeatures = map.queryRenderedFeatures(e.point, { layers: crossLineHitLayers });
           const hit = crossLineFeatures?.[0];
           if (hit) {
@@ -692,6 +712,20 @@ function EditorMap(props: EditorMapProps) {
         // 点击到空白处时，收起信息弹窗
         closeInfoPopup();
 
+        // 岸段修正选择：点击岸段触发批量反转（仅在外部回调中做选段过滤）
+        if (isFixingShoreLineReversedRef.current) {
+          const features = map.queryRenderedFeatures(e.point, { layers: hitLayers });
+          const feature = features?.[0];
+          if (!feature) return;
+
+          const lineIndex = feature.properties?.index as number | undefined;
+          if (lineIndex === undefined || lineIndex === null) return;
+          const shoreLineId = getShoreLineId({ properties: feature.properties }, lineIndex);
+
+          onFixSelectedShoreLineReversedRef.current({ shoreLineIndex: lineIndex, shoreLineId });
+          return;
+        }
+
         const features = map.queryRenderedFeatures(e.point, { layers: hitLayers });
         const feature = features?.[0];
 
@@ -701,7 +735,7 @@ function EditorMap(props: EditorMapProps) {
         const lineFeature = turf.feature(lineGeo, feature.properties) as GeoJSON.Feature<GeoJSON.LineString>;
 
         const lineIndex = feature.properties?.index as number | undefined;
-        const lineId = lineIndex !== undefined ? `line-${lineIndex}` : `line-${Math.random()}`;
+        const lineId = getShoreLineId({ properties: feature.properties }, lineIndex ?? 0);
 
         if (isSelectingShoreLinesRef.current) {
           setSelectedLines((prev) => {

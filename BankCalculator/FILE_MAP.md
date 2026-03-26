@@ -64,7 +64,8 @@
     - 修改间距：删除原段断面并按新间距重绘。
 - [src/pages/editor/fileActions.ts](src/pages/editor/fileActions.ts)
   - 文件相关动作：
-    - 上传主线 GeoJSON 并发送到后端：`POST /v0/mi/geojson`
+    - 上传主线 GeoJSON：仅前端加载（不再调用已弃用的 `/v0/mi/geojson`）
+    - 岸段管理（发送/获取/删除）：`/v0/bank/banks`
     - 导入断面 GeoJSON 并创建任务+断面：`POST /v0/bank/tasks` + `POST /v0/bank/sections`
     - 导出断面样例 GeoJSON。
 

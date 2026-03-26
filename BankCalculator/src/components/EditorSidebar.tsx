@@ -24,6 +24,14 @@ import styles from './EditorSidebar.module.css';
 
 interface EditorSidebarProps {
   uploadedData: GeoJSON.FeatureCollection | null;
+  bankGroups: Array<{ region_code: string; count: number }>;
+  bankList: any[];
+  loadBankById: (bankId: string) => void;
+  deleteBankById: (bankId: string) => void;
+  selectedBankGroup: string;
+  setSelectedBankGroup: (v: string) => void;
+  loadBankGroup: (regionCode: string) => void;
+  deleteBankGroup: () => void;
   basicParamsList: any[];
   selectedBasicParamIdState: string | number | null;
   totalSelectedSegments: number;
@@ -37,6 +45,9 @@ interface EditorSidebarProps {
   toggleSelectAllShoreLines: () => void;
   selectedLinesSize: number;
   handleGenerateSections: () => void;
+  isFixingShoreLineReversed: boolean;
+  toggleFixShoreLineReversed: () => void;
+  sendSelectedShoreLinesGeoJson: () => void;
   perpendicularData: GeoJSON.FeatureCollection | null;
   setShowGlobalPropertiesModal: (v: boolean) => void;
   isSelectingStartEnd: boolean;
@@ -77,6 +88,14 @@ interface EditorSidebarProps {
 function EditorSidebar(props: EditorSidebarProps) {
   const {
     uploadedData,
+    bankGroups,
+    selectedBankGroup,
+    setSelectedBankGroup,
+    loadBankGroup,
+    deleteBankGroup,
+    bankList,
+    loadBankById,
+    deleteBankById,
     basicParamsList,
     selectedBasicParamIdState,
     // totalSelectedSegments, (unused)
@@ -90,6 +109,9 @@ function EditorSidebar(props: EditorSidebarProps) {
     toggleSelectAllShoreLines,
     selectedLinesSize,
     handleGenerateSections,
+    isFixingShoreLineReversed,
+    toggleFixShoreLineReversed,
+    sendSelectedShoreLinesGeoJson,
     perpendicularData,
     setShowGlobalPropertiesModal,
     isSelectingStartEnd,
@@ -160,6 +182,56 @@ function EditorSidebar(props: EditorSidebarProps) {
                 />
               </label>
             </div>
+
+            <div className={`${styles.inputGroup} ${styles.mt12}`}>
+              <label>获取岸段:</label>
+              <select
+                value={selectedBankGroup}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setSelectedBankGroup(v);
+                  if (v) {
+                    // 如果 value 是 region_code（遗留），调用按组加载；否则当作 bank_id 加载单条
+                    const isRegion = bankGroups.some((g) => g.region_code === v);
+                    if (isRegion) loadBankGroup(v);
+                    else loadBankById(v);
+                  }
+                }}
+              >
+                <option value="">（选择岸段/ID）</option>
+                {/* 优先显示按 bank_id 列表 */}
+                {bankList && bankList.length > 0
+                  ? bankList.map((b) => (
+                      <option key={String(b.bank_id)} value={String(b.bank_id)}>
+                        {String(b.bank_id)}
+                      </option>
+                    ))
+                  : bankGroups.map((g) => (
+                      <option key={g.region_code} value={g.region_code}>
+                        {g.region_code}（{g.count}）
+                      </option>
+                    ))}
+              </select>
+            </div>
+            <div className={styles.mt12}>
+              <button
+                type="button"
+                className={styles.outlineButton}
+                onClick={() => {
+                  if (!selectedBankGroup) return;
+                  // 若选中的是 bank_id，则删除单条；若为 region_code，则批量删除（保留原行为）
+                  const isRegion = bankGroups.some((g) => g.region_code === selectedBankGroup);
+                  if (isRegion) deleteBankGroup();
+                  else deleteBankById(selectedBankGroup);
+                }}
+                title="删除当前选择的岸段（支持单条 bank_id 或按 region_code 批量删除）"
+                aria-label="删除岸段"
+                disabled={!selectedBankGroup}
+              >
+                <Trash2 size={16} /> 删除
+              </button>
+            </div>
+
             {perpendicularData && perpendicularData.features.length > 0 && (
               <div className={styles.mt12}>
                 <button
@@ -260,6 +332,34 @@ function EditorSidebar(props: EditorSidebarProps) {
                 <Ruler size={16} /> 生成全部断面
               </button>
             </div>
+
+            {perpendicularData && perpendicularData.features.length > 0 && (
+              <div className={styles.mt12}>
+                <div className={styles.buttonGrid}>
+                  <button
+                    type="button"
+                    className={`${styles.outlineButton} ${isFixingShoreLineReversed ? styles.active : ''}`}
+                    onClick={toggleFixShoreLineReversed}
+                    title="开启岸段修正：仅对已选岸段点击生效；点击岸段后会反转该岸段上全部断面并同步后端，同时标记岸段 properties.reversed=true"
+                    aria-label="修正选择"
+                    disabled={!uploadedData || selectedLinesSize === 0}
+                  >
+                    <MousePointer2 size={16} /> 修正选择
+                  </button>
+                  <button
+                    type="button"
+                    className={styles.outlineButton}
+                    onClick={sendSelectedShoreLinesGeoJson}
+                    title="发送已选岸段 GeoJSON（含修正后的 reversed 标记）到后端"
+                    aria-label="发送"
+                    disabled={!uploadedData || selectedLinesSize === 0}
+                  >
+                    <Upload size={16} /> 发送
+                  </button>
+                </div>
+              </div>
+            )}
+
             {perpendicularData && perpendicularData.features.length > 0 && (
               <div className={styles.mt12}>
                 <button type="button" className={styles.outlineButton} onClick={() => setShowGlobalPropertiesModal(true)} title="全局属性配置" aria-label="全局属性配置">

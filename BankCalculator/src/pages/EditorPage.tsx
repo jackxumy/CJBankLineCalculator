@@ -27,6 +27,7 @@ import {
 } from './editor/fileActions';
 import { generateSectionsAndCreateTask, runCurrentTask } from './editor/sectionsGeneration';
 import { fetchBasicParamDetailAsSectionParams, fetchBasicParamsList } from './editor/basicParamsApi';
+import { getCurrentTaskId } from './editor/taskState';
 
 function EditorPage() {
   // 上传的 GeoJSON 数据 (主线)
@@ -64,9 +65,18 @@ function EditorPage() {
   
   // 新增状态：选中的用于生成垂线的线段（存储线的唯一标识）
   const [selectedLines, setSelectedLines] = useState<Set<string>>(new Set());
+
+  // 岸段组（后端 banks 按 region_code 分组）
+  const [bankGroups, setBankGroups] = useState<Array<{ region_code: string; count: number }>>([]);
+  const [selectedBankGroup, setSelectedBankGroup] = useState<string>('');
+  // 当前可选的岸段列表（按 bank_id）
+  const [bankList, setBankList] = useState<any[]>([]);
   
   // 新增状态：控制断面选择模式
   const [isSelectingCrossLines, setIsSelectingCrossLines] = useState<boolean>(false);
+
+  // 岸段方向修正：对已选岸段逐条点击，批量反转该岸段上的断面，并标记岸段 properties.reversed=true
+  const [isFixingShoreLineReversed, setIsFixingShoreLineReversed] = useState<boolean>(false);
 
   // 新增状态：断面编辑控制模式（岸段线/自由）
   const [crossLineControlMode, setCrossLineControlMode] = useState<'shoreline' | 'free'>('shoreline');
@@ -82,6 +92,11 @@ function EditorPage() {
 
   // 断面验证：避免重复触发校验
   const validationTriggeredRef = useRef<Set<string>>(new Set());
+
+  const getShoreLineId = (feature: any, index: number) => {
+    const p = feature?.properties || {};
+    return String(p.bank_id || p.bankId || `line-${index}`);
+  };
 
   const patchSectionValidationProps = (sectionId: string, patch: Record<string, any>) => {
     setPerpendicularData((prev) => {
@@ -307,6 +322,194 @@ function EditorPage() {
     fetchBasicParams();
   }, []);
 
+  const fetchBankGroups = async () => {
+    try {
+      // 目前岸段仅使用：GET /v0/bank/banks?region_code=...
+      const res = await fetch('/v0/bank/banks?region_code=Mzs');
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+      const data = await res.json();
+      const banks = (data?.banks || data?.data || data) as any[];
+      const list = Array.isArray(banks) ? banks : [];
+
+      setBankGroups([{ region_code: 'Mzs', count: list.length }]);
+      setBankList(list);
+    } catch (err) {
+      console.error('获取岸段组失败:', err);
+      setBankGroups([]);
+    }
+  };
+
+  const loadBankById = async (bankId: string) => {
+    if (!bankId) return;
+    try {
+      // 尝试按 REST 资源路径获取单条
+      let res = await fetch(`/v0/bank/banks/${encodeURIComponent(bankId)}`);
+      if (!res.ok) {
+        // 退回到查询参数形式
+        res = await fetch(`/v0/bank/banks?bank_id=${encodeURIComponent(bankId)}`);
+      }
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const data = await res.json();
+      const bank = (data?.bank || data?.banks?.[0] || data?.data || data) as any;
+      const b = Array.isArray(bank) ? bank[0] : bank;
+      if (!b || !b.geometry) {
+        alert('未找到指定的岸段或该岸段无几何数据');
+        return;
+      }
+
+      const newFeature = {
+        type: 'Feature' as const,
+        geometry: b.geometry,
+        properties: {
+          index: uploadedData ? uploadedData.features.length : 0,
+          bank_id: b.bank_id,
+          bank_name: b.bank_name,
+          region_code: b.region_code,
+          reversed: !!(b?.reversed === true || b?.reversed === 'true'),
+          description: b.description,
+        },
+      } as any;
+
+      // 如果已存在相同 bank_id，避免重复加载
+      const exists = uploadedData?.features.some((f: any) => {
+        const p = f?.properties || {};
+        return String(p.bank_id || p.bankId || '') === String(b.bank_id);
+      });
+      if (exists) {
+        alert(`岸段 ${b.bank_id} 已在编辑器中，已跳过重复加载`);
+        return;
+      }
+
+      setUploadedData((prev) => {
+        if (!prev) return { type: 'FeatureCollection', features: [newFeature] } as any;
+        const next = { ...prev, features: [...prev.features, newFeature] } as any;
+        return next;
+      });
+
+      // 不清空现有选择，允许多条岸段共存。仅将编辑模式调整为默认关闭，避免干扰当前操作。
+      setIsSelectingShoreLines(false);
+      setIsSelectingStartEnd(false);
+      setIsSelectingCrossLines(false);
+      setIsFixingShoreLineReversed(false);
+      setCrossLineEditMode('none');
+    } catch (err: any) {
+      console.error('加载岸段失败:', err);
+      alert(`加载岸段失败: ${err?.message || String(err)}`);
+    }
+  };
+
+  const deleteBankById = async (bankId: string) => {
+    if (!bankId) return;
+    const ok = window.confirm(`确认删除岸段 bank_id=${bankId} ?`);
+    if (!ok) return;
+
+    try {
+      const res = await fetch(`/v0/bank/banks/${encodeURIComponent(bankId)}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      alert('已删除岸段');
+      setSelectedBankGroup('');
+      // 同步从前端已加载的要素中移除该 bank
+      setUploadedData((prev) => {
+        if (!prev) return prev;
+        const features = (prev.features || []).filter((f: any) => {
+          const p = f?.properties || {};
+          return String(p.bank_id || p.bankId || '') !== String(bankId);
+        });
+        return { ...prev, features } as any;
+      });
+      await fetchBankGroups();
+    } catch (err: any) {
+      console.error('删除岸段失败:', err);
+      alert(`删除岸段失败: ${err?.message || String(err)}`);
+    }
+  };
+
+  const loadBankGroup = async (regionCode: string) => {
+    if (!regionCode) return;
+    try {
+      const res = await fetch(`/v0/bank/banks?region_code=${encodeURIComponent(regionCode)}`);
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+      const data = await res.json();
+      const banks = (data?.banks || data?.data || data) as any[];
+      const list = Array.isArray(banks) ? banks : [];
+
+      const features = list
+        .filter((b) => b?.geometry)
+        .map((b, index) => ({
+          type: 'Feature' as const,
+          geometry: b.geometry,
+          properties: {
+            index,
+            bank_id: b.bank_id,
+            bank_name: b.bank_name,
+            region_code: b.region_code,
+            reversed: !!(b?.reversed === true || b?.reversed === 'true'),
+            description: b.description,
+          },
+        }));
+
+      setUploadedData({ type: 'FeatureCollection', features } as any);
+      setSelectedLines(new Set());
+      setIsSelectingShoreLines(false);
+      setIsSelectingStartEnd(false);
+      setIsSelectingCrossLines(false);
+      setIsFixingShoreLineReversed(false);
+      setCrossLineEditMode('none');
+      setSelectedCrossLineIndex(null);
+    } catch (err: any) {
+      console.error('加载岸段组失败:', err);
+      alert(`加载岸段组失败: ${err?.message || String(err)}`);
+    }
+  };
+
+  const deleteBankGroup = async () => {
+    if (!selectedBankGroup) {
+      alert('请先选择要删除的岸段组');
+      return;
+    }
+    const ok = window.confirm(`确认删除岸段组 region_code=${selectedBankGroup} 下的全部岸段？`);
+    if (!ok) return;
+
+    try {
+      const res = await fetch(`/v0/bank/banks?region_code=${encodeURIComponent(selectedBankGroup)}`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const data = await res.json();
+      const banks = (data?.banks || data?.data || data) as any[];
+      const list = Array.isArray(banks) ? banks : [];
+      const ids = list.map((b) => b?.bank_id).filter(Boolean) as string[];
+      if (ids.length === 0) {
+        alert('该组下没有可删除的岸段');
+        return;
+      }
+
+      const results = await Promise.allSettled(
+        ids.map((id) => fetch(`/v0/bank/banks/${encodeURIComponent(id)}`, { method: 'DELETE' })),
+      );
+      const okCount = results.filter((r) => r.status === 'fulfilled' && (r.value as any).ok).length;
+      const failCount = results.length - okCount;
+      if (failCount > 0) {
+        alert(`删除完成：成功 ${okCount}，失败 ${failCount}`);
+      } else {
+        alert(`已删除 ${okCount} 条岸段`);
+      }
+
+      setSelectedBankGroup('');
+      await fetchBankGroups();
+    } catch (err: any) {
+      console.error('删除岸段组失败:', err);
+      alert(`删除岸段组失败: ${err?.message || String(err)}`);
+    }
+  };
+
+  // 挂载时拉取岸段组列表（用于下拉框）
+  useEffect(() => {
+    fetchBankGroups();
+  }, []);
+
   // 当用户选择模板时，拉取模板详情并设置为全局属性
   const handleSelectBasicParam = async (paramIdStr: string | null) => {
     if (!paramIdStr) {
@@ -353,19 +556,18 @@ function EditorPage() {
       return;
     }
     
-    // 如果当前已经全选了（选中数量等于要素中线段数量），则清空
-    const lineFeatures = uploadedData.features.filter(f => 
-      f.geometry.type === 'LineString' || f.geometry.type === 'MultiLineString'
-    );
+    // 如果当前已经全选了（选中数量等于可选线要素数量），则清空
+    const selectableIds: string[] = [];
+    uploadedData.features.forEach((f: any, index: number) => {
+      if (f?.geometry?.type === 'LineString' || f?.geometry?.type === 'MultiLineString') {
+        selectableIds.push(getShoreLineId(f, index));
+      }
+    });
 
-    if (selectedLines.size === lineFeatures.length && lineFeatures.length > 0) {
+    if (selectedLines.size === selectableIds.length && selectableIds.length > 0) {
       setSelectedLines(new Set());
     } else {
-      const allLineIds = new Set<string>();
-      lineFeatures.forEach((_, index) => {
-        allLineIds.add(`line-${index}`);
-      });
-      setSelectedLines(allLineIds);
+      setSelectedLines(new Set(selectableIds));
     }
   };
   
@@ -401,6 +603,238 @@ function EditorPage() {
 
   const clearSelectedCrossLineSelection = () => {
     setSelectedCrossLineIndex(null);
+  };
+
+  const toggleFixShoreLineReversed = () => {
+    setIsFixingShoreLineReversed((prev) => {
+      const next = !prev;
+      if (next) {
+        // 开启修正时，退出其它编辑/选择模式，避免点击冲突
+        setIsSelectingShoreLines(false);
+        setIsSelectingStartEnd(false);
+        setIsSelectingCrossLines(false);
+        setCrossLineEditMode('none');
+        setSelectedCrossLineIndex(null);
+      }
+      return next;
+    });
+  };
+
+  const fixSelectedShoreLineReversed = async (params: { shoreLineIndex: number; shoreLineId: string }) => {
+    const { shoreLineIndex, shoreLineId } = params;
+
+    if (!uploadedData) {
+      alert('未加载岸段数据');
+      return;
+    }
+
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      alert('请先生成断面后再修正');
+      return;
+    }
+
+    if (!selectedLines.has(shoreLineId)) {
+      alert('修正仅对已选岸段生效');
+      return;
+    }
+
+    const targetFeature: any = uploadedData.features?.[shoreLineIndex];
+    const alreadyReversed =
+      !!(targetFeature?.properties && (targetFeature.properties.reversed === true || targetFeature.properties.reversed === 'true'));
+    if (alreadyReversed) {
+      alert('该岸段已标记为 reversed=true，已跳过');
+      return;
+    }
+
+    const updatedFeatures = [...(perpendicularData.features as any[])];
+    const reversedIndices: number[] = [];
+
+    updatedFeatures.forEach((f, idx) => {
+      const props = f?.properties || {};
+      if (props.shoreLineId !== shoreLineId) return;
+      if (f?.geometry?.type !== 'LineString') return;
+      const coords = (f.geometry.coordinates as any[]) || [];
+      if (coords.length < 2) return;
+
+      const nextProps: any = { ...props };
+      if (nextProps.leftPoint && nextProps.rightPoint) {
+        const oldLeft = nextProps.leftPoint;
+        nextProps.leftPoint = nextProps.rightPoint;
+        nextProps.rightPoint = oldLeft;
+      }
+
+      updatedFeatures[idx] = {
+        ...f,
+        geometry: {
+          type: 'LineString',
+          coordinates: [...coords].reverse(),
+        },
+        properties: nextProps,
+      };
+
+      reversedIndices.push(idx);
+    });
+
+    if (reversedIndices.length === 0) {
+      alert('该岸段下未找到可反转的断面');
+      return;
+    }
+
+    setPerpendicularData(turf.featureCollection(updatedFeatures as any));
+
+    // 标记岸段 reversed=true（用于后续重新生成断面时保持方向一致）
+    setUploadedData((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, features: [...prev.features] } as any;
+      const feat: any = next.features?.[shoreLineIndex];
+      if (!feat) return next;
+      feat.properties = { ...(feat.properties || {}), reversed: true };
+      return next;
+    });
+
+    const sectionsToSync = reversedIndices
+      .map((idx) => {
+        const f: any = updatedFeatures[idx];
+        return f?.properties?.sectionId as string | undefined;
+      })
+      .filter(Boolean) as string[];
+
+    if (sectionsToSync.length === 0) {
+      alert(`已修正岸段 ${shoreLineId}：反转 ${reversedIndices.length} 条断面（未同步到后端）`);
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      sectionsToSync.map((sectionId) =>
+        fetch(`/v0/bank/sections/${sectionId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reverse: true }),
+        }).then((res) => {
+          if (!res.ok) throw new Error(res.statusText);
+          return true;
+        }),
+      ),
+    );
+
+    const successCount = results.filter((r) => r.status === 'fulfilled').length;
+    const failedCount = results.length - successCount;
+
+    if (failedCount > 0) {
+      alert(
+        `已修正岸段 ${shoreLineId}：反转 ${reversedIndices.length} 条断面；后端同步成功 ${successCount}，失败 ${failedCount}`,
+      );
+    } else {
+      alert(`已修正岸段 ${shoreLineId}：反转 ${reversedIndices.length} 条断面（已同步到后端）`);
+    }
+  };
+
+  const sendSelectedShoreLinesGeoJson = async () => {
+    if (!uploadedData) {
+      alert('未加载岸段数据');
+      return;
+    }
+    if (selectedLines.size === 0) {
+      alert('请先选择用于生成断面的岸段');
+      return;
+    }
+
+    const selectedFeatures = uploadedData.features
+      .map((f: any, index: number) => ({ f, index }))
+      .filter(({ f, index }) => selectedLines.has(getShoreLineId(f, index)))
+      .map(({ f }) => f);
+
+    const toLineStrings = (geometry: any): Array<{ type: 'LineString'; coordinates: any[] }> => {
+      if (!geometry) return [];
+      if (geometry.type === 'LineString' && Array.isArray(geometry.coordinates)) {
+        return [{ type: 'LineString', coordinates: geometry.coordinates }];
+      }
+      if (geometry.type === 'MultiLineString' && Array.isArray(geometry.coordinates)) {
+        return (geometry.coordinates as any[])
+          .filter((coords) => Array.isArray(coords) && coords.length >= 2)
+          .map((coords) => ({ type: 'LineString' as const, coordinates: coords }));
+      }
+      return [];
+    };
+
+    const banksToSend: any[] = [];
+    const currentTaskId = getCurrentTaskId();
+    const taskPrefix = currentTaskId ? `${currentTaskId}-` : '';
+    selectedFeatures.forEach((f: any, index: number) => {
+      const props = f?.properties || {};
+      const baseId = getShoreLineId(f, index);
+      const baseName = String(props.bank_name || props.bankName || props.name || baseId);
+      const regionCode = String(props.region_code || props.regionCode || 'Mzs');
+      const reversed = !!(props && (props.reversed === true || props.reversed === 'true'));
+      const description = String(props.description || '');
+
+      const parts = toLineStrings(f?.geometry);
+      parts.forEach((geom, partIndex) => {
+        const suffix = parts.length > 1 ? `_part${partIndex + 1}` : '';
+        const bankId = `${taskPrefix}${baseId}${suffix}`;
+        const bankName = parts.length > 1 ? `${baseName}_${partIndex + 1}` : baseName;
+        banksToSend.push({
+          bank_id: String(bankId),
+          bank_name: bankName,
+          region_code: regionCode,
+          geometry: geom,
+          bank_geometry: geom,
+          reversed,
+          description,
+        });
+      });
+    });
+
+    if (banksToSend.length === 0) {
+      alert('没有可发送的岸段（仅支持 LineString / MultiLineString）');
+      return;
+    }
+
+    try {
+      const results: Array<{ bank_id: string; ok: boolean; status?: number; message?: string }> = [];
+
+      for (const bank of banksToSend) {
+        const payload = { banks: [bank], overwrite: false };
+        try {
+          console.log('POST /v0/bank/banks payload for', bank.bank_id, JSON.stringify(payload, null, 2));
+        } catch (e) {
+          console.log('POST /v0/bank/banks payload for', bank.bank_id, payload);
+        }
+        const res = await fetch('/v0/bank/banks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const t = await res.text();
+          results.push({
+            bank_id: String(bank.bank_id),
+            ok: false,
+            status: res.status,
+            message: `${res.status} ${res.statusText} ${t}`,
+          });
+        } else {
+          results.push({ bank_id: String(bank.bank_id), ok: true, status: res.status });
+        }
+      }
+
+      const okCount = results.filter((r) => r.ok).length;
+      const fail = results.filter((r) => !r.ok);
+
+      if (fail.length > 0) {
+        const first = fail[0];
+        console.error('发送岸段失败明细:', fail);
+        alert(`发送完成：成功 ${okCount}，失败 ${fail.length}。首个失败 bank_id=${first.bank_id}：${first.message}`);
+      } else {
+        alert(`已成功发送 ${okCount} 条岸段到后端`);
+      }
+
+      await fetchBankGroups();
+    } catch (err: any) {
+      console.error('发送岸段到 /v0/bank/banks 失败:', err);
+      alert(`发送岸段失败: ${err?.message || String(err)}`);
+    }
   };
   
   // 在指定位置新建断面
@@ -668,6 +1102,8 @@ function EditorPage() {
         uploadedData={uploadedData}
         groups={groups}
         showCrossLines={showCrossLines}
+        isFixingShoreLineReversed={isFixingShoreLineReversed}
+        onFixSelectedShoreLineReversed={fixSelectedShoreLineReversed}
         isSelectingShoreLines={isSelectingShoreLines}
         isSelectingStartEnd={isSelectingStartEnd}
         isSelectingCrossLines={isSelectingCrossLines}
@@ -687,6 +1123,14 @@ function EditorPage() {
       />
       <EditorSidebar
         uploadedData={uploadedData}
+        bankGroups={bankGroups}
+        bankList={bankList}
+        loadBankById={loadBankById}
+        deleteBankById={deleteBankById}
+        selectedBankGroup={selectedBankGroup}
+        setSelectedBankGroup={setSelectedBankGroup}
+        loadBankGroup={loadBankGroup}
+        deleteBankGroup={deleteBankGroup}
         basicParamsList={basicParamsList}
         selectedBasicParamIdState={selectedBasicParamIdState}
         totalSelectedSegments={totalSelectedSegments}
@@ -700,6 +1144,9 @@ function EditorPage() {
         toggleSelectAllShoreLines={toggleSelectAllShoreLines}
         selectedLinesSize={selectedLines.size}
         handleGenerateSections={handleGenerateSections}
+        isFixingShoreLineReversed={isFixingShoreLineReversed}
+        toggleFixShoreLineReversed={toggleFixShoreLineReversed}
+        sendSelectedShoreLinesGeoJson={sendSelectedShoreLinesGeoJson}
         perpendicularData={perpendicularData}
         setShowGlobalPropertiesModal={setShowGlobalPropertiesModal}
         isSelectingStartEnd={isSelectingStartEnd}

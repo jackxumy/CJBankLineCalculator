@@ -31,6 +31,11 @@ export async function generateSectionsAndCreateTask(params: {
     return;
   }
 
+  const getShoreLineId = (feature: any, index: number) => {
+    const p = feature?.properties || {};
+    return String(p.bank_id || p.bankId || `line-${index}`);
+  };
+
   try {
     const basicParamId = await ensureDefaultBasicParams();
     if (!basicParamId) {
@@ -47,10 +52,7 @@ export async function generateSectionsAndCreateTask(params: {
     const taskId = `task-${Date.now()}`;
     setCurrentTaskId(taskId);
 
-    const selectedBankIds: string[] = [];
-    selectedLines.forEach((lineId) => {
-      selectedBankIds.push(lineId);
-    });
+    const selectedBankIds: string[] = Array.from(selectedLines);
 
     const taskPayload = {
       tasks: [
@@ -78,20 +80,39 @@ export async function generateSectionsAndCreateTask(params: {
     const allPerpendicularLines: GeoJSON.Feature<GeoJSON.LineString>[] = [];
     const sectionsToCreate: any[] = [];
 
-    uploadedData.features.forEach((feature, index) => {
-      const lineId = `line-${index}`;
-      if (!selectedLines.has(lineId)) return;
+    uploadedData.features.forEach((feature: any, index: number) => {
+      const shoreLineId = getShoreLineId(feature, index);
+      if (!selectedLines.has(shoreLineId)) return;
 
       if (feature.geometry.type === 'LineString') {
         const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
         const lineLengthMeters = turf.length(line, { units: 'meters' });
 
-        const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
+          const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
+
+          // 检查岸线是否要求反向生成断面（GeoJSON 属性名：reversed）
+          const reverseFlag = !!(
+            feature.properties &&
+            ((feature.properties as any).reversed === true || (feature.properties as any).reversed === 'true')
+          );
+          if (reverseFlag) {
+            featureCollection.features.forEach((f: any) => {
+              if (f.geometry && Array.isArray(f.geometry.coordinates)) {
+                f.geometry.coordinates = (f.geometry.coordinates as any[]).slice().reverse();
+              }
+              if (f.properties) {
+                const lp = f.properties.leftPoint;
+                const rp = f.properties.rightPoint;
+                f.properties.leftPoint = rp;
+                f.properties.rightPoint = lp;
+              }
+            });
+          }
 
         featureCollection.features.forEach((f) => {
           if (!f.properties) f.properties = {};
           (f.properties as any).shoreLineIndex = index;
-          (f.properties as any).shoreLineId = lineId;
+          (f.properties as any).shoreLineId = shoreLineId;
         });
 
         allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
@@ -101,13 +122,33 @@ export async function generateSectionsAndCreateTask(params: {
           const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
           const lineLengthMeters = turf.length(line, { units: 'meters' });
 
+
           const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
 
-          featureCollection.features.forEach((f) => {
-            if (!f.properties) f.properties = {};
-            (f.properties as any).shoreLineIndex = index;
-            (f.properties as any).shoreLineId = lineId;
-          });
+            // 检查岸线是否要求反向生成断面（GeoJSON 属性名：reversed）
+            const reverseFlag = !!(
+              feature.properties &&
+              ((feature.properties as any).reversed === true || (feature.properties as any).reversed === 'true')
+            );
+            if (reverseFlag) {
+              featureCollection.features.forEach((f: any) => {
+                if (f.geometry && Array.isArray(f.geometry.coordinates)) {
+                  f.geometry.coordinates = (f.geometry.coordinates as any[]).slice().reverse();
+                }
+                if (f.properties) {
+                  const lp = f.properties.leftPoint;
+                  const rp = f.properties.rightPoint;
+                  f.properties.leftPoint = rp;
+                  f.properties.rightPoint = lp;
+                }
+              });
+            }
+
+            featureCollection.features.forEach((f) => {
+              if (!f.properties) f.properties = {};
+              (f.properties as any).shoreLineIndex = index;
+              (f.properties as any).shoreLineId = shoreLineId;
+            });
 
           allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
         });

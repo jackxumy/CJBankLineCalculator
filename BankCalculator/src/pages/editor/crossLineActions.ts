@@ -23,7 +23,7 @@ export async function reverseSelectedCrossLineAction(params: {
   if (!selectedLine || selectedLine.geometry.type !== 'LineString') return;
 
   const coords = selectedLine.geometry.coordinates as number[][];
-  const newCoords = [coords[1], coords[0]];
+  const newCoords = [...coords].reverse();
 
   const newGeometry: GeoJSON.LineString = {
     type: 'LineString',
@@ -237,7 +237,8 @@ export async function createCrossLineAtPointAction(params: {
   const rightCoords = rightEnd.geometry.coordinates;
 
   const parentIndex = (line.properties as any)?.index;
-  const parentId = parentIndex !== undefined ? `line-${parentIndex}` : undefined;
+  const parentId =
+    (line.properties as any)?.bank_id || (line.properties as any)?.bankId || (parentIndex !== undefined ? `line-${parentIndex}` : undefined);
 
   const newGeometry: GeoJSON.LineString = {
     type: 'LineString',

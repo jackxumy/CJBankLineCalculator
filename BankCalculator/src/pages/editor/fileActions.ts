@@ -32,25 +32,6 @@ export function uploadMainGeoJsonAction(params: {
       setSelectedLines(new Set());
       setIsSelectingShoreLines(false);
       setIsSelectingStartEnd(false);
-
-      fetch('/v0/mi/geojson', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: file.name,
-          data: geojson,
-        }),
-      })
-        .then((res) => {
-          if (!res.ok) {
-            console.error('上传 GeoJSON 到后端失败:', res.status, res.statusText);
-          } else {
-            console.log('GeoJSON 已发送到后端');
-          }
-        })
-        .catch((err) => {
-          console.error('上传 GeoJSON 到后端出错:', err);
-        });
     } catch {
       alert('解析 GeoJSON 失败，请检查文件格式');
     }
