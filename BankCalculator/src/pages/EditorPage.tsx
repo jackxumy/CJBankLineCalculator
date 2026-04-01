@@ -1124,6 +1124,45 @@ function EditorPage() {
     });
   };
 
+  // 批量更新前端断面几何（用于自由模式多选拖动结束时一次性落盘，避免 N 次 setState）
+  const applyCrossLineGeometriesLocal = (
+    updates: Array<{ crossLineIndex: number; geometry: GeoJSON.LineString }>,
+  ) => {
+    if (!updates || updates.length === 0) return;
+
+    setPerpendicularData((prev) => {
+      if (!prev) return prev;
+      const features = [...prev.features] as GeoJSON.Feature<GeoJSON.Geometry>[];
+      let changed = false;
+
+      updates.forEach(({ crossLineIndex, geometry }) => {
+        if (!Number.isFinite(crossLineIndex) || crossLineIndex < 0 || crossLineIndex >= features.length) return;
+        const current: any = features[crossLineIndex];
+        if (!current || current.geometry?.type !== 'LineString') return;
+
+        const coords = geometry.coordinates as number[][];
+        if (!coords || coords.length < 2) return;
+
+        const leftPoint = coords[0];
+        const rightPoint = coords[coords.length - 1];
+
+        features[crossLineIndex] = {
+          ...current,
+          geometry,
+          properties: {
+            ...(current.properties || {}),
+            crossLineId: (current.properties as any)?.crossLineId ?? crossLineIndex,
+            leftPoint,
+            rightPoint,
+          },
+        };
+        changed = true;
+      });
+
+      return changed ? turf.featureCollection(features as any) : prev;
+    });
+  };
+
   // 将断面几何同步到后端（自由模式拖动结束时调用）
   const persistCrossLineGeometry = async (crossLineIndex: number, geometry: GeoJSON.LineString) => {
     const feature: any = perpendicularData?.features?.[crossLineIndex];
@@ -1403,6 +1442,7 @@ function EditorPage() {
         globalLength={globalLength}
         createCrossLineAtPoint={createCrossLineAtPoint}
         updateCrossLineGeometryLocal={updateCrossLineGeometryLocal}
+        applyCrossLineGeometriesLocal={applyCrossLineGeometriesLocal}
         persistCrossLineGeometry={persistCrossLineGeometry}
         createCrossLineByEndpoints={createCrossLineByEndpoints}
       />

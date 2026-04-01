@@ -185,9 +185,15 @@ function EditorSidebar(props: EditorSidebarProps) {
               </label>
             </div>
 
-            <div className={`${styles.inputGroup} ${styles.mt12}`}>
-              <label>获取岸段:</label>
+            <div className={`${styles.inputGroup} ${styles.bankSelectGroup}`}>
+              <div className={styles.bankSelectHeader}>
+                <span className={styles.bankSelectLabel}>获取岸段:</span>
+                {selectedBankGroup.length > 0 && (
+                  <span className={styles.bankSelectCount}>已选 {selectedBankGroup.length} 条</span>
+                )}
+              </div>
               <select
+                className={styles.bankSelect}
                 multiple
                 value={selectedBankGroup}
                 onChange={(e) => {
@@ -197,17 +203,16 @@ function EditorSidebar(props: EditorSidebarProps) {
                   setSelectedBankGroup(values);
                 }}
               >
-                <option value="">（选择岸段/ID）</option>
                 {/* 优先显示按 bank_id 列表 */}
                 {bankList && bankList.length > 0
                   ? bankList.map((b) => (
                       <option key={String(b.bank_id)} value={String(b.bank_id)}>
-                        {String(b.bank_id)}
+                        岸段: {String(b.bank_id)}
                       </option>
                     ))
                   : bankGroups.map((g) => (
                       <option key={g.region_code} value={g.region_code}>
-                        {g.region_code}（{g.count}）
+                        {g.region_code}（{g.count} 条）
                       </option>
                     ))}
               </select>

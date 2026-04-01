@@ -15,14 +15,32 @@ function buildCrossLineArrowPoints(
 
   const arrowPoints: GeoJSON.Feature<GeoJSON.Point>[] = [];
 
-  data.features.forEach((feature) => {
+  const bearingDegrees = (start: number[], end: number[]) => {
+    const lon1 = Number(start?.[0]);
+    const lat1 = Number(start?.[1]);
+    const lon2 = Number(end?.[0]);
+    const lat2 = Number(end?.[1]);
+    if (![lon1, lat1, lon2, lat2].every((v) => Number.isFinite(v))) return 0;
+
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const toDeg = (r: number) => (r * 180) / Math.PI;
+    const φ1 = toRad(lat1);
+    const φ2 = toRad(lat2);
+    const Δλ = toRad(lon2 - lon1);
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+    const θ = Math.atan2(y, x);
+    return (toDeg(θ) + 360) % 360;
+  };
+
+  data.features.forEach((feature, idx) => {
     if (feature.geometry.type !== 'LineString') return;
     const coords = feature.geometry.coordinates;
     if (!coords || coords.length < 2) return;
 
     const start = coords[0];
     const end = coords[coords.length - 1];
-    const bearing = turf.bearing(turf.point(start), turf.point(end));
+    const bearing = bearingDegrees(start as any, end as any);
     // 参考 Mapbox 图标默认朝向与正北夹角，做 -90 度修正
     const iconRotate = Number(bearing - 90);
 
@@ -32,6 +50,7 @@ function buildCrossLineArrowPoints(
       type: 'Feature',
       properties: {
         iconRotate,
+        crossLineId: (feature as any)?.properties?.crossLineId ?? idx,
         validation_status: props.validation_status,
         is_valid: props.is_valid,
       },
@@ -84,6 +103,9 @@ interface EditorMapProps {
   globalLength: number;
   createCrossLineAtPoint: (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => void;
   updateCrossLineGeometryLocal: (crossLineIndex: number, geometry: GeoJSON.LineString) => void;
+  applyCrossLineGeometriesLocal?: (
+    updates: Array<{ crossLineIndex: number; geometry: GeoJSON.LineString }>,
+  ) => void;
   persistCrossLineGeometry: (crossLineIndex: number, geometry: GeoJSON.LineString) => Promise<void>;
   createCrossLineByEndpoints: (start: number[], end: number[]) => void;
 }
@@ -112,6 +134,7 @@ function EditorMap(props: EditorMapProps) {
     globalLength,
     createCrossLineAtPoint,
     updateCrossLineGeometryLocal,
+    applyCrossLineGeometriesLocal,
     persistCrossLineGeometry,
     createCrossLineByEndpoints,
   } = props;
@@ -198,6 +221,11 @@ function EditorMap(props: EditorMapProps) {
   useEffect(() => {
     updateCrossLineGeometryLocalRef.current = updateCrossLineGeometryLocal;
   }, [updateCrossLineGeometryLocal]);
+
+  const applyCrossLineGeometriesLocalRef = useRef(applyCrossLineGeometriesLocal);
+  useEffect(() => {
+    applyCrossLineGeometriesLocalRef.current = applyCrossLineGeometriesLocal;
+  }, [applyCrossLineGeometriesLocal]);
 
   const persistCrossLineGeometryRef = useRef(persistCrossLineGeometry);
   useEffect(() => {
@@ -603,8 +631,90 @@ function EditorMap(props: EditorMapProps) {
             startLngLat: mapboxgl.LngLat;
             startCoordsById: Map<number, number[][]>;
             lastCoordsById: Map<number, number[][]>;
+            // 拖拽期间只更新 Mapbox source（不触发 React setState），避免多选时卡顿
+            workingCrossLinesData: GeoJSON.FeatureCollection;
+            workingArrowData: GeoJSON.FeatureCollection<GeoJSON.Point>;
+            arrowIndexByCrossLineId: Map<number, number>;
+            crossLinesSource: mapboxgl.GeoJSONSource | null;
+            crossArrowsSource: mapboxgl.GeoJSONSource | null;
+            selectedCrossLineSource: mapboxgl.GeoJSONSource | null;
+            pendingDelta: { dx: number; dy: number } | null;
+            rafId: number | null;
           }
         | null = null;
+
+      const bearingDegrees = (start: number[], end: number[]) => {
+        const lon1 = Number(start?.[0]);
+        const lat1 = Number(start?.[1]);
+        const lon2 = Number(end?.[0]);
+        const lat2 = Number(end?.[1]);
+        if (![lon1, lat1, lon2, lat2].every((v) => Number.isFinite(v))) return 0;
+        const toRad = (d: number) => (d * Math.PI) / 180;
+        const toDeg = (r: number) => (r * 180) / Math.PI;
+        const φ1 = toRad(lat1);
+        const φ2 = toRad(lat2);
+        const Δλ = toRad(lon2 - lon1);
+        const y = Math.sin(Δλ) * Math.cos(φ2);
+        const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+        const θ = Math.atan2(y, x);
+        return (toDeg(θ) + 360) % 360;
+      };
+
+      const applyDragFrame = (ds: NonNullable<typeof dragState>, dx: number, dy: number) => {
+        ds.crossLineIds.forEach((id) => {
+          const startCoords = ds.startCoordsById.get(id);
+          if (!startCoords) return;
+          const nextCoords = startCoords.map((c) => [c[0] + dx, c[1] + dy]);
+          ds.lastCoordsById.set(id, nextCoords);
+
+          const f: any = ds.workingCrossLinesData.features?.[id];
+          if (f?.geometry?.type === 'LineString') {
+            f.geometry.coordinates = nextCoords;
+          }
+
+          const arrowIdx = ds.arrowIndexByCrossLineId.get(id);
+          if (arrowIdx !== undefined) {
+            const arrow: any = ds.workingArrowData.features?.[arrowIdx];
+            if (arrow?.geometry?.type === 'Point') {
+              const start = nextCoords[0];
+              const end = nextCoords[nextCoords.length - 1];
+              arrow.geometry.coordinates = end;
+              arrow.properties = {
+                ...(arrow.properties || {}),
+                iconRotate: Number(bearingDegrees(start as any, end as any) - 90),
+              };
+            }
+          }
+        });
+
+        ds.crossLinesSource?.setData(ds.workingCrossLinesData);
+        ds.crossArrowsSource?.setData(ds.workingArrowData);
+
+        if (ds.selectedCrossLineSource) {
+          const selectedFeatures = ds.crossLineIds
+            .map((id) => ds.workingCrossLinesData.features?.[id])
+            .filter(Boolean) as GeoJSON.Feature<GeoJSON.Geometry>[];
+          ds.selectedCrossLineSource.setData({ type: 'FeatureCollection', features: selectedFeatures } as any);
+        }
+      };
+
+      const scheduleDragRender = (ds: NonNullable<typeof dragState>) => {
+        if (ds.rafId !== null) return;
+        ds.rafId = window.requestAnimationFrame(() => {
+          const active = dragState;
+          if (!active) return;
+          active.rafId = null;
+          const pending = active.pendingDelta;
+          if (!pending) return;
+          active.pendingDelta = null;
+          applyDragFrame(active, pending.dx, pending.dy);
+
+          // 如果在本帧渲染时又积累了新的 delta，继续排队下一帧
+          if (active.pendingDelta) {
+            scheduleDragRender(active);
+          }
+        });
+      };
 
       const onDragMove = (ev: mapboxgl.MapMouseEvent) => {
         const ds = dragState;
@@ -612,24 +722,47 @@ function EditorMap(props: EditorMapProps) {
         const dx = ev.lngLat.lng - ds.startLngLat.lng;
         const dy = ev.lngLat.lat - ds.startLngLat.lat;
 
-        ds.crossLineIds.forEach((id) => {
-          const startCoords = ds.startCoordsById.get(id);
-          if (!startCoords) return;
-          const nextCoords = startCoords.map((c) => [c[0] + dx, c[1] + dy]);
-          ds.lastCoordsById.set(id, nextCoords);
-          updateCrossLineGeometryLocalRef.current(id, {
-            type: 'LineString',
-            coordinates: nextCoords,
-          });
-        });
+        ds.pendingDelta = { dx, dy };
+        scheduleDragRender(ds);
       };
 
       const endDrag = () => {
         const ds = dragState;
         if (!ds) return;
+
+        // 确保最后一次鼠标位置能落盘到地图上
+        if (ds.pendingDelta) {
+          const { dx, dy } = ds.pendingDelta;
+          ds.pendingDelta = null;
+          applyDragFrame(ds, dx, dy);
+        }
+        if (ds.rafId !== null) {
+          window.cancelAnimationFrame(ds.rafId);
+          ds.rafId = null;
+        }
+
         map.dragPan.enable();
         map.off('mousemove', onDragMove);
         map.getCanvas().style.cursor = '';
+
+        // 拖动结束：一次性写回 React 状态（避免 N 次 setState）
+        const updates: Array<{ crossLineIndex: number; geometry: GeoJSON.LineString }> = [];
+        ds.crossLineIds.forEach((id) => {
+          const coords = ds.lastCoordsById.get(id);
+          if (!coords) return;
+          updates.push({
+            crossLineIndex: id,
+            geometry: { type: 'LineString', coordinates: coords },
+          });
+        });
+
+        const applier = applyCrossLineGeometriesLocalRef.current;
+        if (applier) {
+          applier(updates);
+        } else {
+          // 兼容旧接口：逐条回写
+          updates.forEach((u) => updateCrossLineGeometryLocalRef.current(u.crossLineIndex, u.geometry));
+        }
 
         const tasks: Array<Promise<any>> = [];
         ds.crossLineIds.forEach((id) => {
@@ -692,11 +825,54 @@ function EditorMap(props: EditorMapProps) {
           lastCoordsById.set(id, copied.map((c) => [c[0], c[1]]));
         });
 
+        // 为拖拽创建一次性的工作副本：只 clone 被拖拽的要素，避免污染 React state
+        const base = perpendicularDataRef.current;
+        const workingFeatures = (base?.features ? base.features.slice() : []) as any[];
+        Array.from(startCoordsById.entries()).forEach(([id, coords]) => {
+          const original: any = workingFeatures[id];
+          if (!original) return;
+          workingFeatures[id] = {
+            ...original,
+            geometry: {
+              ...(original.geometry || {}),
+              type: 'LineString',
+              coordinates: coords.map((c) => [c[0], c[1]]),
+            },
+            properties: {
+              ...(original.properties || {}),
+              crossLineId: (original.properties as any)?.crossLineId ?? id,
+            },
+          };
+        });
+        const workingCrossLinesData: GeoJSON.FeatureCollection = {
+          type: 'FeatureCollection',
+          features: workingFeatures as any,
+        };
+
+        const workingArrowData = buildCrossLineArrowPoints(workingCrossLinesData);
+        const arrowIndexByCrossLineId = new Map<number, number>();
+        (workingArrowData.features as any[]).forEach((f, idx) => {
+          const cid = Number(f?.properties?.crossLineId);
+          if (Number.isFinite(cid)) arrowIndexByCrossLineId.set(cid, idx);
+        });
+
+        const crossLinesSource = map.getSource('perpendicular-lines') as mapboxgl.GeoJSONSource | null;
+        const crossArrowsSource = map.getSource('perpendicular-arrows') as mapboxgl.GeoJSONSource | null;
+        const selectedCrossLineSource = map.getSource('selected-cross-line') as mapboxgl.GeoJSONSource | null;
+
         dragState = {
           crossLineIds: Array.from(startCoordsById.keys()),
           startLngLat: e.lngLat,
           startCoordsById,
           lastCoordsById,
+          workingCrossLinesData,
+          workingArrowData,
+          arrowIndexByCrossLineId,
+          crossLinesSource,
+          crossArrowsSource,
+          selectedCrossLineSource,
+          pendingDelta: null,
+          rafId: null,
         };
 
         if (dragState.crossLineIds.length === 0) {

@@ -99,6 +99,67 @@
   border-color: var(--primary-color);
 }
 
+.bankSelect {
+  min-height: 120px;
+  background-color: #fff;
+  border: 1px solid var(--border-color);
+  border-radius: 8px !important;
+  font-family: inherit;
+  padding: 8px !important;
+  overflow-y: auto;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.05);
+}
+
+.bankSelect option {
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin-bottom: 2px;
+  cursor: pointer;
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.bankSelect option:checked {
+  background: var(--primary-color) linear-gradient(0deg, var(--primary-color) 0%, var(--primary-color) 100%);
+  color: #fff;
+}
+
+.bankSelect option:hover {
+  background-color: #f1f5f9;
+}
+
+.bankSelectGroup {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--border-color);
+}
+
+.bankSelectHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.bankSelectLabel {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.bankSelectCount {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  background: #f1f5f9;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.mt12 {
+  margin-top: 12px;
+}
+
 .buttonGrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
