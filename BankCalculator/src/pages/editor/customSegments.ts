@@ -79,24 +79,30 @@ export function applyCustomSegmentsAction(params: {
         const newLeft = leftEnd.geometry.coordinates as number[];
         const newRight = rightEnd.geometry.coordinates as number[];
 
-        line.geometry = {
+        const nextGeometry: GeoJSON.LineString = {
           type: 'LineString',
           coordinates: [newLeft, newRight],
         };
 
-        line.properties = {
+        const nextProps: any = {
+          ...lineProp,
           crossLineId: lineProp.crossLineId,
           distance: lineProp.distance,
-          shoreLineIndex: lineProp.shoreLineIndex,
-          shoreLineId: lineProp.shoreLineId,
+          shoreLineIndex: lineProp.shoreLineIndex ?? editingGroup.lineIndex,
+          shoreLineId:
+            lineProp.shoreLineId ?? (editingGroup.lineIndex !== undefined ? `line-${editingGroup.lineIndex}` : undefined),
           leftPoint: newLeft,
           rightPoint: newRight,
-          analysisConfig: editingGroup.properties || { ...globalProperties },
+          analysisConfig: editingGroup.properties || { ...(globalProperties || {}) },
         };
 
         newCrossData.push({ distance: actualDist, left: newLeft, right: newRight });
 
-        return line;
+        return {
+          ...line,
+          geometry: nextGeometry,
+          properties: nextProps,
+        };
       } catch {
         return line;
       }

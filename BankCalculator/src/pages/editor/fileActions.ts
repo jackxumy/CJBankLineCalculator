@@ -143,6 +143,7 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
         crossLineId: index,
         distance,
         shoreLineId: bankId,
+        bank_id: bankId,
         leftPoint: left,
         rightPoint: right,
       };
@@ -193,11 +194,16 @@ export function exportSectionsSampleAction(params: { perpendicularData: GeoJSON.
 
   const features = perpendicularData.features
     .filter((f) => f.geometry && f.geometry.type === 'LineString')
-    .map((f) => ({
-      type: 'Feature' as const,
-      geometry: f.geometry,
-      properties: {},
-    }));
+    .map((f: any) => {
+      const props = f?.properties || {};
+      const bankId = String(props.bank_id || props.shoreLineId || props.bankId || '');
+      return {
+        type: 'Feature' as const,
+        geometry: f.geometry,
+        // 导出时必须带 bank_id，作为导入后按岸段分组依据
+        properties: bankId ? { bank_id: bankId } : {},
+      };
+    });
 
   const exportData = {
     type: 'FeatureCollection' as const,

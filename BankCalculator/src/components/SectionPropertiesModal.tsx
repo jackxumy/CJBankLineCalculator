@@ -20,6 +20,33 @@ function SectionPropertiesModal({
   const [params, setParams] = useState<SectionParams>(config || {});
   const [isSaving, setIsSaving] = useState(false);
 
+  const sanitizeFileName = (name: string) => {
+    const base = (name || 'config').trim() || 'config';
+    return base.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '_').slice(0, 120);
+  };
+
+  const handleExport = () => {
+    try {
+      const jsonText = JSON.stringify(params ?? {}, null, 2);
+      const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      const baseName = sanitizeFileName(title);
+      const sid = sectionId ? `_${sanitizeFileName(sectionId)}` : '';
+      a.href = url;
+      a.download = `${baseName}${sid}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('导出 JSON 失败:', err);
+      alert('导出失败，请重试');
+    }
+  };
+
   const handleSave = async () => {
     setIsSaving(true);
     try {
@@ -275,6 +302,13 @@ function SectionPropertiesModal({
             className={styles.cancelButton}
           >
             取消
+          </button>
+          <button
+            onClick={handleExport}
+            disabled={isSaving}
+            className={styles.cancelButton}
+          >
+            导出
           </button>
           <button
             onClick={handleSave}

@@ -78,11 +78,13 @@ interface EditorMapProps {
   setGroups: React.Dispatch<React.SetStateAction<SelectionGroup[]>>;
   selectedCrossLineIndex: number | null;
   setSelectedCrossLineIndex: (index: number | null) => void;
+  selectedCrossLineIndices: Set<number>;
+  setSelectedCrossLineIndices: React.Dispatch<React.SetStateAction<Set<number>>>;
   globalInterval: number;
   globalLength: number;
   createCrossLineAtPoint: (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => void;
   updateCrossLineGeometryLocal: (crossLineIndex: number, geometry: GeoJSON.LineString) => void;
-  persistCrossLineGeometry: (crossLineIndex: number, geometry: GeoJSON.LineString) => void;
+  persistCrossLineGeometry: (crossLineIndex: number, geometry: GeoJSON.LineString) => Promise<void>;
   createCrossLineByEndpoints: (start: number[], end: number[]) => void;
 }
 
@@ -104,6 +106,8 @@ function EditorMap(props: EditorMapProps) {
     setGroups,
     selectedCrossLineIndex,
     setSelectedCrossLineIndex,
+    selectedCrossLineIndices,
+    setSelectedCrossLineIndices,
     globalInterval,
     globalLength,
     createCrossLineAtPoint,
@@ -160,6 +164,25 @@ function EditorMap(props: EditorMapProps) {
     crossLineEditModeRef.current = crossLineEditMode;
   }, [crossLineEditMode]);
 
+  // 在自由模式断面精调时，Ctrl 键要用于多选；Mapbox 默认 Ctrl+左键会触发 dragRotate，需禁用以免抢占事件
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const shouldDisableRotate =
+      isSelectingCrossLines && crossLineControlMode === 'free' && crossLineEditMode === 'select';
+
+    try {
+      if (shouldDisableRotate) {
+        map.dragRotate?.disable();
+      } else {
+        map.dragRotate?.enable();
+      }
+    } catch {
+      // ignore
+    }
+  }, [isSelectingCrossLines, crossLineControlMode, crossLineEditMode]);
+
   // 退出断面精调/释放选择时，清理吸附点与鼠标样式
   useEffect(() => {
     const map = mapRef.current;
@@ -190,6 +213,11 @@ function EditorMap(props: EditorMapProps) {
   useEffect(() => {
     selectedCrossLineIndexRef.current = selectedCrossLineIndex;
   }, [selectedCrossLineIndex]);
+
+  const selectedCrossLineIndicesRef = useRef<Set<number>>(selectedCrossLineIndices);
+  useEffect(() => {
+    selectedCrossLineIndicesRef.current = selectedCrossLineIndices;
+  }, [selectedCrossLineIndices]);
 
   const configRef = useRef({ interval: globalInterval, length: globalLength });
   useEffect(() => {
@@ -342,7 +370,15 @@ function EditorMap(props: EditorMapProps) {
     const updateSelectedCrossLine = () => {
       const selectedSource = map.getSource('selected-cross-line') as mapboxgl.GeoJSONSource;
       if (selectedSource) {
-        if (selectedCrossLineIndex !== null && perpendicularData.features[selectedCrossLineIndex]) {
+        const ids = Array.from(selectedCrossLineIndices);
+        const features = ids
+          .map((idx) => perpendicularData.features[idx])
+          .filter(Boolean) as GeoJSON.Feature<GeoJSON.Geometry>[];
+
+        if (features.length > 0) {
+          selectedSource.setData(turf.featureCollection(features as any));
+        } else if (selectedCrossLineIndex !== null && perpendicularData.features[selectedCrossLineIndex]) {
+          // 兼容：若外部只维护了主选中索引
           selectedSource.setData(turf.featureCollection([perpendicularData.features[selectedCrossLineIndex]]));
         } else {
           selectedSource.setData(turf.featureCollection([]));
@@ -355,7 +391,7 @@ function EditorMap(props: EditorMapProps) {
     } else {
       map.once('idle', updateSelectedCrossLine);
     }
-  }, [selectedCrossLineIndex, perpendicularData]);
+  }, [selectedCrossLineIndex, selectedCrossLineIndices, perpendicularData]);
 
   // 初始化地图和交互
   useEffect(() => {
@@ -563,37 +599,50 @@ function EditorMap(props: EditorMapProps) {
 
       let dragState:
         | {
-            crossLineId: number;
+            crossLineIds: number[];
             startLngLat: mapboxgl.LngLat;
-            startCoords: number[][];
-            lastCoords: number[][];
+            startCoordsById: Map<number, number[][]>;
+            lastCoordsById: Map<number, number[][]>;
           }
         | null = null;
 
       const onDragMove = (ev: mapboxgl.MapMouseEvent) => {
-        if (!dragState) return;
-        const dx = ev.lngLat.lng - dragState.startLngLat.lng;
-        const dy = ev.lngLat.lat - dragState.startLngLat.lat;
-        const nextCoords = dragState.startCoords.map((c) => [c[0] + dx, c[1] + dy]);
-        dragState.lastCoords = nextCoords;
-        updateCrossLineGeometryLocalRef.current(dragState.crossLineId, {
-          type: 'LineString',
-          coordinates: nextCoords,
+        const ds = dragState;
+        if (!ds) return;
+        const dx = ev.lngLat.lng - ds.startLngLat.lng;
+        const dy = ev.lngLat.lat - ds.startLngLat.lat;
+
+        ds.crossLineIds.forEach((id) => {
+          const startCoords = ds.startCoordsById.get(id);
+          if (!startCoords) return;
+          const nextCoords = startCoords.map((c) => [c[0] + dx, c[1] + dy]);
+          ds.lastCoordsById.set(id, nextCoords);
+          updateCrossLineGeometryLocalRef.current(id, {
+            type: 'LineString',
+            coordinates: nextCoords,
+          });
         });
       };
 
       const endDrag = () => {
-        if (!dragState) return;
+        const ds = dragState;
+        if (!ds) return;
         map.dragPan.enable();
         map.off('mousemove', onDragMove);
         map.getCanvas().style.cursor = '';
 
-        const finalGeometry: GeoJSON.LineString = {
-          type: 'LineString',
-          coordinates: dragState.lastCoords,
-        };
-
-        persistCrossLineGeometryRef.current(dragState.crossLineId, finalGeometry);
+        const tasks: Array<Promise<any>> = [];
+        ds.crossLineIds.forEach((id) => {
+          const coords = ds.lastCoordsById.get(id);
+          if (!coords) return;
+          const finalGeometry: GeoJSON.LineString = {
+            type: 'LineString',
+            coordinates: coords,
+          };
+          tasks.push(persistCrossLineGeometryRef.current(id, finalGeometry));
+        });
+        // 不阻塞 UI；后台同步即可
+        Promise.allSettled(tasks);
         dragState = null;
       };
 
@@ -601,6 +650,9 @@ function EditorMap(props: EditorMapProps) {
         if (!isSelectingCrossLinesRef.current) return;
         if (crossLineControlModeRef.current !== 'free') return;
         if (crossLineEditModeRef.current !== 'select') return;
+
+        const oe = e.originalEvent as MouseEvent | undefined;
+        const isCtrl = !!oe?.ctrlKey;
 
         const feature = e.features?.[0];
         const crossLineId = feature?.properties?.crossLineId as number | undefined;
@@ -613,14 +665,44 @@ function EditorMap(props: EditorMapProps) {
         const startCoords = (currentFeature.geometry.coordinates as number[][]) || [];
         if (startCoords.length < 2) return;
 
-        setSelectedCrossLineIndex(crossLineId);
+        // Ctrl+点选未选中的断面：交由 click 逻辑做“多选切换”，避免误触拖拽
+        const currentSelected = selectedCrossLineIndicesRef.current;
+        const clickedIsSelected = currentSelected.has(crossLineId);
+        if (isCtrl && !clickedIsSelected) return;
+
+        // 拖拽逻辑：
+        // - 如果点击的是已选中断面（无论是否按 Ctrl），则拖拽整个多选集合
+        // - 如果点击的是未选中断面，则先单选它再拖拽
+        const willUseIds = clickedIsSelected ? Array.from(currentSelected) : [crossLineId];
+
+        if (!clickedIsSelected) {
+          setSelectedCrossLineIndex(crossLineId);
+          setSelectedCrossLineIndices(new Set([crossLineId]));
+        }
+
+        const startCoordsById = new Map<number, number[][]>();
+        const lastCoordsById = new Map<number, number[][]>();
+        willUseIds.forEach((id) => {
+          const f: any = perpendicularDataRef.current?.features?.[id];
+          if (!f || f.geometry?.type !== 'LineString') return;
+          const coords = (f.geometry.coordinates as number[][]) || [];
+          if (coords.length < 2) return;
+          const copied = coords.map((c) => [c[0], c[1]]);
+          startCoordsById.set(id, copied);
+          lastCoordsById.set(id, copied.map((c) => [c[0], c[1]]));
+        });
 
         dragState = {
-          crossLineId,
+          crossLineIds: Array.from(startCoordsById.keys()),
           startLngLat: e.lngLat,
-          startCoords: startCoords.map((c) => [c[0], c[1]]),
-          lastCoords: startCoords.map((c) => [c[0], c[1]]),
+          startCoordsById,
+          lastCoordsById,
         };
+
+        if (dragState.crossLineIds.length === 0) {
+          dragState = null;
+          return;
+        }
 
         map.dragPan.disable();
         map.getCanvas().style.cursor = 'move';
@@ -654,6 +736,7 @@ function EditorMap(props: EditorMapProps) {
 
           if (editMode === 'none') {
             setSelectedCrossLineIndex(null);
+            setSelectedCrossLineIndices(new Set());
             return;
           }
 
@@ -668,7 +751,36 @@ function EditorMap(props: EditorMapProps) {
               console.log(`点击的断面ID: ${crossLineId}`);
 
               if (crossLineId !== undefined && crossLineId !== null) {
-                setSelectedCrossLineIndex(crossLineId);
+                const oe = e.originalEvent as MouseEvent | undefined;
+                const isCtrl = !!oe?.ctrlKey;
+
+                if (!isCtrl) {
+                  setSelectedCrossLineIndex(crossLineId);
+                  setSelectedCrossLineIndices(new Set([crossLineId]));
+                } else {
+                  setSelectedCrossLineIndices((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(crossLineId)) {
+                      next.delete(crossLineId);
+                    } else {
+                      next.add(crossLineId);
+                    }
+
+                    // 主选中索引同步
+                    if (next.size === 0) {
+                      setSelectedCrossLineIndex(null);
+                    } else if (!next.has(selectedCrossLineIndexRef.current ?? -1)) {
+                      // 如果当前主选中被移除，则选一个剩余的作为主选中
+                      const first = Array.from(next)[0];
+                      setSelectedCrossLineIndex(first);
+                    } else {
+                      // 保持主选中不变；若是新增则更新为新点选
+                      if (!prev.has(crossLineId)) setSelectedCrossLineIndex(crossLineId);
+                    }
+
+                    return next;
+                  });
+                }
                 console.log(`选中断面索引: ${crossLineId}`);
               } else {
                 console.warn('断面没有crossLineId属性，尝试坐标匹配');

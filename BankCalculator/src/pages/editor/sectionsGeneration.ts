@@ -36,6 +36,74 @@ export async function generateSectionsAndCreateTask(params: {
     return String(p.bank_id || p.bankId || `line-${index}`);
   };
 
+  const toLineStrings = (geometry: any): Array<{ type: 'LineString'; coordinates: any[] }> => {
+    if (!geometry) return [];
+    if (geometry.type === 'LineString' && Array.isArray(geometry.coordinates)) {
+      return [{ type: 'LineString', coordinates: geometry.coordinates }];
+    }
+    if (geometry.type === 'MultiLineString' && Array.isArray(geometry.coordinates)) {
+      return (geometry.coordinates as any[])
+        .filter((coords) => Array.isArray(coords) && coords.length >= 2)
+        .map((coords) => ({ type: 'LineString' as const, coordinates: coords }));
+    }
+    return [];
+  };
+
+  const isFromBackendFeature = (feature: any) => {
+    const props = feature?.properties || {};
+    return props.from_backend === true || props.fromBackend === true;
+  };
+
+  const ensureBanksUploaded = async (banksToSend: any[]) => {
+    if (banksToSend.length === 0) return;
+
+    const results: Array<{ bank_id: string; ok: boolean; status?: number; message?: string }> = [];
+    for (const bank of banksToSend) {
+      const payload = { banks: [bank], overwrite: false };
+      const res = await fetch('/v0/bank/banks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (res.ok) {
+        results.push({ bank_id: String(bank.bank_id), ok: true, status: res.status });
+        continue;
+      }
+
+      // 若后端提示已存在（例如重复提交），视为成功并继续。
+      if (res.status === 409) {
+        results.push({ bank_id: String(bank.bank_id), ok: true, status: res.status });
+        continue;
+      }
+
+      const t = await res.text();
+
+      if (
+        res.status === 400 &&
+        typeof t === 'string' &&
+        /exist|already|duplicate|conflict/i.test(t)
+      ) {
+        results.push({ bank_id: String(bank.bank_id), ok: true, status: res.status });
+        continue;
+      }
+
+      results.push({
+        bank_id: String(bank.bank_id),
+        ok: false,
+        status: res.status,
+        message: `${res.status} ${res.statusText} ${t}`,
+      });
+    }
+
+    const fail = results.filter((r) => !r.ok);
+    if (fail.length > 0) {
+      const first = fail[0];
+      console.error('生成前上传岸段失败明细:', fail);
+      throw new Error(`生成前上传岸段失败：首个失败 bank_id=${first.bank_id}：${first.message}`);
+    }
+  };
+
   try {
     const basicParamId = await ensureDefaultBasicParams();
     if (!basicParamId) {
@@ -52,7 +120,68 @@ export async function generateSectionsAndCreateTask(params: {
     const taskId = `task-${Date.now()}`;
     setCurrentTaskId(taskId);
 
-    const selectedBankIds: string[] = Array.from(selectedLines);
+    // 生成全部断面前：先把“本地上传的、且被选中使用”的岸段上传到后端。
+    // - 若岸段来自后端（properties.from_backend=true），则不上传，直接复用其 bank_id。
+    // - 若岸段为本地数据，则用 taskId 前缀生成 bank_id：task-...-line-x（MultiLineString 会追加 _partN）。
+    const taskBankIdSet = new Set<string>();
+    const localBanksToSend: any[] = [];
+
+    // 关键：本地岸段的 line-N 采用“本次 task 里选中的顺序位置”，而不是原始文件 index（避免出现 line-41）。
+    const selectedEntries = uploadedData.features
+      .map((feature: any, originalIndex: number) => {
+        const selectionId = getShoreLineId(feature, originalIndex);
+        return { feature, originalIndex, selectionId };
+      })
+      .filter((x) => selectedLines.has(x.selectionId));
+
+    // 记录：selectionId（用于前端选择） -> 本次 task 对应的 bank_id（后端）
+    const selectionIdToBankBaseId = new Map<string, { fromBackend: boolean; base: string }>();
+
+    selectedEntries.forEach(({ feature, selectionId }, selectedIndex) => {
+      const props = feature?.properties || {};
+      const fromBackend = isFromBackendFeature(feature);
+
+      // 与“上传岸段”按钮一致：对本地岸段，bank_id 使用 line-0/line-1/...（按选中顺序）
+      const baseIdInTask = getShoreLineId(feature, selectedIndex);
+      const baseBackendBankId = fromBackend ? String(props.bank_id || props.bankId || baseIdInTask) : `${taskId}-${baseIdInTask}`;
+      selectionIdToBankBaseId.set(selectionId, { fromBackend, base: baseBackendBankId });
+
+      const baseName = String(props.bank_name || props.bankName || props.name || selectionId);
+      const regionCode = String(props.region_code || props.regionCode || 'Mzs');
+      const reversed = !!(props && (props.reversed === true || props.reversed === 'true'));
+      const description = String(props.description || '');
+
+      if (fromBackend) {
+        taskBankIdSet.add(baseBackendBankId);
+        return;
+      }
+
+      const parts = toLineStrings(feature?.geometry);
+      parts.forEach((geom, partIndex) => {
+        const suffix = parts.length > 1 ? `_part${partIndex + 1}` : '';
+        const bankId = `${baseBackendBankId}${suffix}`;
+        const bankName = parts.length > 1 ? `${baseName}_${partIndex + 1}` : baseName;
+        taskBankIdSet.add(bankId);
+        localBanksToSend.push({
+          bank_id: String(bankId),
+          bank_name: bankName,
+          region_code: regionCode,
+          geometry: geom,
+          bank_geometry: geom,
+          reversed,
+          description,
+        });
+      });
+    });
+
+    if (taskBankIdSet.size === 0) {
+      alert('所选岸段中没有可用的 LineString / MultiLineString，无法创建任务');
+      return;
+    }
+
+    await ensureBanksUploaded(localBanksToSend);
+
+    const selectedBankIds: string[] = Array.from(taskBankIdSet);
 
     const taskPayload = {
       tasks: [
@@ -84,17 +213,23 @@ export async function generateSectionsAndCreateTask(params: {
       const shoreLineId = getShoreLineId(feature, index);
       if (!selectedLines.has(shoreLineId)) return;
 
+      const mapped = selectionIdToBankBaseId.get(shoreLineId);
+      // 理论上不会缺失；若缺失则退回到旧行为
+      const fromBackend = mapped?.fromBackend ?? isFromBackendFeature(feature);
+      const baseBackendBankId =
+        mapped?.base ?? (fromBackend ? String(feature?.properties?.bank_id || feature?.properties?.bankId || shoreLineId) : `${taskId}-${shoreLineId}`);
+      const reverseFlag = !!(
+        feature.properties &&
+        ((feature.properties as any).reversed === true || (feature.properties as any).reversed === 'true')
+      );
+
       if (feature.geometry.type === 'LineString') {
         const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
         const lineLengthMeters = turf.length(line, { units: 'meters' });
 
           const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
 
-          // 检查岸线是否要求反向生成断面（GeoJSON 属性名：reversed）
-          const reverseFlag = !!(
-            feature.properties &&
-            ((feature.properties as any).reversed === true || (feature.properties as any).reversed === 'true')
-          );
+          const bankIdToUse = baseBackendBankId;
           if (reverseFlag) {
             featureCollection.features.forEach((f: any) => {
               if (f.geometry && Array.isArray(f.geometry.coordinates)) {
@@ -113,23 +248,21 @@ export async function generateSectionsAndCreateTask(params: {
           if (!f.properties) f.properties = {};
           (f.properties as any).shoreLineIndex = index;
           (f.properties as any).shoreLineId = shoreLineId;
+          (f.properties as any).bank_id = bankIdToUse;
         });
 
         allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
       } else if (feature.geometry.type === 'MultiLineString') {
         const multiLine = feature.geometry as GeoJSON.MultiLineString;
-        multiLine.coordinates.forEach((coords) => {
+        multiLine.coordinates.forEach((coords, partIndex) => {
+          if (!Array.isArray(coords) || coords.length < 2) return;
           const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
           const lineLengthMeters = turf.length(line, { units: 'meters' });
 
 
           const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
 
-            // 检查岸线是否要求反向生成断面（GeoJSON 属性名：reversed）
-            const reverseFlag = !!(
-              feature.properties &&
-              ((feature.properties as any).reversed === true || (feature.properties as any).reversed === 'true')
-            );
+            const bankIdToUse = fromBackend ? baseBackendBankId : `${baseBackendBankId}_part${partIndex + 1}`;
             if (reverseFlag) {
               featureCollection.features.forEach((f: any) => {
                 if (f.geometry && Array.isArray(f.geometry.coordinates)) {
@@ -148,6 +281,7 @@ export async function generateSectionsAndCreateTask(params: {
               if (!f.properties) f.properties = {};
               (f.properties as any).shoreLineIndex = index;
               (f.properties as any).shoreLineId = shoreLineId;
+              (f.properties as any).bank_id = bankIdToUse;
             });
 
           allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
@@ -163,7 +297,7 @@ export async function generateSectionsAndCreateTask(params: {
         section_id: sectionId,
         section_name: `断面${index + 1}`,
         distance: props.distance,
-        bank_id: props.shoreLineId || 'line-0',
+        bank_id: props.bank_id || props.shoreLineId || 'line-0',
         region_code: 'Mzs',
         segment_index: index,
         geometry: line.geometry,
@@ -177,6 +311,7 @@ export async function generateSectionsAndCreateTask(params: {
         distance: props.distance,
         shoreLineIndex: props.shoreLineIndex,
         shoreLineId: props.shoreLineId,
+        bank_id: props.bank_id,
         leftPoint: props.leftPoint,
         rightPoint: props.rightPoint,
       };

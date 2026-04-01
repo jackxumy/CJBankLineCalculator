@@ -26,11 +26,10 @@ interface EditorSidebarProps {
   uploadedData: GeoJSON.FeatureCollection | null;
   bankGroups: Array<{ region_code: string; count: number }>;
   bankList: any[];
-  loadBankById: (bankId: string) => void;
   deleteBankById: (bankId: string) => void;
-  selectedBankGroup: string;
-  setSelectedBankGroup: (v: string) => void;
-  loadBankGroup: (regionCode: string) => void;
+  deleteBanksByIds: (bankIds: string[]) => void;
+  selectedBankGroup: string[];
+  setSelectedBankGroup: (v: string[]) => void;
   deleteBankGroup: () => void;
   basicParamsList: any[];
   selectedBasicParamIdState: string | number | null;
@@ -58,6 +57,7 @@ interface EditorSidebarProps {
   deleteGroup: (id: string) => void;
   updateGroupConfig: (id: string, field: 'interval' | 'length', value: number) => void;
   reverseCrossLinesInGroup: (groupId: string) => void;
+  deleteCrossLinesInGroup: (groupId: string) => void;
   setEditingPropertiesGroupId: (id: string | null) => void;
   handleApplyCustomSegments: () => void;
   isSelectingCrossLines: boolean;
@@ -91,11 +91,10 @@ function EditorSidebar(props: EditorSidebarProps) {
     bankGroups,
     selectedBankGroup,
     setSelectedBankGroup,
-    loadBankGroup,
     deleteBankGroup,
     bankList,
-    loadBankById,
     deleteBankById,
+    deleteBanksByIds,
     basicParamsList,
     selectedBasicParamIdState,
     // totalSelectedSegments, (unused)
@@ -122,6 +121,7 @@ function EditorSidebar(props: EditorSidebarProps) {
     deleteGroup,
     updateGroupConfig,
     reverseCrossLinesInGroup,
+    deleteCrossLinesInGroup,
     setEditingPropertiesGroupId,
     handleApplyCustomSegments,
     isSelectingCrossLines,
@@ -148,6 +148,8 @@ function EditorSidebar(props: EditorSidebarProps) {
     handleSelectBasicParam,
     onExportSections,
   } = props;
+
+  const activeSelectedBank = selectedBankGroup[selectedBankGroup.length - 1] || '';
 
   return (
     <div className={styles.sidebarContainer}>
@@ -186,16 +188,13 @@ function EditorSidebar(props: EditorSidebarProps) {
             <div className={`${styles.inputGroup} ${styles.mt12}`}>
               <label>获取岸段:</label>
               <select
+                multiple
                 value={selectedBankGroup}
                 onChange={(e) => {
-                  const v = e.target.value;
-                  setSelectedBankGroup(v);
-                  if (v) {
-                    // 如果 value 是 region_code（遗留），调用按组加载；否则当作 bank_id 加载单条
-                    const isRegion = bankGroups.some((g) => g.region_code === v);
-                    if (isRegion) loadBankGroup(v);
-                    else loadBankById(v);
-                  }
+                  const values = Array.from(e.target.selectedOptions)
+                    .map((o) => o.value)
+                    .filter((v) => v);
+                  setSelectedBankGroup(values);
                 }}
               >
                 <option value="">（选择岸段/ID）</option>
@@ -218,15 +217,28 @@ function EditorSidebar(props: EditorSidebarProps) {
                 type="button"
                 className={styles.outlineButton}
                 onClick={() => {
-                  if (!selectedBankGroup) return;
-                  // 若选中的是 bank_id，则删除单条；若为 region_code，则批量删除（保留原行为）
-                  const isRegion = bankGroups.some((g) => g.region_code === selectedBankGroup);
-                  if (isRegion) deleteBankGroup();
-                  else deleteBankById(selectedBankGroup);
+                  if (!activeSelectedBank) return;
+                  // 若选中的是 region_code，则批量删除组（保留原行为，仅支持单选）
+                  const isRegion = bankGroups.some((g) => g.region_code === activeSelectedBank);
+                  if (isRegion) {
+                    if (selectedBankGroup.length !== 1) {
+                      alert('删除岸段组仅支持单选一个 region_code，请先只选择一个再删除');
+                      return;
+                    }
+                    deleteBankGroup();
+                    return;
+                  }
+
+                  // bank_id：支持单删/多选批量删
+                  if (selectedBankGroup.length > 1) {
+                    deleteBanksByIds(selectedBankGroup);
+                  } else {
+                    deleteBankById(activeSelectedBank);
+                  }
                 }}
                 title="删除当前选择的岸段（支持单条 bank_id 或按 region_code 批量删除）"
                 aria-label="删除岸段"
-                disabled={!selectedBankGroup}
+                disabled={!activeSelectedBank}
               >
                 <Trash2 size={16} /> 删除
               </button>
@@ -340,7 +352,7 @@ function EditorSidebar(props: EditorSidebarProps) {
                     type="button"
                     className={`${styles.outlineButton} ${isFixingShoreLineReversed ? styles.active : ''}`}
                     onClick={toggleFixShoreLineReversed}
-                    title="开启岸段修正：仅对已选岸段点击生效；点击岸段后会反转该岸段上全部断面并同步后端，同时标记岸段 properties.reversed=true"
+                    title="开启岸段修正：仅对已选岸段点击生效；每次点击岸段都会反转该岸段上全部断面并同步后端，同时切换岸段 properties.reversed（true/false）"
                     aria-label="修正选择"
                     disabled={!uploadedData || selectedLinesSize === 0}
                   >
@@ -354,7 +366,7 @@ function EditorSidebar(props: EditorSidebarProps) {
                     aria-label="发送"
                     disabled={!uploadedData || selectedLinesSize === 0}
                   >
-                    <Upload size={16} /> 发送
+                    <Upload size={16} /> 上传岸段
                   </button>
                 </div>
               </div>
@@ -430,6 +442,16 @@ function EditorSidebar(props: EditorSidebarProps) {
                             aria-label={`反切第 ${idx + 1} 段断面方向`}
                           >
                             <RotateCw size={14} /> 反切
+                          </button>
+                          <button
+                            type="button"
+                            className={styles.outlineButton}
+                            onClick={() => deleteCrossLinesInGroup(g.id)}
+                            disabled={!perpendicularData || perpendicularData.features.length === 0 || g.end === null}
+                            title={g.end === null ? '请先拾取终点' : '删除该段落范围内的所有断面'}
+                            aria-label={`删除第 ${idx + 1} 段断面`}
+                          >
+                            <Trash2 size={14} /> 删除
                           </button>
                           <button
                             type="button"

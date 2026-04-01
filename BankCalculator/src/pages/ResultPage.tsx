@@ -653,45 +653,54 @@ function ResultPage() {
 
     // 2. 遍历每个岸段组
     Object.keys(groups).forEach(bankId => {
-      const bankSections = groups[bankId].sort((a, b) => a.distance - b.distance);
-      if (bankSections.length < 2) return; // 至少需要 2 个中点才能连成线
+      const bankSections = groups[bankId];
+      if (!bankSections || bankSections.length < 2) return;
 
-      // 计算每个断面中点并构建 LineString
-      const midpoints: number[][] = [];
-      const riskStops: { val: number; color: string }[] = [];
+      // 计算每个断面中点，并按“西→东(经度升序)、北→南(纬度降序)”排序后再连接
+      const points = bankSections
+        .filter(s => s && s.geometry && s.geometry.type === 'LineString')
+        .map(s => {
+          const coords = (s.geometry as any).coordinates as number[][];
+          if (!coords || coords.length < 2) return null;
+          const mid: number[] = [
+            (coords[0][0] + coords[1][0]) / 2,
+            (coords[0][1] + coords[1][1]) / 2
+          ];
+          const info = getRiskInfo(s.risk_level);
+          return { mid, color: info.color, section: s };
+        })
+        .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult }>;
 
-      bankSections.forEach(s => {
-        if (!s.geometry || s.geometry.type !== 'LineString') return;
-        
-        // 计算中点 (断面为 2 个坐标的 LineString)
-        const coords = s.geometry.coordinates;
-        const mid = [
-          (coords[0][0] + coords[1][0]) / 2,
-          (coords[0][1] + coords[1][1]) / 2
-        ];
-        midpoints.push(mid);
+      points.sort((a, b) => {
+        const dx = a.mid[0] - b.mid[0];
+        if (dx !== 0) return dx; // 经度：西→东
+        const dy = b.mid[1] - a.mid[1];
+        if (dy !== 0) return dy; // 纬度：北→南
+        // 兜底：保持稳定（用 distance 或 section_id）
+        const ad = Number(a.section.distance ?? 0);
+        const bd = Number(b.section.distance ?? 0);
+        if (ad !== bd) return ad - bd;
+        return String(a.section.section_id).localeCompare(String(b.section.section_id));
       });
 
-      if (midpoints.length < 2) return;
+      if (points.length < 2) return;
 
-      const newLine = turf.lineString(midpoints);
+      const midpoints = points.map(p => p.mid as number[]);
+      const newLine = turf.lineString(midpoints as any);
       const totalDist = turf.length(newLine, { units: 'meters' });
 
-      // 构建颜色梯度参数
+      // 构建颜色梯度参数（沿排序后的折线累积距离）
+      const riskStops: { val: number; color: string }[] = [];
       let currentDist = 0;
-      bankSections.forEach((s, idx) => {
+      for (let idx = 0; idx < points.length; idx++) {
         if (idx > 0) {
-          const prevMid = midpoints[idx - 1];
-          const currMid = midpoints[idx];
-          currentDist += turf.distance(prevMid, currMid, { units: 'meters' });
+          const prevMid = points[idx - 1].mid;
+          const currMid = points[idx].mid;
+          currentDist += turf.distance(prevMid as any, currMid as any, { units: 'meters' });
         }
-
-        const info = getRiskInfo(s.risk_level);
-        const color = info.color;
-
         const progress = totalDist > 0 ? (currentDist / totalDist) : 0;
-        riskStops.push({ val: progress, color });
-      });
+        riskStops.push({ val: progress, color: points[idx].color });
+      }
 
       // Mapbox interpolate 表达式格式
       const stops: any[] = ['interpolate', ['linear'], ['line-progress']];

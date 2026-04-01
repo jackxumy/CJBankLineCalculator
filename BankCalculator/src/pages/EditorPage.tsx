@@ -11,11 +11,12 @@ import {
   configureSelectedCrossLinePropertiesAction,
   createCrossLineAtPointAction,
   createCrossLineByEndpointsAction,
+  deleteCrossLinesInGroupAction,
+  deleteSelectedCrossLinesAction,
   deleteSelectedCrossLineAction,
   persistCrossLineGeometryAction,
   rotateCrossLineGeometry,
   reverseCrossLinesInGroupAction,
-  reverseSelectedCrossLineAction,
   scaleCrossLineGeometry,
   translateSelectedCrossLineAction,
 } from './editor/crossLineActions';
@@ -68,9 +69,12 @@ function EditorPage() {
 
   // 岸段组（后端 banks 按 region_code 分组）
   const [bankGroups, setBankGroups] = useState<Array<{ region_code: string; count: number }>>([]);
-  const [selectedBankGroup, setSelectedBankGroup] = useState<string>('');
+  // “获取岸段”下拉框支持多选（用于批量加载 bank_id）
+  const [selectedBankGroup, setSelectedBankGroup] = useState<string[]>([]);
   // 当前可选的岸段列表（按 bank_id）
   const [bankList, setBankList] = useState<any[]>([]);
+
+  const prevSelectedBankGroupRef = useRef<string[]>([]);
   
   // 新增状态：控制断面选择模式
   const [isSelectingCrossLines, setIsSelectingCrossLines] = useState<boolean>(false);
@@ -89,6 +93,37 @@ function EditorPage() {
   
   // 新增状态：选中的断面索引
   const [selectedCrossLineIndex, setSelectedCrossLineIndex] = useState<number | null>(null);
+
+  // 自由模式多选：按住 Ctrl 可选择多个断面
+  // 约定：selectedCrossLineIndex 作为“主选中”（用于侧边栏显示），selectedCrossLineIndices 作为多选集合
+  const [selectedCrossLineIndices, setSelectedCrossLineIndices] = useState<Set<number>>(new Set());
+
+  const clearSelectedCrossLines = () => {
+    setSelectedCrossLineIndex(null);
+    setSelectedCrossLineIndices(new Set());
+  };
+
+  const getSelectedCrossLineIndices = (): number[] => {
+    if (selectedCrossLineIndices.size > 0) return Array.from(selectedCrossLineIndices);
+    return selectedCrossLineIndex === null ? [] : [selectedCrossLineIndex];
+  };
+
+  // 当断面数据变化时，修剪无效的选中索引，避免越界
+  useEffect(() => {
+    const max = perpendicularData?.features?.length ?? 0;
+
+    setSelectedCrossLineIndices((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set(Array.from(prev).filter((i) => Number.isFinite(i) && i >= 0 && i < max));
+      return next.size === prev.size ? prev : next;
+    });
+
+    setSelectedCrossLineIndex((prev) => {
+      if (prev === null) return prev;
+      if (!Number.isFinite(prev) || prev < 0 || prev >= max) return null;
+      return prev;
+    });
+  }, [perpendicularData]);
 
   // 断面验证：避免重复触发校验
   const validationTriggeredRef = useRef<Set<string>>(new Set());
@@ -369,6 +404,7 @@ function EditorPage() {
           region_code: b.region_code,
           reversed: !!(b?.reversed === true || b?.reversed === 'true'),
           description: b.description,
+          from_backend: true,
         },
       } as any;
 
@@ -378,7 +414,7 @@ function EditorPage() {
         return String(p.bank_id || p.bankId || '') === String(b.bank_id);
       });
       if (exists) {
-        alert(`岸段 ${b.bank_id} 已在编辑器中，已跳过重复加载`);
+        // alert(`岸段 ${b.bank_id} 已在编辑器中，已跳过重复加载`);
         return;
       }
 
@@ -409,7 +445,18 @@ function EditorPage() {
       const res = await fetch(`/v0/bank/banks/${encodeURIComponent(bankId)}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       alert('已删除岸段');
-      setSelectedBankGroup('');
+      prevSelectedBankGroupRef.current = [];
+      setSelectedBankGroup([]);
+
+      // 删除后同步移除该 bank 的“选中用于生成断面”的标记
+      setSelectedLines((prev) => {
+        if (!prev || prev.size === 0) return prev;
+        if (!prev.has(bankId)) return prev;
+        const next = new Set(prev);
+        next.delete(bankId);
+        return next;
+      });
+
       // 同步从前端已加载的要素中移除该 bank
       setUploadedData((prev) => {
         if (!prev) return prev;
@@ -423,6 +470,64 @@ function EditorPage() {
     } catch (err: any) {
       console.error('删除岸段失败:', err);
       alert(`删除岸段失败: ${err?.message || String(err)}`);
+    }
+  };
+
+  const deleteBanksByIds = async (bankIds: string[]) => {
+    const ids = Array.from(new Set((bankIds || []).map(String))).filter(Boolean);
+    if (ids.length === 0) return;
+
+    const ok = window.confirm(`确认批量删除已选 ${ids.length} 条岸段？`);
+    if (!ok) return;
+
+    const results = await Promise.allSettled(
+      ids.map((bankId) =>
+        fetch(`/v0/bank/banks/${encodeURIComponent(bankId)}`, { method: 'DELETE' }).then((res) => {
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          return true;
+        }),
+      ),
+    );
+
+    const successIds: string[] = [];
+    const failed: Array<{ bankId: string; reason: string }> = [];
+    results.forEach((r, idx) => {
+      const bankId = ids[idx];
+      if (r.status === 'fulfilled') successIds.push(bankId);
+      else failed.push({ bankId, reason: (r.reason as any)?.message || String(r.reason) });
+    });
+
+    if (successIds.length > 0) {
+      const successSet = new Set(successIds);
+
+      prevSelectedBankGroupRef.current = [];
+      setSelectedBankGroup([]);
+
+      setSelectedLines((prev) => {
+        if (!prev || prev.size === 0) return prev;
+        const next = new Set(prev);
+        successIds.forEach((id) => next.delete(id));
+        return next.size === prev.size ? prev : next;
+      });
+
+      setUploadedData((prev) => {
+        if (!prev) return prev;
+        const features = (prev.features || []).filter((f: any) => {
+          const p = f?.properties || {};
+          const id = String(p.bank_id || p.bankId || '');
+          return !successSet.has(id);
+        });
+        return { ...prev, features } as any;
+      });
+    }
+
+    await fetchBankGroups();
+
+    if (failed.length > 0) {
+      console.error('批量删除岸段失败明细:', failed);
+      alert(`批量删除完成：成功 ${successIds.length}，失败 ${failed.length}。首个失败 bank_id=${failed[0].bankId}：${failed[0].reason}`);
+    } else {
+      alert(`已批量删除 ${successIds.length} 条岸段`);
     }
   };
 
@@ -449,6 +554,7 @@ function EditorPage() {
             region_code: b.region_code,
             reversed: !!(b?.reversed === true || b?.reversed === 'true'),
             description: b.description,
+            from_backend: true,
           },
         }));
 
@@ -459,7 +565,7 @@ function EditorPage() {
       setIsSelectingCrossLines(false);
       setIsFixingShoreLineReversed(false);
       setCrossLineEditMode('none');
-      setSelectedCrossLineIndex(null);
+      clearSelectedCrossLines();
     } catch (err: any) {
       console.error('加载岸段组失败:', err);
       alert(`加载岸段组失败: ${err?.message || String(err)}`);
@@ -467,15 +573,23 @@ function EditorPage() {
   };
 
   const deleteBankGroup = async () => {
-    if (!selectedBankGroup) {
+    if (!selectedBankGroup || selectedBankGroup.length === 0) {
       alert('请先选择要删除的岸段组');
       return;
     }
-    const ok = window.confirm(`确认删除岸段组 region_code=${selectedBankGroup} 下的全部岸段？`);
+
+    // 多选时避免误删：仍然只允许删除单个 region_code
+    if (selectedBankGroup.length !== 1) {
+      alert('删除岸段组仅支持单选一个 region_code，请先只选择一个再删除');
+      return;
+    }
+
+    const regionCode = selectedBankGroup[0];
+    const ok = window.confirm(`确认删除岸段组 region_code=${regionCode} 下的全部岸段？`);
     if (!ok) return;
 
     try {
-      const res = await fetch(`/v0/bank/banks?region_code=${encodeURIComponent(selectedBankGroup)}`);
+      const res = await fetch(`/v0/bank/banks?region_code=${encodeURIComponent(regionCode)}`);
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const data = await res.json();
       const banks = (data?.banks || data?.data || data) as any[];
@@ -497,11 +611,34 @@ function EditorPage() {
         alert(`已删除 ${okCount} 条岸段`);
       }
 
-      setSelectedBankGroup('');
+      setSelectedBankGroup([]);
       await fetchBankGroups();
     } catch (err: any) {
       console.error('删除岸段组失败:', err);
       alert(`删除岸段组失败: ${err?.message || String(err)}`);
+    }
+  };
+
+  const handleSelectBanksFromDropdown = async (nextSelected: string[]) => {
+    // 计算增量，只加载“新选中的”条目
+    const prev = prevSelectedBankGroupRef.current;
+    prevSelectedBankGroupRef.current = nextSelected;
+    setSelectedBankGroup(nextSelected);
+
+    const added = nextSelected.filter((v) => !prev.includes(v));
+    if (added.length === 0) return;
+
+    // 如果选中了 region_code（兜底分支），按原行为加载整组；为了避免多选语义混乱，强制单选该 region
+    const regionAdded = added.find((v) => bankGroups.some((g) => g.region_code === v));
+    if (regionAdded) {
+      await loadBankGroup(regionAdded);
+      prevSelectedBankGroupRef.current = [regionAdded];
+      setSelectedBankGroup([regionAdded]);
+      return;
+    }
+
+    for (const bankId of added) {
+      await loadBankById(bankId);
     }
   };
 
@@ -531,11 +668,77 @@ function EditorPage() {
 
   // 反转选中的断面（交换端点并同步到后端如果存在）
   const reverseSelectedCrossLine = async () => {
-    await reverseSelectedCrossLineAction({
-      selectedCrossLineIndex,
-      perpendicularData,
-      setPerpendicularData,
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      alert('当前没有断面可反切');
+      return;
+    }
+
+    const indices = getSelectedCrossLineIndices();
+    if (indices.length === 0) {
+      alert('请先选择要反切的断面');
+      return;
+    }
+
+    const unique = Array.from(new Set(indices)).filter(
+      (i) => Number.isFinite(i) && i >= 0 && i < perpendicularData.features.length,
+    );
+    if (unique.length === 0) {
+      alert('请选择有效的断面');
+      return;
+    }
+
+    // 先本地批量反切
+    const updatedFeatures = [...(perpendicularData.features as any[])];
+    const sectionIdsToSync: string[] = [];
+
+    unique.forEach((idx) => {
+      const f: any = updatedFeatures[idx];
+      if (!f || f.geometry?.type !== 'LineString') return;
+      const coords = (f.geometry.coordinates as number[][]) || [];
+      if (coords.length < 2) return;
+
+      const nextProps: any = { ...(f.properties || {}) };
+      if (nextProps.leftPoint && nextProps.rightPoint) {
+        const oldLeft = nextProps.leftPoint;
+        nextProps.leftPoint = nextProps.rightPoint;
+        nextProps.rightPoint = oldLeft;
+      }
+
+      updatedFeatures[idx] = {
+        ...f,
+        geometry: {
+          type: 'LineString',
+          coordinates: [...coords].reverse(),
+        },
+        properties: nextProps,
+      };
+
+      const sid = nextProps.sectionId ?? nextProps.section_id ?? nextProps.id;
+      if (sid) sectionIdsToSync.push(String(sid));
     });
+
+    setPerpendicularData(turf.featureCollection(updatedFeatures as any));
+
+    // 再同步到后端（存在 sectionId 的才同步）
+    if (sectionIdsToSync.length > 0) {
+      const results = await Promise.allSettled(
+        sectionIdsToSync.map((sectionId) =>
+          fetch(`/v0/bank/sections/${encodeURIComponent(sectionId)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reverse: true }),
+          }).then((res) => {
+            if (!res.ok) throw new Error(res.statusText);
+            return true;
+          }),
+        ),
+      );
+
+      const failedCount = results.filter((r) => r.status === 'rejected').length;
+      if (failedCount > 0) {
+        alert(`反切同步后端失败 ${failedCount} 条（其余已完成）`);
+      }
+    }
   };
 
   // 切换岸段选择模式
@@ -592,17 +795,17 @@ function EditorPage() {
       if (isSelectingStartEnd) setIsSelectingStartEnd(false);
       // 进入精调时默认不选中任何工具，避免误触
       setCrossLineEditMode('none');
-      setSelectedCrossLineIndex(null);
+      clearSelectedCrossLines();
     } else {
       // 退出精调时取消所有选择并释放断面
-      setSelectedCrossLineIndex(null);
+      clearSelectedCrossLines();
       setCrossLineEditMode('none');
       setCrossLineControlMode('shoreline');
     }
   };
 
   const clearSelectedCrossLineSelection = () => {
-    setSelectedCrossLineIndex(null);
+    clearSelectedCrossLines();
   };
 
   const toggleFixShoreLineReversed = () => {
@@ -614,7 +817,7 @@ function EditorPage() {
         setIsSelectingStartEnd(false);
         setIsSelectingCrossLines(false);
         setCrossLineEditMode('none');
-        setSelectedCrossLineIndex(null);
+        clearSelectedCrossLines();
       }
       return next;
     });
@@ -639,12 +842,9 @@ function EditorPage() {
     }
 
     const targetFeature: any = uploadedData.features?.[shoreLineIndex];
-    const alreadyReversed =
-      !!(targetFeature?.properties && (targetFeature.properties.reversed === true || targetFeature.properties.reversed === 'true'));
-    if (alreadyReversed) {
-      alert('该岸段已标记为 reversed=true，已跳过');
-      return;
-    }
+    const rawReversed = targetFeature?.properties?.reversed;
+    const currentReversed = rawReversed === true || rawReversed === 'true' ? true : false;
+    const nextReversed = !currentReversed;
 
     const updatedFeatures = [...(perpendicularData.features as any[])];
     const reversedIndices: number[] = [];
@@ -682,13 +882,13 @@ function EditorPage() {
 
     setPerpendicularData(turf.featureCollection(updatedFeatures as any));
 
-    // 标记岸段 reversed=true（用于后续重新生成断面时保持方向一致）
+    // 切换岸段 reversed 标记（用于后续重新生成断面时保持方向一致）
     setUploadedData((prev) => {
       if (!prev) return prev;
       const next = { ...prev, features: [...prev.features] } as any;
       const feat: any = next.features?.[shoreLineIndex];
       if (!feat) return next;
-      feat.properties = { ...(feat.properties || {}), reversed: true };
+      feat.properties = { ...(feat.properties || {}), reversed: nextReversed };
       return next;
     });
 
@@ -699,8 +899,10 @@ function EditorPage() {
       })
       .filter(Boolean) as string[];
 
+    const actionLabel = nextReversed ? '反转' : '反转回'
+
     if (sectionsToSync.length === 0) {
-      alert(`已修正岸段 ${shoreLineId}：反转 ${reversedIndices.length} 条断面（未同步到后端）`);
+      alert(`已修正岸段 ${shoreLineId}（reversed=${String(nextReversed)}）：${actionLabel} ${reversedIndices.length} 条断面（未同步到后端）`);
       return;
     }
 
@@ -722,10 +924,10 @@ function EditorPage() {
 
     if (failedCount > 0) {
       alert(
-        `已修正岸段 ${shoreLineId}：反转 ${reversedIndices.length} 条断面；后端同步成功 ${successCount}，失败 ${failedCount}`,
+        `已修正岸段 ${shoreLineId}（reversed=${String(nextReversed)}）：${actionLabel} ${reversedIndices.length} 条断面；后端同步成功 ${successCount}，失败 ${failedCount}`,
       );
     } else {
-      alert(`已修正岸段 ${shoreLineId}：反转 ${reversedIndices.length} 条断面（已同步到后端）`);
+      alert(`已修正岸段 ${shoreLineId}（reversed=${String(nextReversed)}）：${actionLabel} ${reversedIndices.length} 条断面（已同步到后端）`);
     }
   };
 
@@ -852,12 +1054,34 @@ function EditorPage() {
   
   // 删除选中的断面
   const deleteSelectedCrossLine = async () => {
+    const indices = getSelectedCrossLineIndices();
+    if (indices.length > 1) {
+      await deleteSelectedCrossLinesAction({
+        selectedCrossLineIndices: indices,
+        perpendicularData,
+        setPerpendicularData,
+        setSelectedCrossLineIndex: (v) => {
+          setSelectedCrossLineIndex(v);
+          if (v === null) setSelectedCrossLineIndices(new Set());
+        },
+      });
+      // 删除后索引会重排，直接清空多选以避免错位
+      setSelectedCrossLineIndices(new Set());
+      return;
+    }
+
     await deleteSelectedCrossLineAction({
       selectedCrossLineIndex,
       perpendicularData,
       setPerpendicularData,
-      setSelectedCrossLineIndex,
+      setSelectedCrossLineIndex: (v) => {
+        setSelectedCrossLineIndex(v);
+        if (v === null) setSelectedCrossLineIndices(new Set());
+      },
     });
+
+    // 单删也清空多选，避免索引错位
+    setSelectedCrossLineIndices(new Set());
   };
   
   // 平移选中的断面
@@ -909,38 +1133,70 @@ function EditorPage() {
 
   // 自由模式：旋转选中断面
   const rotateSelectedCrossLine = async (angleDegrees: number) => {
-    if (selectedCrossLineIndex === null || !perpendicularData) {
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      alert('当前没有断面可旋转');
+      return;
+    }
+
+    const indices = getSelectedCrossLineIndices();
+    if (indices.length === 0) {
       alert('请先选择要旋转的断面');
       return;
     }
-    const feature: any = perpendicularData.features[selectedCrossLineIndex];
-    if (!feature || feature.geometry?.type !== 'LineString') return;
 
-    const nextGeometry = rotateCrossLineGeometry({
-      geometry: feature.geometry as GeoJSON.LineString,
-      angleDegrees,
+    const unique = Array.from(new Set(indices)).filter(
+      (i) => Number.isFinite(i) && i >= 0 && i < perpendicularData.features.length,
+    );
+    const tasks: Array<Promise<any>> = [];
+
+    unique.forEach((idx) => {
+      const feature: any = perpendicularData.features[idx];
+      if (!feature || feature.geometry?.type !== 'LineString') return;
+
+      const nextGeometry = rotateCrossLineGeometry({
+        geometry: feature.geometry as GeoJSON.LineString,
+        angleDegrees,
+      });
+
+      updateCrossLineGeometryLocal(idx, nextGeometry);
+      tasks.push(persistCrossLineGeometry(idx, nextGeometry));
     });
 
-    updateCrossLineGeometryLocal(selectedCrossLineIndex, nextGeometry);
-    await persistCrossLineGeometry(selectedCrossLineIndex, nextGeometry);
+    await Promise.allSettled(tasks);
   };
 
   // 自由模式：拉长/缩短选中断面
   const scaleSelectedCrossLine = async (deltaMeters: number) => {
-    if (selectedCrossLineIndex === null || !perpendicularData) {
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      alert('当前没有断面可缩放');
+      return;
+    }
+
+    const indices = getSelectedCrossLineIndices();
+    if (indices.length === 0) {
       alert('请先选择要缩放的断面');
       return;
     }
-    const feature: any = perpendicularData.features[selectedCrossLineIndex];
-    if (!feature || feature.geometry?.type !== 'LineString') return;
 
-    const nextGeometry = scaleCrossLineGeometry({
-      geometry: feature.geometry as GeoJSON.LineString,
-      deltaMeters,
+    const unique = Array.from(new Set(indices)).filter(
+      (i) => Number.isFinite(i) && i >= 0 && i < perpendicularData.features.length,
+    );
+    const tasks: Array<Promise<any>> = [];
+
+    unique.forEach((idx) => {
+      const feature: any = perpendicularData.features[idx];
+      if (!feature || feature.geometry?.type !== 'LineString') return;
+
+      const nextGeometry = scaleCrossLineGeometry({
+        geometry: feature.geometry as GeoJSON.LineString,
+        deltaMeters,
+      });
+
+      updateCrossLineGeometryLocal(idx, nextGeometry);
+      tasks.push(persistCrossLineGeometry(idx, nextGeometry));
     });
 
-    updateCrossLineGeometryLocal(selectedCrossLineIndex, nextGeometry);
-    await persistCrossLineGeometry(selectedCrossLineIndex, nextGeometry);
+    await Promise.allSettled(tasks);
   };
 
   // 自由模式：点选起止点创建断面
@@ -969,16 +1225,21 @@ function EditorPage() {
       alert('请先上传 GeoJSON 数据');
       return;
     }
-    await generateSectionsAndCreateTask({
-      uploadedData,
-      selectedLines,
-      globalInterval,
-      globalLength,
-      globalProperties,
-      setPerpendicularData,
-      setShowCrossLines,
-      setGlobalProperties,
-    });
+    try {
+      await generateSectionsAndCreateTask({
+        uploadedData,
+        selectedLines,
+        globalInterval,
+        globalLength,
+        globalProperties,
+        setPerpendicularData,
+        setShowCrossLines,
+        setGlobalProperties,
+      });
+    } finally {
+      // 上传断面（生成）完成后刷新“获取岸段”下拉框数据
+      fetchBankGroups();
+    }
   };
 
   // 开始分析：运行任务中的所有断面
@@ -1023,11 +1284,16 @@ function EditorPage() {
 
   // 上传已有断面几何并直接创建任务与断面
   const handleSectionsFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    await uploadSectionsGeoJsonAndCreateTaskAction({
-      e,
-      setPerpendicularData,
-      setShowCrossLines,
-    });
+    try {
+      await uploadSectionsGeoJsonAndCreateTaskAction({
+        e,
+        setPerpendicularData,
+        setShowCrossLines,
+      });
+    } finally {
+      // 上传断面（导入）完成后刷新“获取岸段”下拉框数据
+      fetchBankGroups();
+    }
   };
 
   // 导出当前断面的几何信息（用于上传断面功能的样例）
@@ -1066,6 +1332,23 @@ function EditorPage() {
       perpendicularData,
       globalLength,
       setPerpendicularData,
+    });
+  };
+
+  // 删除某段落范围内的所有断面
+  const deleteCrossLinesInGroup = async (groupId: string) => {
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) {
+      alert('未找到要删除断面的段落');
+      return;
+    }
+
+    await deleteCrossLinesInGroupAction({
+      group,
+      perpendicularData,
+      globalLength,
+      setPerpendicularData,
+      setSelectedCrossLineIndex,
     });
   };
 
@@ -1114,6 +1397,8 @@ function EditorPage() {
         setGroups={setGroups}
         selectedCrossLineIndex={selectedCrossLineIndex}
         setSelectedCrossLineIndex={setSelectedCrossLineIndex}
+        selectedCrossLineIndices={selectedCrossLineIndices}
+        setSelectedCrossLineIndices={setSelectedCrossLineIndices}
         globalInterval={globalInterval}
         globalLength={globalLength}
         createCrossLineAtPoint={createCrossLineAtPoint}
@@ -1125,11 +1410,10 @@ function EditorPage() {
         uploadedData={uploadedData}
         bankGroups={bankGroups}
         bankList={bankList}
-        loadBankById={loadBankById}
         deleteBankById={deleteBankById}
+        deleteBanksByIds={deleteBanksByIds}
         selectedBankGroup={selectedBankGroup}
-        setSelectedBankGroup={setSelectedBankGroup}
-        loadBankGroup={loadBankGroup}
+        setSelectedBankGroup={handleSelectBanksFromDropdown}
         deleteBankGroup={deleteBankGroup}
         basicParamsList={basicParamsList}
         selectedBasicParamIdState={selectedBasicParamIdState}
@@ -1157,6 +1441,7 @@ function EditorPage() {
         deleteGroup={deleteGroup}
         updateGroupConfig={updateGroupConfig}
         reverseCrossLinesInGroup={reverseCrossLinesInGroup}
+        deleteCrossLinesInGroup={deleteCrossLinesInGroup}
         setEditingPropertiesGroupId={setEditingPropertiesGroupId}
         handleApplyCustomSegments={handleApplyCustomSegments}
         isSelectingCrossLines={isSelectingCrossLines}

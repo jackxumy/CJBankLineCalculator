@@ -185,6 +185,108 @@ export async function reverseCrossLinesInGroupAction(params: {
   }
 }
 
+export async function deleteCrossLinesInGroupAction(params: {
+  group: { id: string; line: GeoJSON.Feature<GeoJSON.LineString>; start: number; end: number | null; length: number };
+  perpendicularData: GeoJSON.FeatureCollection | null;
+  globalLength: number;
+  setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
+  setSelectedCrossLineIndex?: (v: number | null) => void;
+}) {
+  const { group, perpendicularData, globalLength, setPerpendicularData, setSelectedCrossLineIndex } = params;
+
+  if (group.end === null) {
+    alert('该段落尚未选择终点，无法删除段内断面');
+    return;
+  }
+
+  if (!perpendicularData || perpendicularData.features.length === 0) {
+    alert('当前没有断面可删除');
+    return;
+  }
+
+  const start = Math.min(group.start, group.end);
+  const end = Math.max(group.start, group.end);
+  const distanceThreshold = Math.max(globalLength, group.length) / 2 + 100;
+
+  const indicesToDelete: number[] = [];
+  const features = perpendicularData.features as GeoJSON.Feature<GeoJSON.Geometry>[];
+
+  features.forEach((feature, index) => {
+    if (feature.geometry.type !== 'LineString') return;
+    const coords = (feature.geometry.coordinates as number[][]) || [];
+    if (coords.length < 2) return;
+
+    const first = coords[0];
+    const last = coords[coords.length - 1];
+    const mid = turf.point([(first[0] + last[0]) / 2, (first[1] + last[1]) / 2]);
+
+    try {
+      const snapped = turf.nearestPointOnLine(group.line, mid, { units: 'meters' });
+      const actualDist = snapped.properties.location ?? 0;
+      const distToLine = turf.distance(mid, snapped, { units: 'meters' });
+
+      if (distToLine > distanceThreshold) return;
+      if (actualDist < start || actualDist > end) return;
+
+      indicesToDelete.push(index);
+    } catch {
+      // ignore matching failures
+    }
+  });
+
+  if (indicesToDelete.length === 0) {
+    alert('在该段落范围内未找到可删除的断面');
+    return;
+  }
+
+  const ok = window.confirm(`确认删除该段落范围内的 ${indicesToDelete.length} 条断面？`);
+  if (!ok) return;
+
+  const deletedFeatures = indicesToDelete.map((idx) => features[idx]);
+
+  const remaining = features.filter((_, idx) => !indicesToDelete.includes(idx)) as any[];
+  remaining.forEach((f, idx) => {
+    if (f?.properties) {
+      (f.properties as any).crossLineId = idx;
+    }
+  });
+
+  setPerpendicularData(turf.featureCollection(remaining as any));
+  if (setSelectedCrossLineIndex) setSelectedCrossLineIndex(null);
+
+  const sectionIdsToDelete = deletedFeatures
+    .map((f: any) => {
+      const p = f?.properties || {};
+      return (p.sectionId ?? p.section_id ?? p.id) as string | undefined;
+    })
+    .filter(Boolean) as string[];
+
+  if (sectionIdsToDelete.length === 0) {
+    alert(`已删除 ${indicesToDelete.length} 条断面（未同步到后端）`);
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    sectionIdsToDelete.map((sectionId) =>
+      fetch(`/v0/bank/sections/${sectionId}`, {
+        method: 'DELETE',
+      }).then((res) => {
+        if (!res.ok) throw new Error(res.statusText);
+        return true;
+      }),
+    ),
+  );
+
+  const successCount = results.filter((r) => r.status === 'fulfilled').length;
+  const failedCount = results.length - successCount;
+
+  if (failedCount > 0) {
+    alert(`已删除 ${indicesToDelete.length} 条断面；后端同步成功 ${successCount}，失败 ${failedCount}`);
+  } else {
+    alert(`已删除 ${indicesToDelete.length} 条断面（已同步到后端）`);
+  }
+}
+
 export async function createCrossLineAtPointAction(params: {
   line: GeoJSON.Feature<GeoJSON.LineString>;
   distanceOnLine: number;
@@ -375,6 +477,77 @@ export async function deleteSelectedCrossLineAction(params: {
   } catch (err: any) {
     console.error('删除断面失败:', err);
     alert(`删除断面失败: ${err.message}`);
+  }
+}
+
+export async function deleteSelectedCrossLinesAction(params: {
+  selectedCrossLineIndices: number[];
+  perpendicularData: GeoJSON.FeatureCollection | null;
+  setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
+  setSelectedCrossLineIndex: (v: number | null) => void;
+}) {
+  const { selectedCrossLineIndices, perpendicularData, setPerpendicularData, setSelectedCrossLineIndex } = params;
+
+  if (!perpendicularData || !Array.isArray(perpendicularData.features) || perpendicularData.features.length === 0) {
+    alert('当前没有断面可删除');
+    return;
+  }
+
+  const max = perpendicularData.features.length;
+  const unique = Array.from(new Set(selectedCrossLineIndices))
+    .filter((i) => Number.isFinite(i) && i >= 0 && i < max)
+    .sort((a, b) => b - a);
+
+  if (unique.length === 0) {
+    alert('请先选择要删除的断面');
+    return;
+  }
+
+  const ok = window.confirm(`确认删除选中的 ${unique.length} 条断面？`);
+  if (!ok) return;
+
+  const toDelete = new Set(unique);
+  const features = perpendicularData.features as GeoJSON.Feature<GeoJSON.Geometry>[];
+  const deletedFeatures = unique.map((idx) => features[idx]).filter(Boolean) as any[];
+
+  // 先更新前端（删除后索引会重排）
+  const remaining = features.filter((_, idx) => !toDelete.has(idx)) as any[];
+  remaining.forEach((f, idx) => {
+    if (f?.properties) (f.properties as any).crossLineId = idx;
+  });
+  setPerpendicularData(turf.featureCollection(remaining as any));
+  setSelectedCrossLineIndex(null);
+
+  // 再同步后端（仅删除有 sectionId 的）
+  const sectionIds = deletedFeatures
+    .map((f) => {
+      const p = f?.properties || {};
+      return (p.sectionId ?? p.section_id ?? p.id) as string | undefined;
+    })
+    .filter(Boolean)
+    .map((s) => String(s));
+
+  if (sectionIds.length === 0) {
+    alert(`已删除 ${unique.length} 条断面（未同步到后端）`);
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    sectionIds.map((sectionId) =>
+      fetch(`/v0/bank/sections/${encodeURIComponent(sectionId)}`, {
+        method: 'DELETE',
+      }).then((res) => {
+        if (!res.ok) throw new Error(res.statusText);
+        return true;
+      }),
+    ),
+  );
+
+  const failCount = results.filter((r) => r.status === 'rejected').length;
+  if (failCount > 0) {
+    alert(`已删除 ${unique.length} 条断面；后端同步成功 ${sectionIds.length - failCount}，失败 ${failCount}`);
+  } else {
+    alert(`已删除 ${unique.length} 条断面（已同步到后端）`);
   }
 }
 
