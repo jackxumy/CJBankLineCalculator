@@ -2,6 +2,7 @@ import * as turf from '@turf/turf';
 import type { ChangeEvent } from 'react';
 import { ensureDefaultBasicParams } from '../../services/basicParamsService';
 import { setCurrentTaskId } from './taskState';
+import { stripZFromGeoJSON } from '../../utils/geojson';
 
 export function uploadMainGeoJsonAction(params: {
   e: ChangeEvent<HTMLInputElement>;
@@ -19,7 +20,8 @@ export function uploadMainGeoJsonAction(params: {
   reader.onload = (event) => {
     try {
       const json = JSON.parse(event.target?.result as string);
-      const geojson = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
+      const geojsonRaw = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
+      const geojson = stripZFromGeoJSON(geojsonRaw as any);
 
       geojson.features.forEach((feature: any, index: number) => {
         if (!feature.properties) {
@@ -52,7 +54,8 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
   try {
     const text = await file.text();
     const json = JSON.parse(text);
-    const geojson = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
+    const geojsonRaw = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
+    const geojson = stripZFromGeoJSON(geojsonRaw as any);
 
     const lineFeatures = geojson.features.filter((f: any) => f.geometry && f.geometry.type === 'LineString') as GeoJSON.Feature<
       GeoJSON.LineString
@@ -121,6 +124,9 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
       const bankId = props.bank_id || props.shoreLineId || props.bankId || 'line-0';
       const distance = props.distance ?? 0;
 
+      // 防御性：确保导入断面为 2D 坐标
+      const line2d = stripZFromGeoJSON(line as any) as any;
+
       sectionsToCreate.push({
         section_id: sectionId,
         section_name: props.section_name || props.name || `导入断面${index + 1}`,
@@ -128,12 +134,12 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
         bank_id: bankId,
         region_code: 'Mzs',
         segment_index: index,
-        geometry: line.geometry,
-        section_geometry: line.geometry,
+        geometry: line2d.geometry,
+        section_geometry: line2d.geometry,
         basic_param_id: basicParamId,
       });
 
-      const coords = line.geometry.coordinates as number[][];
+      const coords = (line2d.geometry.coordinates as number[][]) || [];
       const left = coords[0];
       const right = coords[coords.length - 1];
 
@@ -147,6 +153,9 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
         leftPoint: left,
         rightPoint: right,
       };
+
+      // 同步更新本地 Feature 的 geometry，避免后续前端再发送时带 Z
+      (line as any).geometry = line2d.geometry;
     });
 
     const sectionsPayload = {

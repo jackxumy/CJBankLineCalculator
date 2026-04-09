@@ -14,6 +14,8 @@ export async function generateSectionsAndCreateTask(params: {
   setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
   setShowCrossLines: (v: boolean) => void;
   setGlobalProperties: (v: SectionParams | null) => void;
+  // 若为 true，则在生成断面前不将本地岸段同步上传到后端
+  skipUploadBanks?: boolean;
 }) {
   const {
     uploadedData,
@@ -179,7 +181,12 @@ export async function generateSectionsAndCreateTask(params: {
       return;
     }
 
-    await ensureBanksUploaded(localBanksToSend);
+    if (!params.skipUploadBanks) {
+      await ensureBanksUploaded(localBanksToSend);
+    } else {
+      // 不上传岸段：仍然构造 bank id 映射，但跳过网络上传步骤
+      console.info('跳过上传岸段（skipUploadBanks=true）');
+    }
 
     const selectedBankIds: string[] = Array.from(taskBankIdSet);
 

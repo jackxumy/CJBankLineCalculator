@@ -346,7 +346,7 @@ function EditorSidebar(props: EditorSidebarProps) {
 
             <div className={styles.mt12}>
               <button type="button" className={styles.primaryButton} onClick={handleGenerateSections}>
-                <Ruler size={16} /> 生成全部断面
+                <Ruler size={16} /> 生成精细断面
               </button>
             </div>
 

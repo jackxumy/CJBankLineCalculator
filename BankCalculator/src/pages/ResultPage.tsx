@@ -656,7 +656,8 @@ function ResultPage() {
       const bankSections = groups[bankId];
       if (!bankSections || bankSections.length < 2) return;
 
-      // 计算每个断面中点，并按“西→东(经度升序)、北→南(纬度降序)”排序后再连接
+      // 计算每个断面中点，并按传入的断面顺序（即 sections 数组本身的顺序）连接
+      // 说明：此前按经纬度排序（西→东、北→南）会改变生成顺序；现在改为使用后端/生成顺序（section 列表顺序）
       const points = bankSections
         .filter(s => s && s.geometry && s.geometry.type === 'LineString')
         .map(s => {
@@ -670,18 +671,6 @@ function ResultPage() {
           return { mid, color: info.color, section: s };
         })
         .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult }>;
-
-      points.sort((a, b) => {
-        const dx = a.mid[0] - b.mid[0];
-        if (dx !== 0) return dx; // 经度：西→东
-        const dy = b.mid[1] - a.mid[1];
-        if (dy !== 0) return dy; // 纬度：北→南
-        // 兜底：保持稳定（用 distance 或 section_id）
-        const ad = Number(a.section.distance ?? 0);
-        const bd = Number(b.section.distance ?? 0);
-        if (ad !== bd) return ad - bd;
-        return String(a.section.section_id).localeCompare(String(b.section.section_id));
-      });
 
       if (points.length < 2) return;
 

@@ -7,6 +7,7 @@ import EditorSidebar from '../components/EditorSidebar';
 import EditorMap from '../components/EditorMap';
 import { setCurrentBasicParamId } from '../services/basicParamsService';
 import type { SelectionGroup } from '../types/selection';
+import { stripZFromGeoJSON } from '../utils/geojson';
 import {
   configureSelectedCrossLinePropertiesAction,
   createCrossLineAtPointAction,
@@ -44,7 +45,7 @@ function EditorPage() {
   const [groups, setGroups] = useState<SelectionGroup[]>([]);
 
   // 全局垂线配置（用于首次绘制整个 GeoJSON）
-  const [globalInterval, setGlobalInterval] = useState<number>(100);
+  const [globalInterval, setGlobalInterval] = useState<number>(1000);
   const [globalLength, setGlobalLength] = useState<number>(1000);
   
   // 当前正在编辑的组ID
@@ -972,6 +973,7 @@ function EditorPage() {
 
       const parts = toLineStrings(f?.geometry);
       parts.forEach((geom, partIndex) => {
+        const geom2d = stripZFromGeoJSON(geom as any) as any;
         const suffix = parts.length > 1 ? `_part${partIndex + 1}` : '';
         const bankId = `${taskPrefix}${baseId}${suffix}`;
         const bankName = parts.length > 1 ? `${baseName}_${partIndex + 1}` : baseName;
@@ -979,8 +981,8 @@ function EditorPage() {
           bank_id: String(bankId),
           bank_name: bankName,
           region_code: regionCode,
-          geometry: geom,
-          bank_geometry: geom,
+          geometry: geom2d,
+          bank_geometry: geom2d,
           reversed,
           description,
         });
@@ -1274,6 +1276,8 @@ function EditorPage() {
         setPerpendicularData,
         setShowCrossLines,
         setGlobalProperties,
+        // 生成精细断面时不要同步上传岸段
+        skipUploadBanks: true,
       });
     } finally {
       // 上传断面（生成）完成后刷新“获取岸段”下拉框数据

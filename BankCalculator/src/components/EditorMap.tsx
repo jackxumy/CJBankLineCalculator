@@ -177,6 +177,9 @@ function EditorMap(props: EditorMapProps) {
     isSelectingCrossLinesRef.current = isSelectingCrossLines;
   }, [isSelectingCrossLines]);
 
+  // 记录上一次上传数据要素数量，用于判断是否为“首次加载”以决定是否 fitBounds
+  const prevUploadedCountRef = useRef<number>(0);
+
   const crossLineControlModeRef = useRef<'shoreline' | 'free'>(crossLineControlMode);
   useEffect(() => {
     crossLineControlModeRef.current = crossLineControlMode;
@@ -292,9 +295,18 @@ function EditorMap(props: EditorMapProps) {
         source.setData(uploadedData);
       }
 
-      if (uploadedData.features.length > 0) {
-        const bbox = turf.bbox(uploadedData);
-        map.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 50 });
+      // 仅在从“无要素 -> 有要素”时自动适配视图范围，避免后续对 uploadedData 的小改动（如 reversed 标记切换）触发多次缩放
+      try {
+        const prevCount = prevUploadedCountRef.current || 0;
+        const currCount = (uploadedData.features && uploadedData.features.length) || 0;
+        if (prevCount === 0 && currCount > 0) {
+          const bbox = turf.bbox(uploadedData);
+          map.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 50 });
+        }
+        prevUploadedCountRef.current = currCount;
+      } catch (err) {
+        // 保守处理：若计算 bbox 失败则忽略
+        console.warn('更新 uploadedData 时适配视图范围失败', err);
       }
     };
 
