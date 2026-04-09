@@ -266,21 +266,56 @@ function ResultPage() {
     return { valid: false, color: RISK_COLORS.default, label: '未知', level: null };
   };
 
-  // 计算最终用于绘制的颜色：在 base color 基础上根据 matrix.result 深化色彩
-  const computeColorWithMatrix = (baseLevel: any, matrixResult?: any) => {
-    const base = getRiskInfo(baseLevel);
-    let color = base.color || RISK_COLORS.default;
-    if (matrixResult !== null && matrixResult !== undefined) {
-      // 假定 matrix.result 在 0..1 之间；若超出则按比例截断
-      const val = Number(matrixResult);
-      if (!isNaN(val) && Number.isFinite(val)) {
-        const clamped = Math.max(0, Math.min(1, val));
-        // 最大加深比例：60%（避免完全变黑影响可读性）
-        const maxDarken = 0.6;
-        const factor = clamped * maxDarken;
-        color = darkenColor(color, factor);
+  // 连续色带插值：构建从青色到深红的扩展色带，并根据位置插值
+  // 色带位置说明：我们支持插值域 [-1,4]
+  // 关键点映射： -1: cyan, 0: green, 1: yellow, 2: orange, 3: red, 4: deepRed
+  const COLOR_BAND: Array<{ pos: number; hex: string }> = [
+    { pos: -1, hex: '#00FFFF' }, // 青色
+    { pos: 0, hex: '#10b981' },  // 低/无风险 - 绿
+    { pos: 1, hex: '#facc15' },  // 一般 - 黄
+    { pos: 2, hex: '#f97316' },  // 高 - 橙
+    { pos: 3, hex: '#ef4444' },  // 极高 - 红
+    { pos: 4, hex: '#8B0000' }   // 深红
+  ];
+
+  const interpColorAtPos = (pos: number) => {
+    const p = Math.max(COLOR_BAND[0].pos, Math.min(COLOR_BAND[COLOR_BAND.length - 1].pos, pos));
+    // find segment
+    for (let i = 0; i < COLOR_BAND.length - 1; i++) {
+      const a = COLOR_BAND[i];
+      const b = COLOR_BAND[i + 1];
+      if (p >= a.pos && p <= b.pos) {
+        const t = (p - a.pos) / (b.pos - a.pos || 1);
+        const ac = hexToRgb(a.hex);
+        const bc = hexToRgb(b.hex);
+        const r = ac.r + (bc.r - ac.r) * t;
+        const g = ac.g + (bc.g - ac.g) * t;
+        const bcol = ac.b + (bc.b - ac.b) * t;
+        return rgbToHex(r, g, bcol);
       }
     }
+    return COLOR_BAND[0].hex;
+  };
+
+  // 计算最终用于绘制的颜色：将风险等级和 matrix.result 映射到色带位置
+  // 逻辑：对于整数风险等级 L，结果 r ∈ [0,1] 映射到位置 pos = L - 1 + 2*r
+  // 于是 r=0 -> pos=L-1（更接近低一级或青色），r=0.5 -> pos=L（基色），r=1 -> pos=L+1（更接近高一级或深红）
+  const computeColorWithMatrix = (baseLevel: any, matrixResult?: any) => {
+    const base = getRiskInfo(baseLevel);
+    const L = base.valid && base.level !== null ? Number(base.level) : null;
+    let color = base.color || RISK_COLORS.default;
+    if (L === null) return { ...base, color };
+
+    let r = 0.5; // 默认在本级
+    if (matrixResult !== null && matrixResult !== undefined) {
+      const val = Number(matrixResult);
+      if (!isNaN(val) && Number.isFinite(val)) {
+        r = Math.max(0, Math.min(1, val));
+      }
+    }
+
+    const pos = L - 1 + 2 * r;
+    color = interpColorAtPos(pos);
     return { ...base, color };
   };
 

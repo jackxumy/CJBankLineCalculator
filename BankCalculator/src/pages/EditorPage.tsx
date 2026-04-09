@@ -27,7 +27,11 @@ import {
   uploadMainGeoJsonAction,
   uploadSectionsGeoJsonAndCreateTaskAction,
 } from './editor/fileActions';
-import { generateSectionsAndCreateTask, runCurrentTask } from './editor/sectionsGeneration';
+import {
+  generateComputeSectionsAndCreateTask,
+  generateSectionsAndCreateTask,
+  runCurrentTask,
+} from './editor/sectionsGeneration';
 import { fetchBasicParamDetailAsSectionParams, fetchBasicParamsList } from './editor/basicParamsApi';
 import { getCurrentTaskId } from './editor/taskState';
 
@@ -1285,6 +1289,30 @@ function EditorPage() {
     }
   };
 
+  // “生成计算断面”：在精细断面基础上，沿断面起点->终点方向延长，直到与遇到的第一个岸线相交
+  const handleGenerateComputeSections = async () => {
+    if (!uploadedData) {
+      alert('请先上传 GeoJSON 数据');
+      return;
+    }
+    try {
+      await generateComputeSectionsAndCreateTask({
+        uploadedData,
+        selectedLines,
+        globalInterval,
+        globalLength,
+        globalProperties,
+        setPerpendicularData,
+        setShowCrossLines,
+        setGlobalProperties,
+        // 与精细断面保持一致：不强制同步上传岸段
+        skipUploadBanks: true,
+      });
+    } finally {
+      fetchBankGroups();
+    }
+  };
+
   // 开始分析：运行任务中的所有断面
   const handleStartAnalysis = async () => {
     if (!perpendicularData) {
@@ -1472,6 +1500,7 @@ function EditorPage() {
         toggleSelectAllShoreLines={toggleSelectAllShoreLines}
         selectedLinesSize={selectedLines.size}
         handleGenerateSections={handleGenerateSections}
+        handleGenerateComputeSections={handleGenerateComputeSections}
         isFixingShoreLineReversed={isFixingShoreLineReversed}
         toggleFixShoreLineReversed={toggleFixShoreLineReversed}
         sendSelectedShoreLinesGeoJson={sendSelectedShoreLinesGeoJson}

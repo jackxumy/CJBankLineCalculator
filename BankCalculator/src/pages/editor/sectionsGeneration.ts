@@ -5,7 +5,103 @@ import type { SectionParams } from '../../types/sections';
 import { fetchSectionParams } from './sectionApi';
 import { getCurrentTaskId, setCurrentTaskId } from './taskState';
 
-export async function generateSectionsAndCreateTask(params: {
+function getShoreLineIdFromFeature(feature: any, index: number) {
+  const p = feature?.properties || {};
+  return String(p.bank_id || p.bankId || `line-${index}`);
+}
+
+function toLineStrings(geometry: any): Array<{ type: 'LineString'; coordinates: any[] }> {
+  if (!geometry) return [];
+  if (geometry.type === 'LineString' && Array.isArray(geometry.coordinates)) {
+    return [{ type: 'LineString', coordinates: geometry.coordinates }];
+  }
+  if (geometry.type === 'MultiLineString' && Array.isArray(geometry.coordinates)) {
+    return (geometry.coordinates as any[])
+      .filter((coords) => Array.isArray(coords) && coords.length >= 2)
+      .map((coords) => ({ type: 'LineString' as const, coordinates: coords }));
+  }
+  return [];
+}
+
+function isFromBackendFeature(feature: any) {
+  const props = feature?.properties || {};
+  return props.from_backend === true || props.fromBackend === true;
+}
+
+function extendCrossLineToFirstShorelineIntersection(params: {
+  crossLine: GeoJSON.Feature<GeoJSON.LineString>;
+  shoreLineId?: string;
+  uploadedData: GeoJSON.FeatureCollection;
+  // 最大延伸距离：超过仍无交点则丢弃该断面
+  maxRayLengthMeters: number;
+}): GeoJSON.Feature<GeoJSON.LineString> | null {
+  const { crossLine, shoreLineId, uploadedData } = params;
+  const maxRayLengthMeters = Math.max(1, Number(params.maxRayLengthMeters));
+
+  const coords = crossLine?.geometry?.coordinates;
+  if (!Array.isArray(coords) || coords.length < 2) return crossLine;
+
+  const start0 = coords[0];
+  const end0 = coords[coords.length - 1];
+  if (!Array.isArray(start0) || !Array.isArray(end0)) return crossLine;
+
+  // 约束 1：只保留“岸线上的点”与“延申后的首次相交点”。
+  // 岸线点优先用 generatePerpendicularLines 注入的 anchorPoint，否则退化为断面中点。
+  const anchorRaw = (crossLine.properties as any)?.anchorPoint;
+  let anchorCoord: number[] | null = Array.isArray(anchorRaw) ? (anchorRaw as any) : null;
+  if (!anchorCoord) {
+    const mid = turf.midpoint(turf.point(start0 as any), turf.point(end0 as any));
+    anchorCoord = mid.geometry.coordinates as any;
+  }
+
+  const bearing = turf.bearing(turf.point(start0 as any), turf.point(end0 as any));
+  const farEnd = turf.destination(turf.point(anchorCoord as any), maxRayLengthMeters, bearing, { units: 'meters' });
+  const ray = turf.lineString([anchorCoord as any, farEnd.geometry.coordinates as any]);
+
+  let bestLocation: number | null = null;
+  let bestCoord: number[] | null = null;
+
+  const features = (uploadedData?.features || []) as any[];
+  for (let i = 0; i < features.length; i++) {
+    const f = features[i];
+    const id = getShoreLineIdFromFeature(f, i);
+    if (shoreLineId && id === shoreLineId) continue;
+
+    const parts = toLineStrings(f?.geometry);
+    for (const part of parts) {
+      const shore = turf.lineString(part.coordinates as any);
+      const hits = turf.lineIntersect(ray, shore);
+      const hitPts = (hits?.features || []) as any[];
+      for (const hp of hitPts) {
+        const snapped = turf.nearestPointOnLine(ray, hp, { units: 'meters' }) as any;
+        const loc = Number(snapped?.properties?.location);
+        if (!Number.isFinite(loc)) continue;
+        // 避免把起点自身（0 距离）当作相交点
+        if (loc < 1) continue;
+
+        if (bestLocation === null || loc < bestLocation) {
+          bestLocation = loc;
+          bestCoord = hp?.geometry?.coordinates as any;
+        }
+      }
+    }
+  }
+
+  // 约束 2：超过 maxRayLengthMeters 仍无交点则丢弃该断面
+  if (!bestCoord || bestLocation === null) return null;
+
+  // 只保留两点：岸线锚点 -> 首次相交点
+  crossLine.geometry.coordinates = [anchorCoord as any, bestCoord as any];
+  if (!crossLine.properties) crossLine.properties = {};
+  (crossLine.properties as any).leftPoint = anchorCoord;
+  (crossLine.properties as any).rightPoint = bestCoord;
+  (crossLine.properties as any).extended_to_shoreline = true;
+  (crossLine.properties as any).extended_length_m = bestLocation;
+
+  return crossLine;
+}
+
+async function generateSectionsAndCreateTaskCore(params: {
   uploadedData: GeoJSON.FeatureCollection;
   selectedLines: Set<string>;
   globalInterval: number;
@@ -16,6 +112,8 @@ export async function generateSectionsAndCreateTask(params: {
   setGlobalProperties: (v: SectionParams | null) => void;
   // 若为 true，则在生成断面前不将本地岸段同步上传到后端
   skipUploadBanks?: boolean;
+  // 若为 true，则对每条断面沿起点->终点方向延长，直到与遇到的第一个岸线相交
+  extendToFirstShorelineIntersection?: boolean;
 }) {
   const {
     uploadedData,
@@ -32,29 +130,6 @@ export async function generateSectionsAndCreateTask(params: {
     alert('请先选择用于分析的岸段');
     return;
   }
-
-  const getShoreLineId = (feature: any, index: number) => {
-    const p = feature?.properties || {};
-    return String(p.bank_id || p.bankId || `line-${index}`);
-  };
-
-  const toLineStrings = (geometry: any): Array<{ type: 'LineString'; coordinates: any[] }> => {
-    if (!geometry) return [];
-    if (geometry.type === 'LineString' && Array.isArray(geometry.coordinates)) {
-      return [{ type: 'LineString', coordinates: geometry.coordinates }];
-    }
-    if (geometry.type === 'MultiLineString' && Array.isArray(geometry.coordinates)) {
-      return (geometry.coordinates as any[])
-        .filter((coords) => Array.isArray(coords) && coords.length >= 2)
-        .map((coords) => ({ type: 'LineString' as const, coordinates: coords }));
-    }
-    return [];
-  };
-
-  const isFromBackendFeature = (feature: any) => {
-    const props = feature?.properties || {};
-    return props.from_backend === true || props.fromBackend === true;
-  };
 
   const ensureBanksUploaded = async (banksToSend: any[]) => {
     if (banksToSend.length === 0) return;
@@ -81,11 +156,7 @@ export async function generateSectionsAndCreateTask(params: {
 
       const t = await res.text();
 
-      if (
-        res.status === 400 &&
-        typeof t === 'string' &&
-        /exist|already|duplicate|conflict/i.test(t)
-      ) {
+      if (res.status === 400 && typeof t === 'string' && /exist|already|duplicate|conflict/i.test(t)) {
         results.push({ bank_id: String(bank.bank_id), ok: true, status: res.status });
         continue;
       }
@@ -122,30 +193,26 @@ export async function generateSectionsAndCreateTask(params: {
     const taskId = `task-${Date.now()}`;
     setCurrentTaskId(taskId);
 
-    // 生成全部断面前：先把“本地上传的、且被选中使用”的岸段上传到后端。
-    // - 若岸段来自后端（properties.from_backend=true），则不上传，直接复用其 bank_id。
-    // - 若岸段为本地数据，则用 taskId 前缀生成 bank_id：task-...-line-x（MultiLineString 会追加 _partN）。
     const taskBankIdSet = new Set<string>();
     const localBanksToSend: any[] = [];
 
-    // 关键：本地岸段的 line-N 采用“本次 task 里选中的顺序位置”，而不是原始文件 index（避免出现 line-41）。
     const selectedEntries = uploadedData.features
       .map((feature: any, originalIndex: number) => {
-        const selectionId = getShoreLineId(feature, originalIndex);
+        const selectionId = getShoreLineIdFromFeature(feature, originalIndex);
         return { feature, originalIndex, selectionId };
       })
       .filter((x) => selectedLines.has(x.selectionId));
 
-    // 记录：selectionId（用于前端选择） -> 本次 task 对应的 bank_id（后端）
     const selectionIdToBankBaseId = new Map<string, { fromBackend: boolean; base: string }>();
 
     selectedEntries.forEach(({ feature, selectionId }, selectedIndex) => {
       const props = feature?.properties || {};
       const fromBackend = isFromBackendFeature(feature);
 
-      // 与“上传岸段”按钮一致：对本地岸段，bank_id 使用 line-0/line-1/...（按选中顺序）
-      const baseIdInTask = getShoreLineId(feature, selectedIndex);
-      const baseBackendBankId = fromBackend ? String(props.bank_id || props.bankId || baseIdInTask) : `${taskId}-${baseIdInTask}`;
+      const baseIdInTask = getShoreLineIdFromFeature(feature, selectedIndex);
+      const baseBackendBankId = fromBackend
+        ? String(props.bank_id || props.bankId || baseIdInTask)
+        : `${taskId}-${baseIdInTask}`;
       selectionIdToBankBaseId.set(selectionId, { fromBackend, base: baseBackendBankId });
 
       const baseName = String(props.bank_name || props.bankName || props.name || selectionId);
@@ -184,7 +251,6 @@ export async function generateSectionsAndCreateTask(params: {
     if (!params.skipUploadBanks) {
       await ensureBanksUploaded(localBanksToSend);
     } else {
-      // 不上传岸段：仍然构造 bank id 映射，但跳过网络上传步骤
       console.info('跳过上传岸段（skipUploadBanks=true）');
     }
 
@@ -217,48 +283,70 @@ export async function generateSectionsAndCreateTask(params: {
     const sectionsToCreate: any[] = [];
 
     uploadedData.features.forEach((feature: any, index: number) => {
-      const shoreLineId = getShoreLineId(feature, index);
+      const shoreLineId = getShoreLineIdFromFeature(feature, index);
       if (!selectedLines.has(shoreLineId)) return;
 
       const mapped = selectionIdToBankBaseId.get(shoreLineId);
-      // 理论上不会缺失；若缺失则退回到旧行为
       const fromBackend = mapped?.fromBackend ?? isFromBackendFeature(feature);
       const baseBackendBankId =
-        mapped?.base ?? (fromBackend ? String(feature?.properties?.bank_id || feature?.properties?.bankId || shoreLineId) : `${taskId}-${shoreLineId}`);
+        mapped?.base ??
+        (fromBackend
+          ? String(feature?.properties?.bank_id || feature?.properties?.bankId || shoreLineId)
+          : `${taskId}-${shoreLineId}`);
       const reverseFlag = !!(
         feature.properties &&
         ((feature.properties as any).reversed === true || (feature.properties as any).reversed === 'true')
       );
 
-      if (feature.geometry.type === 'LineString') {
-        const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
-        const lineLengthMeters = turf.length(line, { units: 'meters' });
-
-          const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
-
-          const bankIdToUse = baseBackendBankId;
-          if (reverseFlag) {
-            featureCollection.features.forEach((f: any) => {
-              if (f.geometry && Array.isArray(f.geometry.coordinates)) {
-                f.geometry.coordinates = (f.geometry.coordinates as any[]).slice().reverse();
-              }
-              if (f.properties) {
-                const lp = f.properties.leftPoint;
-                const rp = f.properties.rightPoint;
-                f.properties.leftPoint = rp;
-                f.properties.rightPoint = lp;
-              }
-            });
+      const applyReverseFlag = (featureCollection: any) => {
+        if (!reverseFlag) return;
+        featureCollection.features.forEach((f: any) => {
+          if (f.geometry && Array.isArray(f.geometry.coordinates)) {
+            f.geometry.coordinates = (f.geometry.coordinates as any[]).slice().reverse();
           }
+          if (f.properties) {
+            const lp = f.properties.leftPoint;
+            const rp = f.properties.rightPoint;
+            f.properties.leftPoint = rp;
+            f.properties.rightPoint = lp;
+          }
+        });
+      };
 
-        featureCollection.features.forEach((f) => {
+      const applyCommonProps = (featureCollection: any, bankIdToUse: string) => {
+        featureCollection.features.forEach((f: any) => {
           if (!f.properties) f.properties = {};
           (f.properties as any).shoreLineIndex = index;
           (f.properties as any).shoreLineId = shoreLineId;
           (f.properties as any).bank_id = bankIdToUse;
         });
+      };
 
-        allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+      const maybeExtend = (f: GeoJSON.Feature<GeoJSON.LineString>) => {
+        if (!params.extendToFirstShorelineIntersection) return f;
+        return extendCrossLineToFirstShorelineIntersection({
+          crossLine: f,
+          shoreLineId,
+          uploadedData,
+          maxRayLengthMeters: 10000,
+        });
+      };
+
+      if (feature.geometry.type === 'LineString') {
+        const line = feature as GeoJSON.Feature<GeoJSON.LineString>;
+        const lineLengthMeters = turf.length(line, { units: 'meters' });
+
+        const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
+
+        const bankIdToUse = baseBackendBankId;
+        applyReverseFlag(featureCollection);
+        applyCommonProps(featureCollection, bankIdToUse);
+
+        const extended = (featureCollection.features as any[])
+          .map((ff) => maybeExtend(ff))
+          .filter(Boolean) as GeoJSON.Feature<GeoJSON.LineString>[];
+
+        allPerpendicularLines.push(...extended);
       } else if (feature.geometry.type === 'MultiLineString') {
         const multiLine = feature.geometry as GeoJSON.MultiLineString;
         multiLine.coordinates.forEach((coords, partIndex) => {
@@ -266,32 +354,17 @@ export async function generateSectionsAndCreateTask(params: {
           const line = turf.lineString(coords) as GeoJSON.Feature<GeoJSON.LineString>;
           const lineLengthMeters = turf.length(line, { units: 'meters' });
 
-
           const { featureCollection } = generatePerpendicularLines(line, 0, lineLengthMeters, globalInterval, globalLength);
 
-            const bankIdToUse = fromBackend ? baseBackendBankId : `${baseBackendBankId}_part${partIndex + 1}`;
-            if (reverseFlag) {
-              featureCollection.features.forEach((f: any) => {
-                if (f.geometry && Array.isArray(f.geometry.coordinates)) {
-                  f.geometry.coordinates = (f.geometry.coordinates as any[]).slice().reverse();
-                }
-                if (f.properties) {
-                  const lp = f.properties.leftPoint;
-                  const rp = f.properties.rightPoint;
-                  f.properties.leftPoint = rp;
-                  f.properties.rightPoint = lp;
-                }
-              });
-            }
+          const bankIdToUse = fromBackend ? baseBackendBankId : `${baseBackendBankId}_part${partIndex + 1}`;
+          applyReverseFlag(featureCollection);
+          applyCommonProps(featureCollection, bankIdToUse);
 
-            featureCollection.features.forEach((f) => {
-              if (!f.properties) f.properties = {};
-              (f.properties as any).shoreLineIndex = index;
-              (f.properties as any).shoreLineId = shoreLineId;
-              (f.properties as any).bank_id = bankIdToUse;
-            });
+          const extended = (featureCollection.features as any[])
+            .map((ff) => maybeExtend(ff))
+            .filter(Boolean) as GeoJSON.Feature<GeoJSON.LineString>[];
 
-          allPerpendicularLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
+          allPerpendicularLines.push(...extended);
         });
       }
     });
@@ -321,6 +394,8 @@ export async function generateSectionsAndCreateTask(params: {
         bank_id: props.bank_id,
         leftPoint: props.leftPoint,
         rightPoint: props.rightPoint,
+        extended_to_shoreline: props.extended_to_shoreline,
+        extended_length_m: props.extended_length_m,
       };
     });
 
@@ -356,16 +431,53 @@ export async function generateSectionsAndCreateTask(params: {
         setGlobalProperties(fetched);
       }
     } else if (!globalProperties) {
-      // no-op: 保持现有逻辑，不强行补默认
+      // no-op
     }
 
     setPerpendicularData(turf.featureCollection(allPerpendicularLines));
     setShowCrossLines(true);
-    alert(`任务创建成功！\n已为 ${selectedLines.size} 个岸段生成 ${allPerpendicularLines.length} 条断面！`);
+
+    const modeLabel = params.extendToFirstShorelineIntersection ? '计算断面' : '精细断面';
+    alert(`任务创建成功！\n已为 ${selectedLines.size} 个岸段生成 ${allPerpendicularLines.length} 条${modeLabel}！`);
   } catch (err: any) {
     console.error('生成断面失败:', err);
     alert(`生成断面失败: ${err.message}`);
   }
+}
+
+export async function generateSectionsAndCreateTask(params: {
+  uploadedData: GeoJSON.FeatureCollection;
+  selectedLines: Set<string>;
+  globalInterval: number;
+  globalLength: number;
+  globalProperties: SectionParams | null;
+  setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
+  setShowCrossLines: (v: boolean) => void;
+  setGlobalProperties: (v: SectionParams | null) => void;
+  // 若为 true，则在生成断面前不将本地岸段同步上传到后端
+  skipUploadBanks?: boolean;
+}) {
+  await generateSectionsAndCreateTaskCore({
+    ...params,
+    extendToFirstShorelineIntersection: false,
+  });
+}
+
+export async function generateComputeSectionsAndCreateTask(params: {
+  uploadedData: GeoJSON.FeatureCollection;
+  selectedLines: Set<string>;
+  globalInterval: number;
+  globalLength: number;
+  globalProperties: SectionParams | null;
+  setPerpendicularData: (v: GeoJSON.FeatureCollection | null) => void;
+  setShowCrossLines: (v: boolean) => void;
+  setGlobalProperties: (v: SectionParams | null) => void;
+  skipUploadBanks?: boolean;
+}) {
+  await generateSectionsAndCreateTaskCore({
+    ...params,
+    extendToFirstShorelineIntersection: true,
+  });
 }
 
 export async function runCurrentTask(params: { perpendicularData: GeoJSON.FeatureCollection }) {

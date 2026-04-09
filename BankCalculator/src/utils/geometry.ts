@@ -55,6 +55,7 @@ export function generatePerpendicularLines(
       type: 'Feature',
       properties: {
         distance: d,
+        anchorPoint: p1.geometry.coordinates,
         leftPoint: leftCoords,
         rightPoint: rightCoords,
       },

@@ -44,6 +44,7 @@ interface EditorSidebarProps {
   toggleSelectAllShoreLines: () => void;
   selectedLinesSize: number;
   handleGenerateSections: () => void;
+  handleGenerateComputeSections: () => void;
   isFixingShoreLineReversed: boolean;
   toggleFixShoreLineReversed: () => void;
   sendSelectedShoreLinesGeoJson: () => void;
@@ -108,6 +109,7 @@ function EditorSidebar(props: EditorSidebarProps) {
     toggleSelectAllShoreLines,
     selectedLinesSize,
     handleGenerateSections,
+    handleGenerateComputeSections,
     isFixingShoreLineReversed,
     toggleFixShoreLineReversed,
     sendSelectedShoreLinesGeoJson,
@@ -347,6 +349,12 @@ function EditorSidebar(props: EditorSidebarProps) {
             <div className={styles.mt12}>
               <button type="button" className={styles.primaryButton} onClick={handleGenerateSections}>
                 <Ruler size={16} /> 生成精细断面
+              </button>
+            </div>
+
+            <div className={styles.mt12}>
+              <button type="button" className={styles.primaryButton} onClick={handleGenerateComputeSections}>
+                <Ruler size={16} /> 生成计算断面
               </button>
             </div>
 
