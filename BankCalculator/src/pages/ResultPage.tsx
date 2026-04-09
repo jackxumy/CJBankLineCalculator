@@ -31,6 +31,7 @@ interface SectionResult {
   geometry: any;
   risk_level?: string | number; // 字符串(high, medium, low, no) 或 数字(1, 2, 3, 4)
   risk_score?: number;
+  matrixResult?: number | null;
 }
 
 type TaskProgressSnapshot = {
@@ -87,6 +88,120 @@ function ResultPage() {
   const [progress, setProgress] = useState<TaskProgressSnapshot | null>(null);
   const [expandedErrorIds, setExpandedErrorIds] = useState<Record<string, boolean>>({});
 
+  const [matrixOpen, setMatrixOpen] = useState(false);
+  const [matrixLoading, setMatrixLoading] = useState(false);
+  const [matrixError, setMatrixError] = useState<string | null>(null);
+  const [matrixSectionId, setMatrixSectionId] = useState<string | null>(null);
+  const [matrixSectionName, setMatrixSectionName] = useState<string | null>(null);
+  const [matrixDetail, setMatrixDetail] = useState<any | null>(null);
+
+  const openMatrixDetail = async (sectionId: string, sectionName?: string) => {
+    if (!sectionId) return;
+    setMatrixOpen(true);
+    setMatrixLoading(true);
+    setMatrixError(null);
+    setMatrixSectionId(sectionId);
+    setMatrixSectionName(sectionName || null);
+    setMatrixDetail(null);
+
+    try {
+      const res = await fetch(`/v0/bank/results/${encodeURIComponent(sectionId)}/matrix`);
+      const text = await res.text();
+      let json: any = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${text?.slice(0, 500)}`);
+      }
+
+      // 兼容不同后端包装：{matrix:{...}} / {data:{matrix:{...}}} / 直接返回 matrix
+      const payload = json ?? text;
+      const matrix = payload?.matrix ?? payload?.data?.matrix ?? payload?.data ?? payload;
+      setMatrixDetail(matrix);
+    } catch (err: any) {
+      setMatrixError(err?.message || '获取矩阵详情失败');
+    } finally {
+      setMatrixLoading(false);
+    }
+  };
+
+  const closeMatrixDetail = () => {
+    setMatrixOpen(false);
+    setMatrixLoading(false);
+    setMatrixError(null);
+    setMatrixSectionId(null);
+    setMatrixSectionName(null);
+    setMatrixDetail(null);
+  };
+
+  const formatCellValue = (v: any) => {
+    if (v === null || v === undefined) return '-';
+    if (typeof v === 'number') {
+      if (!Number.isFinite(v)) return String(v);
+      // 避免长小数影响可读性
+      return Math.abs(v) >= 1000 ? String(Math.round(v)) : String(Number(v.toFixed(4)));
+    }
+    if (typeof v === 'string') return v;
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    try {
+      return JSON.stringify(v);
+    } catch {
+      return String(v);
+    }
+  };
+
+  const renderMatrixTable = (name: string, matrix: any) => {
+    if (!matrix) return null;
+
+    // 2D 数组 => table
+    if (Array.isArray(matrix) && matrix.every((row) => Array.isArray(row))) {
+      return (
+        <div className="matrix-block" key={name}>
+          <div className="matrix-block-title">{name}</div>
+          <div className="matrix-table-wrap">
+            <table className="matrix-table">
+              <tbody>
+                {matrix.map((row: any[], rIdx: number) => (
+                  <tr key={rIdx}>
+                    {row.map((cell: any, cIdx: number) => (
+                      <td key={cIdx}>{formatCellValue(cell)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    // 1D 数组 => inline
+    if (Array.isArray(matrix)) {
+      return (
+        <div className="matrix-block" key={name}>
+          <div className="matrix-block-title">{name}</div>
+          <div className="matrix-inline-array">
+            {matrix.map((x: any, idx: number) => (
+              <span className="matrix-chip" key={idx}>{formatCellValue(x)}</span>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // 其它 => 直接 JSON
+    return (
+      <div className="matrix-block" key={name}>
+        <div className="matrix-block-title">{name}</div>
+        <pre className="matrix-json">{JSON.stringify(matrix, null, 2)}</pre>
+      </div>
+    );
+  };
+
   // 切换断面可见性
   useEffect(() => {
     if (!mapRef.current) return;
@@ -115,6 +230,27 @@ function ResultPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 将颜色在同一风险等级内根据 matrix.result 加深
+  const hexToRgb = (hex: string) => {
+    const h = hex.replace('#', '');
+    const bigint = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
+    return { r: (bigint >> 16) & 255, g: (bigint >> 8) & 255, b: bigint & 255 };
+  };
+  const rgbToHex = (r: number, g: number, b: number) => {
+    const toHex = (v: number) => ('0' + Math.max(0, Math.min(255, Math.round(v))).toString(16)).slice(-2);
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+  };
+
+  // factor: 0 = original, 1 = fully black; we cap darkening to a reasonable amount
+  const darkenColor = (hex: string, factor: number) => {
+    const c = hexToRgb(hex);
+    const f = Math.max(0, Math.min(1, factor));
+    const r = c.r * (1 - f);
+    const g = c.g * (1 - f);
+    const b = c.b * (1 - f);
+    return rgbToHex(r, g, b);
+  };
+
   // 风险解析辅助：判断 risk_level 是否为 0-3 的有效数字
   const getRiskInfo = (risk: any) => {
     if (risk === null || risk === undefined) {
@@ -128,6 +264,24 @@ function ResultPage() {
 
     // 非 0-3 的值视为未知（灰色）
     return { valid: false, color: RISK_COLORS.default, label: '未知', level: null };
+  };
+
+  // 计算最终用于绘制的颜色：在 base color 基础上根据 matrix.result 深化色彩
+  const computeColorWithMatrix = (baseLevel: any, matrixResult?: any) => {
+    const base = getRiskInfo(baseLevel);
+    let color = base.color || RISK_COLORS.default;
+    if (matrixResult !== null && matrixResult !== undefined) {
+      // 假定 matrix.result 在 0..1 之间；若超出则按比例截断
+      const val = Number(matrixResult);
+      if (!isNaN(val) && Number.isFinite(val)) {
+        const clamped = Math.max(0, Math.min(1, val));
+        // 最大加深比例：60%（避免完全变黑影响可读性）
+        const maxDarken = 0.6;
+        const factor = clamped * maxDarken;
+        color = darkenColor(color, factor);
+      }
+    }
+    return { ...base, color };
   };
 
   // 获取所有任务列表
@@ -292,6 +446,33 @@ function ResultPage() {
       if (!hit) return s;
       return { ...s, risk_level: hit.riskLevel ?? s.risk_level };
     });
+
+    // 额外拉取每个断面的 matrix.result（若可用），用于在同一风险等级内调整颜色深浅
+    try {
+      await Promise.allSettled(mergedSections.map(async (s) => {
+        const sid = s.section_id;
+        try {
+          const mRes = await fetch(`/v0/bank/results/${encodeURIComponent(sid)}/matrix`);
+          if (!mRes.ok) return;
+          const text = await mRes.text();
+          let json: any = null;
+          try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+          const payload = json ?? text;
+          const matrix = payload?.matrix ?? payload?.data?.matrix ?? payload?.data ?? payload;
+          const val = matrix?.result ?? matrix?.['result'] ?? null;
+          if (val !== null && val !== undefined) {
+            (s as any).matrixResult = Number(val);
+          } else {
+            (s as any).matrixResult = null;
+          }
+        } catch (e) {
+          // 忽略单个断面 matrix 拉取失败
+          (s as any).matrixResult = null;
+        }
+      }));
+    } catch (e) {
+      // 忽略整体并发错误
+    }
 
     // 统计成功数：以 risk_level(0-3) 为准
     const successCount = mergedSections.reduce((acc, s) => {
@@ -525,7 +706,7 @@ function ResultPage() {
 
     // 转换断面数据为 GeoJSON
     const features = sections.filter(s => s.geometry).map(s => {
-      const info = getRiskInfo(s.risk_level);
+      const info = computeColorWithMatrix(s.risk_level, (s as any).matrixResult);
       const color = info.color;
       const displayRisk = info.valid ? info.level : info.label;
 
@@ -607,18 +788,51 @@ function ResultPage() {
         const p = f.properties;
         if (!p) return;
 
-        new mapboxgl.Popup()
-          .setLngLat(e.lngLat)
-          .setHTML(`
-            <div style="padding: 4px; font-family: sans-serif;">
-              <p style="margin:0; font-weight:bold; color:#1e293b;">${p.name}</p>
-              <p style="margin:4px 0 0; font-size:12px; color:#64748b;">断面ID: ${p.id}</p>
-              <p style="margin:4px 0 0; font-size:12px; color:#64748b;">风险等级:
-                <span style="color:${p.color}; font-weight:bold;">${p.risk_label}</span>
-              </p>
-            </div>
-          `)
-          .addTo(map);
+        const root = document.createElement('div');
+        root.style.padding = '6px 6px 4px';
+        root.style.fontFamily = 'sans-serif';
+
+        const title = document.createElement('div');
+        title.textContent = String(p.name ?? '断面');
+        title.style.margin = '0';
+        title.style.fontWeight = '700';
+        title.style.color = '#1e293b';
+        title.style.fontSize = '13px';
+        root.appendChild(title);
+
+        const meta = document.createElement('div');
+        meta.textContent = `断面ID: ${p.id}`;
+        meta.style.marginTop = '4px';
+        meta.style.fontSize = '12px';
+        meta.style.color = '#64748b';
+        root.appendChild(meta);
+
+        const risk = document.createElement('div');
+        risk.style.marginTop = '4px';
+        risk.style.fontSize = '12px';
+        risk.style.color = '#64748b';
+        risk.innerHTML = `风险等级: <span style="color:${p.color}; font-weight:700;">${p.risk_label}</span>`;
+        root.appendChild(risk);
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = '查看细节';
+        btn.style.marginTop = '8px';
+        btn.style.border = 'none';
+        btn.style.background = '#3b82f6';
+        btn.style.color = 'white';
+        btn.style.borderRadius = '6px';
+        btn.style.padding = '4px 8px';
+        btn.style.cursor = 'pointer';
+        btn.style.fontSize = '12px';
+        btn.onclick = () => {
+          const sid = String(p.id);
+          const sname = String(p.name ?? '断面');
+          openMatrixDetail(sid, sname);
+        };
+        root.appendChild(btn);
+
+        new mapboxgl.Popup().setLngLat(e.lngLat).setDOMContent(root).addTo(map);
       };
       sectionEnterHandlerRef.current = () => {
         map.getCanvas().style.cursor = 'pointer';
@@ -667,8 +881,8 @@ function ResultPage() {
             (coords[0][0] + coords[1][0]) / 2,
             (coords[0][1] + coords[1][1]) / 2
           ];
-          const info = getRiskInfo(s.risk_level);
-          return { mid, color: info.color, section: s };
+          const info = computeColorWithMatrix(s.risk_level, (s as any).matrixResult);
+            return { mid, color: info.color, section: s };
         })
         .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult }>;
 
@@ -776,6 +990,67 @@ function ResultPage() {
   return (
     <div className="map-wrapper">
       <div ref={mapContainer} className="map-full" />
+
+      {matrixOpen && (
+        <div className="matrix-modal-overlay" onClick={closeMatrixDetail}>
+          <div className="matrix-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="matrix-modal-header">
+              <div>
+                <div className="matrix-modal-title">断面矩阵详情</div>
+                <div className="matrix-modal-subtitle">
+                  {matrixSectionName ? `${matrixSectionName} | ` : ''}断面ID: {matrixSectionId || '-'}
+                </div>
+              </div>
+              <button className="matrix-modal-close" onClick={closeMatrixDetail}>关闭</button>
+            </div>
+
+            {matrixLoading ? (
+              <div className="matrix-loading">加载中...</div>
+            ) : matrixError ? (
+              <div className="matrix-error">{matrixError}</div>
+            ) : matrixDetail ? (
+              <div className="matrix-body">
+                <div className="matrix-kv">
+                  <div className="matrix-kv-row"><span>case-id</span><span>{formatCellValue(matrixDetail['case-id'] ?? matrixDetail.case_id ?? matrixDetail.caseId)}</span></div>
+                  <div className="matrix-kv-row"><span>result</span><span>{formatCellValue(matrixDetail.result)}</span></div>
+                  <div className="matrix-kv-row"><span>risk-level</span><span>{Array.isArray(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
+                    ? JSON.stringify(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
+                    : formatCellValue(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)}</span></div>
+
+                  {(() => {
+                    const rawEntries = Object.entries(matrixDetail || {});
+                    const skipKeys = new Set([
+                      'case-id', 'case_id', 'caseId',
+                      'result',
+                      'risk-level', 'risk_level', 'riskLevel',
+                      'matrices',
+                    ]);
+                    const others = rawEntries.filter(([k]) => !skipKeys.has(k));
+                    if (others.length === 0) return null;
+                    return others.map(([k, v]) => (
+                      <div className="matrix-kv-row" key={k}><span>{k}</span><span>{formatCellValue(v)}</span></div>
+                    ));
+                  })()}
+                </div>
+
+                <div className="matrix-section-title">matrices</div>
+                <div className="matrix-matrices">
+                  {(() => {
+                    const matrices = matrixDetail.matrices ?? {};
+                    const entries = Object.entries(matrices);
+                    if (entries.length === 0) {
+                      return <div className="matrix-empty">无 matrices 数据</div>;
+                    }
+                    return entries.map(([k, v]) => renderMatrixTable(k, v));
+                  })()}
+                </div>
+              </div>
+            ) : (
+              <div className="matrix-empty">无数据</div>
+            )}
+          </div>
+        </div>
+      )}
 
       {progressOpen && selectedTask && (
         <div className="progress-drawer" onClick={(e) => e.stopPropagation()}>
