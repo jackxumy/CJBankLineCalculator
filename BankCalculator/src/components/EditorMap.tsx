@@ -3,6 +3,7 @@ import mapboxgl from 'mapbox-gl';
 import * as turf from '@turf/turf';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import type { SelectionGroup } from '../types/selection';
+import { getVerticalFootCoordsFromAny } from '../utils/verticalFootPoint';
 
 mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg';
 
@@ -1152,10 +1153,14 @@ function EditorMap(props: EditorMapProps) {
             const geometry = feature.geometry as GeoJSON.LineString;
             const coords = geometry.coordinates;
 
-            const midPoint = turf.point([
-              (coords[0][0] + coords[1][0]) / 2,
-              (coords[0][1] + coords[1][1]) / 2,
-            ]);
+            const ap = getVerticalFootCoordsFromAny(feature.properties);
+            const p =
+              ap ??
+              ([
+                (coords[0][0] + coords[1][0]) / 2,
+                (coords[0][1] + coords[1][1]) / 2,
+              ] as any);
+            const midPoint = turf.point(p as any);
 
             const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
             if (source) source.setData(midPoint);
@@ -1213,10 +1218,14 @@ function EditorMap(props: EditorMapProps) {
             const geometry = feature.geometry as GeoJSON.LineString;
             const coords = geometry.coordinates;
 
-            const midPoint = turf.point([
-              (coords[0][0] + coords[1][0]) / 2,
-              (coords[0][1] + coords[1][1]) / 2,
-            ]);
+            const ap = getVerticalFootCoordsFromAny(feature.properties);
+            const p =
+              ap ??
+              ([
+                (coords[0][0] + coords[1][0]) / 2,
+                (coords[0][1] + coords[1][1]) / 2,
+              ] as any);
+            const midPoint = turf.point(p as any);
 
             const source = map.getSource('snap-point') as mapboxgl.GeoJSONSource;
             if (source) source.setData(midPoint);

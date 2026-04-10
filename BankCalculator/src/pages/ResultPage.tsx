@@ -3,6 +3,7 @@ import mapboxgl from 'mapbox-gl';
 import * as turf from '@turf/turf';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import '../App.css';
+import { getVerticalFootCoordsFromAny, getVerticalFootPointFromAny } from '../utils/verticalFootPoint';
 
 // 与 EditorPage 保持一致的 Mapbox token
 mapboxgl.accessToken = 'pk.eyJ1IjoieWNzb2t1IiwiYSI6ImNrenozdWdodDAza3EzY3BtdHh4cm5pangifQ.ZigfygDi2bK4HXY1pWh-wg';
@@ -29,9 +30,11 @@ interface SectionResult {
   distance: number;
   bank_id: string;
   geometry: any;
+  vertical_foot_point?: { type: 'Point'; coordinates: [number, number] } | null;
+  // legacy compatibility
+  anchorPoint?: number[] | null;
   risk_level?: string | number; // 字符串(high, medium, low, no) 或 数字(1, 2, 3, 4)
   risk_score?: number;
-  matrixResult?: number | null;
 }
 
 type TaskProgressSnapshot = {
@@ -230,27 +233,6 @@ function ResultPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 将颜色在同一风险等级内根据 matrix.result 加深
-  const hexToRgb = (hex: string) => {
-    const h = hex.replace('#', '');
-    const bigint = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
-    return { r: (bigint >> 16) & 255, g: (bigint >> 8) & 255, b: bigint & 255 };
-  };
-  const rgbToHex = (r: number, g: number, b: number) => {
-    const toHex = (v: number) => ('0' + Math.max(0, Math.min(255, Math.round(v))).toString(16)).slice(-2);
-    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-  };
-
-  // factor: 0 = original, 1 = fully black; we cap darkening to a reasonable amount
-  const darkenColor = (hex: string, factor: number) => {
-    const c = hexToRgb(hex);
-    const f = Math.max(0, Math.min(1, factor));
-    const r = c.r * (1 - f);
-    const g = c.g * (1 - f);
-    const b = c.b * (1 - f);
-    return rgbToHex(r, g, b);
-  };
-
   // 风险解析辅助：判断 risk_level 是否为 0-3 的有效数字
   const getRiskInfo = (risk: any) => {
     if (risk === null || risk === undefined) {
@@ -266,57 +248,10 @@ function ResultPage() {
     return { valid: false, color: RISK_COLORS.default, label: '未知', level: null };
   };
 
-  // 连续色带插值：构建从青色到深红的扩展色带，并根据位置插值
-  // 色带位置说明：我们支持插值域 [-1,4]
-  // 关键点映射： -1: cyan, 0: green, 1: yellow, 2: orange, 3: red, 4: deepRed
-  const COLOR_BAND: Array<{ pos: number; hex: string }> = [
-    { pos: -1, hex: '#00FFFF' }, // 青色
-    { pos: 0, hex: '#10b981' },  // 低/无风险 - 绿
-    { pos: 1, hex: '#facc15' },  // 一般 - 黄
-    { pos: 2, hex: '#f97316' },  // 高 - 橙
-    { pos: 3, hex: '#ef4444' },  // 极高 - 红
-    { pos: 4, hex: '#8B0000' }   // 深红
-  ];
-
-  const interpColorAtPos = (pos: number) => {
-    const p = Math.max(COLOR_BAND[0].pos, Math.min(COLOR_BAND[COLOR_BAND.length - 1].pos, pos));
-    // find segment
-    for (let i = 0; i < COLOR_BAND.length - 1; i++) {
-      const a = COLOR_BAND[i];
-      const b = COLOR_BAND[i + 1];
-      if (p >= a.pos && p <= b.pos) {
-        const t = (p - a.pos) / (b.pos - a.pos || 1);
-        const ac = hexToRgb(a.hex);
-        const bc = hexToRgb(b.hex);
-        const r = ac.r + (bc.r - ac.r) * t;
-        const g = ac.g + (bc.g - ac.g) * t;
-        const bcol = ac.b + (bc.b - ac.b) * t;
-        return rgbToHex(r, g, bcol);
-      }
-    }
-    return COLOR_BAND[0].hex;
-  };
-
-  // 计算最终用于绘制的颜色：将风险等级和 matrix.result 映射到色带位置
-  // 逻辑：对于整数风险等级 L，结果 r ∈ [0,1] 映射到位置 pos = L - 1 + 2*r
-  // 于是 r=0 -> pos=L-1（更接近低一级或青色），r=0.5 -> pos=L（基色），r=1 -> pos=L+1（更接近高一级或深红）
-  const computeColorWithMatrix = (baseLevel: any, matrixResult?: any) => {
-    const base = getRiskInfo(baseLevel);
-    const L = base.valid && base.level !== null ? Number(base.level) : null;
-    let color = base.color || RISK_COLORS.default;
-    if (L === null) return { ...base, color };
-
-    let r = 0.5; // 默认在本级
-    if (matrixResult !== null && matrixResult !== undefined) {
-      const val = Number(matrixResult);
-      if (!isNaN(val) && Number.isFinite(val)) {
-        r = Math.max(0, Math.min(1, val));
-      }
-    }
-
-    const pos = L - 1 + 2 * r;
-    color = interpColorAtPos(pos);
-    return { ...base, color };
+  // 颜色展示回退：仅按四级风险颜色展示（result 数值暂不参与）
+  // 不同等级之间的过渡（岸线/中线）仍由 Mapbox 的 line-gradient 插值完成
+  const computeColorWithMatrix = (baseLevel: any) => {
+    return getRiskInfo(baseLevel);
   };
 
   // 获取所有任务列表
@@ -482,32 +417,7 @@ function ResultPage() {
       return { ...s, risk_level: hit.riskLevel ?? s.risk_level };
     });
 
-    // 额外拉取每个断面的 matrix.result（若可用），用于在同一风险等级内调整颜色深浅
-    try {
-      await Promise.allSettled(mergedSections.map(async (s) => {
-        const sid = s.section_id;
-        try {
-          const mRes = await fetch(`/v0/bank/results/${encodeURIComponent(sid)}/matrix`);
-          if (!mRes.ok) return;
-          const text = await mRes.text();
-          let json: any = null;
-          try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-          const payload = json ?? text;
-          const matrix = payload?.matrix ?? payload?.data?.matrix ?? payload?.data ?? payload;
-          const val = matrix?.result ?? matrix?.['result'] ?? null;
-          if (val !== null && val !== undefined) {
-            (s as any).matrixResult = Number(val);
-          } else {
-            (s as any).matrixResult = null;
-          }
-        } catch (e) {
-          // 忽略单个断面 matrix 拉取失败
-          (s as any).matrixResult = null;
-        }
-      }));
-    } catch (e) {
-      // 忽略整体并发错误
-    }
+    // 注：result 的数值意义尚不明确，暂不再轮询 /matrix（避免高频额外请求）
 
     // 统计成功数：以 risk_level(0-3) 为准
     const successCount = mergedSections.reduce((acc, s) => {
@@ -622,6 +532,7 @@ function ResultPage() {
       if (!sectionsRes.ok) throw new Error('获取断面列表失败');
       const js = await sectionsRes.json().catch(() => null);
       const sectionsRaw: any[] = (js?.sections ?? js?.data ?? js) || [];
+      console.log('ResultPage: raw sections response:', sectionsRaw);
       const sectionResults: SectionResult[] = (Array.isArray(sectionsRaw) ? sectionsRaw : [])
         .filter(s => s && (s.geometry || s.section_geometry))
         .map((s: any) => ({
@@ -630,8 +541,18 @@ function ResultPage() {
           distance: Number(s.distance ?? 0),
           bank_id: s.bank_id ?? 'unknown',
           geometry: s.geometry ?? s.section_geometry,
+          vertical_foot_point: getVerticalFootPointFromAny(s) ?? null,
+          // legacy compatibility
+          anchorPoint: (s.anchorPoint ?? s.anchor_point ?? s.anchor) ?? null,
           risk_level: s.risk_level
         }));
+
+      // 打印处理后的断面列表 JSON，便于调试（也可在控制台查看）
+      try {
+        console.log('ResultPage: parsed sectionResults:', JSON.stringify(sectionResults, null, 2));
+      } catch (e) {
+        console.log('ResultPage: parsed sectionResults (non-serializable):', sectionResults);
+      }
 
       lastSectionsByTaskRef.current[taskId] = sectionResults;
 
@@ -741,7 +662,7 @@ function ResultPage() {
 
     // 转换断面数据为 GeoJSON
     const features = sections.filter(s => s.geometry).map(s => {
-      const info = computeColorWithMatrix(s.risk_level, (s as any).matrixResult);
+      const info = computeColorWithMatrix(s.risk_level);
       const color = info.color;
       const displayRisk = info.valid ? info.level : info.label;
 
@@ -912,11 +833,14 @@ function ResultPage() {
         .map(s => {
           const coords = (s.geometry as any).coordinates as number[][];
           if (!coords || coords.length < 2) return null;
-          const mid: number[] = [
-            (coords[0][0] + coords[1][0]) / 2,
-            (coords[0][1] + coords[1][1]) / 2
-          ];
-          const info = computeColorWithMatrix(s.risk_level, (s as any).matrixResult);
+          const ap = getVerticalFootCoordsFromAny(s);
+          const mid: number[] = ap
+            ? [Number(ap[0]), Number(ap[1])]
+            : [
+                (coords[0][0] + coords[1][0]) / 2,
+                (coords[0][1] + coords[1][1]) / 2,
+              ];
+          const info = computeColorWithMatrix(s.risk_level);
             return { mid, color: info.color, section: s };
         })
         .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult }>;

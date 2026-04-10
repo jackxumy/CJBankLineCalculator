@@ -1,4 +1,5 @@
 import * as turf from '@turf/turf';
+import { coordsToVerticalFootPoint } from './verticalFootPoint';
 
 export function generatePerpendicularLines(
   line: GeoJSON.Feature<GeoJSON.LineString>,
@@ -25,6 +26,9 @@ export function generatePerpendicularLines(
     const p1 = turf.along(line, d, { units: 'meters' });
     const p2Offset = Math.min(d + 0.1, lineLength);
     const p2 = turf.along(line, p2Offset, { units: 'meters' });
+
+    const anchorCoords = (p1.geometry.coordinates as number[]) || [];
+    const verticalFootPoint = coordsToVerticalFootPoint(anchorCoords);
 
     const relPos = segmentLen > 0 ? (d - actualStart) / segmentLen : 0;
     console.log(
@@ -55,7 +59,7 @@ export function generatePerpendicularLines(
       type: 'Feature',
       properties: {
         distance: d,
-        anchorPoint: p1.geometry.coordinates,
+        ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
         leftPoint: leftCoords,
         rightPoint: rightCoords,
       },

@@ -4,6 +4,11 @@ import { ensureDefaultBasicParams } from '../../services/basicParamsService';
 import type { SectionParams } from '../../types/sections';
 import { fetchSectionParams } from './sectionApi';
 import { getCurrentTaskId, setCurrentTaskId } from './taskState';
+import {
+  coordsToVerticalFootPoint,
+  getVerticalFootCoordsFromAny,
+  getVerticalFootPointFromAny,
+} from '../../utils/verticalFootPoint';
 
 function getShoreLineIdFromFeature(feature: any, index: number) {
   const p = feature?.properties || {};
@@ -32,30 +37,32 @@ function extendCrossLineToFirstShorelineIntersection(params: {
   crossLine: GeoJSON.Feature<GeoJSON.LineString>;
   shoreLineId?: string;
   uploadedData: GeoJSON.FeatureCollection;
-  // 最大延伸距离：超过仍无交点则丢弃该断面
-  maxRayLengthMeters: number;
-}): GeoJSON.Feature<GeoJSON.LineString> | null {
+  maxRayLengthMeters?: number;
+}) {
   const { crossLine, shoreLineId, uploadedData } = params;
-  const maxRayLengthMeters = Math.max(1, Number(params.maxRayLengthMeters));
+  // 约束：最多延长 10000m；若仍无交点则丢弃该断面（返回 null）
+  const maxRayLengthMeters = Math.max(1, Number(params.maxRayLengthMeters ?? 10000));
 
   const coords = crossLine?.geometry?.coordinates;
   if (!Array.isArray(coords) || coords.length < 2) return crossLine;
 
-  const start0 = coords[0];
-  const end0 = coords[coords.length - 1];
-  if (!Array.isArray(start0) || !Array.isArray(end0)) return crossLine;
+  const start = coords[0];
+  const end = coords[coords.length - 1];
+  if (!Array.isArray(start) || !Array.isArray(end)) return crossLine;
 
-  // 约束 1：只保留“岸线上的点”与“延申后的首次相交点”。
-  // 岸线点优先用 generatePerpendicularLines 注入的 anchorPoint，否则退化为断面中点。
-  const anchorRaw = (crossLine.properties as any)?.anchorPoint;
-  let anchorCoord: number[] | null = Array.isArray(anchorRaw) ? (anchorRaw as any) : null;
-  if (!anchorCoord) {
-    const mid = turf.midpoint(turf.point(start0 as any), turf.point(end0 as any));
-    anchorCoord = mid.geometry.coordinates as any;
-  }
+  const props: any = crossLine.properties || {};
+  const anchorCoord = getVerticalFootCoordsFromAny(props);
+  const right = (props.rightPoint as number[] | undefined) ?? null;
+  const rightCoord = Array.isArray(right) && right.length >= 2 ? right : (Array.isArray(end) ? (end as any) : null);
+  if (!anchorCoord || !rightCoord) return crossLine;
 
-  const bearing = turf.bearing(turf.point(start0 as any), turf.point(end0 as any));
-  const farEnd = turf.destination(turf.point(anchorCoord as any), maxRayLengthMeters, bearing, { units: 'meters' });
+  const anchorPt = turf.point(anchorCoord as any);
+  const dirPt = turf.point(rightCoord as any);
+  const bearing = turf.bearing(anchorPt, dirPt);
+
+  // 从垂足点向右端方向发射射线，跳过极近的交点
+  const minAfterMeters = 1;
+  const farEnd = turf.destination(anchorPt, maxRayLengthMeters, bearing, { units: 'meters' });
   const ray = turf.lineString([anchorCoord as any, farEnd.geometry.coordinates as any]);
 
   let bestLocation: number | null = null;
@@ -76,8 +83,7 @@ function extendCrossLineToFirstShorelineIntersection(params: {
         const snapped = turf.nearestPointOnLine(ray, hp, { units: 'meters' }) as any;
         const loc = Number(snapped?.properties?.location);
         if (!Number.isFinite(loc)) continue;
-        // 避免把起点自身（0 距离）当作相交点
-        if (loc < 1) continue;
+        if (loc < minAfterMeters) continue;
 
         if (bestLocation === null || loc < bestLocation) {
           bestLocation = loc;
@@ -87,12 +93,15 @@ function extendCrossLineToFirstShorelineIntersection(params: {
     }
   }
 
-  // 约束 2：超过 maxRayLengthMeters 仍无交点则丢弃该断面
-  if (!bestCoord || bestLocation === null) return null;
+  if (!bestCoord || bestLocation === null) {
+    return null;
+  }
 
-  // 只保留两点：岸线锚点 -> 首次相交点
+  // 只保留：垂足点(vertical_foot_point) 与 延申后的交点
   crossLine.geometry.coordinates = [anchorCoord as any, bestCoord as any];
   if (!crossLine.properties) crossLine.properties = {};
+  const vfp = coordsToVerticalFootPoint(anchorCoord);
+  if (vfp) (crossLine.properties as any).vertical_foot_point = vfp;
   (crossLine.properties as any).leftPoint = anchorCoord;
   (crossLine.properties as any).rightPoint = bestCoord;
   (crossLine.properties as any).extended_to_shoreline = true;
@@ -342,11 +351,11 @@ async function generateSectionsAndCreateTaskCore(params: {
         applyReverseFlag(featureCollection);
         applyCommonProps(featureCollection, bankIdToUse);
 
-        const extended = (featureCollection.features as any[])
+        const extendedFeatures = (featureCollection.features as any[])
           .map((ff) => maybeExtend(ff))
           .filter(Boolean) as GeoJSON.Feature<GeoJSON.LineString>[];
 
-        allPerpendicularLines.push(...extended);
+        allPerpendicularLines.push(...extendedFeatures);
       } else if (feature.geometry.type === 'MultiLineString') {
         const multiLine = feature.geometry as GeoJSON.MultiLineString;
         multiLine.coordinates.forEach((coords, partIndex) => {
@@ -360,11 +369,11 @@ async function generateSectionsAndCreateTaskCore(params: {
           applyReverseFlag(featureCollection);
           applyCommonProps(featureCollection, bankIdToUse);
 
-          const extended = (featureCollection.features as any[])
+          const extendedFeatures = (featureCollection.features as any[])
             .map((ff) => maybeExtend(ff))
             .filter(Boolean) as GeoJSON.Feature<GeoJSON.LineString>[];
 
-          allPerpendicularLines.push(...extended);
+          allPerpendicularLines.push(...extendedFeatures);
         });
       }
     });
@@ -372,6 +381,8 @@ async function generateSectionsAndCreateTaskCore(params: {
     allPerpendicularLines.forEach((line, index) => {
       const props: any = line.properties || {};
       const sectionId = `sec-${taskId}-${index}`;
+
+      const verticalFootPoint = getVerticalFootPointFromAny(props);
 
       sectionsToCreate.push({
         section_id: sectionId,
@@ -382,6 +393,7 @@ async function generateSectionsAndCreateTaskCore(params: {
         segment_index: index,
         geometry: line.geometry,
         section_geometry: line.geometry,
+        ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
         basic_param_id: basicParamId,
       });
 
@@ -392,6 +404,7 @@ async function generateSectionsAndCreateTaskCore(params: {
         shoreLineIndex: props.shoreLineIndex,
         shoreLineId: props.shoreLineId,
         bank_id: props.bank_id,
+        ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
         leftPoint: props.leftPoint,
         rightPoint: props.rightPoint,
         extended_to_shoreline: props.extended_to_shoreline,

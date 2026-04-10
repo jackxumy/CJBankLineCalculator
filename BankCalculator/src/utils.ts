@@ -1,5 +1,4 @@
-import * as turf from '@turf/turf';
-import { ANALYSIS_CONFIG_DEFAULT, type AnalysisConfig } from './constants';
+import { ANALYSIS_CONFIG_DEFAULT } from './constants';
 
 export { generatePerpendicularLines } from './utils/geometry';
 

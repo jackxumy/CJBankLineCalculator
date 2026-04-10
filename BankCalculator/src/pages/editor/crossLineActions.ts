@@ -4,6 +4,10 @@ import type { SectionParams } from '../../types/sections';
 import { ensureDefaultBasicParams } from '../../services/basicParamsService';
 import { fetchSectionParams } from './sectionApi';
 import { getCurrentTaskId } from './taskState';
+import {
+  coordsToVerticalFootPoint,
+  getVerticalFootCoordsFromAny,
+} from '../../utils/verticalFootPoint';
 
 export type CrossLineControlMode = 'shoreline' | 'free';
 
@@ -109,7 +113,12 @@ export async function reverseCrossLinesInGroupAction(params: {
 
     const first = coords[0];
     const last = coords[coords.length - 1];
-    const mid = turf.point([(first[0] + last[0]) / 2, (first[1] + last[1]) / 2]);
+    const anchorPoint = getVerticalFootCoordsFromAny(feature.properties) ?? undefined;
+    const p =
+      Array.isArray(anchorPoint) && anchorPoint.length >= 2
+        ? anchorPoint
+        : [(first[0] + last[0]) / 2, (first[1] + last[1]) / 2];
+    const mid = turf.point(p as any);
 
     try {
       const snapped = turf.nearestPointOnLine(group.line, mid, { units: 'meters' });
@@ -218,7 +227,12 @@ export async function deleteCrossLinesInGroupAction(params: {
 
     const first = coords[0];
     const last = coords[coords.length - 1];
-    const mid = turf.point([(first[0] + last[0]) / 2, (first[1] + last[1]) / 2]);
+    const anchorPoint = getVerticalFootCoordsFromAny(feature.properties) ?? undefined;
+    const p =
+      Array.isArray(anchorPoint) && anchorPoint.length >= 2
+        ? anchorPoint
+        : [(first[0] + last[0]) / 2, (first[1] + last[1]) / 2];
+    const mid = turf.point(p as any);
 
     try {
       const snapped = turf.nearestPointOnLine(group.line, mid, { units: 'meters' });
@@ -319,6 +333,8 @@ export async function createCrossLineAtPointAction(params: {
   }
 
   const pointOnLine = turf.along(line, distanceOnLine, { units: 'meters' });
+  const anchorCoords = pointOnLine.geometry.coordinates as number[];
+  const verticalFootPoint = coordsToVerticalFootPoint(anchorCoords);
   const lineLength = turf.length(line, { units: 'meters' });
   const nextDist = Math.min(distanceOnLine + 0.1, lineLength);
   const nextPoint = turf.along(line, nextDist, { units: 'meters' });
@@ -363,6 +379,7 @@ export async function createCrossLineAtPointAction(params: {
           segment_index: newSectionIndex,
           geometry: newGeometry,
           section_geometry: newGeometry,
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
           basic_param_id: basicParamId,
         },
       ],
@@ -406,6 +423,7 @@ export async function createCrossLineAtPointAction(params: {
           distance: distanceOnLine,
           shoreLineIndex: parentIndex,
           shoreLineId: parentId,
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
           leftPoint: leftCoords,
           rightPoint: rightCoords,
         },
@@ -808,12 +826,14 @@ export async function createCrossLineByEndpointsAction(params: {
   // 尝试根据上传岸线推断 bank_id 与 distance（自由模式也可在无岸线情况下工作）
   let bankId = 'line-0';
   let distance = 0;
+  let verticalFootPoint = coordsToVerticalFootPoint([(start[0] + end[0]) / 2, (start[1] + end[1]) / 2]);
 
   if (uploadedData && uploadedData.features.length > 0) {
     const mid = turf.midpoint(turf.point(start), turf.point(end));
     let bestBankId: string | null = null;
     let bestDistance = 0;
     let bestD = Number.POSITIVE_INFINITY;
+    let bestAnchorPoint: number[] | null = null;
 
     uploadedData.features.forEach((f, idx) => {
       if (!f.geometry || (f.geometry.type !== 'LineString' && f.geometry.type !== 'MultiLineString')) return;
@@ -823,11 +843,13 @@ export async function createCrossLineByEndpointsAction(params: {
           const snapped = turf.nearestPointOnLine(line, mid, { units: 'meters' });
           const d = turf.distance(mid, snapped, { units: 'meters' });
           const loc = snapped.properties.location ?? 0;
+          const ap = (snapped?.geometry?.coordinates as any) as number[] | undefined;
 
           if (d < bestD) {
             bestD = d;
             bestBankId = assumedBankId;
             bestDistance = loc;
+            if (Array.isArray(ap) && ap.length >= 2) bestAnchorPoint = [Number(ap[0]), Number(ap[1])];
           }
         } catch {
           // ignore
@@ -850,6 +872,9 @@ export async function createCrossLineByEndpointsAction(params: {
       bankId = bestBankId;
       distance = bestDistance;
     }
+
+    // 记录垂足点（无匹配则回退到几何中点）
+    if (bestAnchorPoint) verticalFootPoint = coordsToVerticalFootPoint(bestAnchorPoint);
   }
 
   const nextIndex = perpendicularData ? perpendicularData.features.length : 0;
@@ -869,6 +894,7 @@ export async function createCrossLineByEndpointsAction(params: {
           crossLineId: newCrossLineId,
           distance,
           shoreLineId: bankId,
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
           leftPoint: left,
           rightPoint: right,
         },
@@ -895,6 +921,7 @@ export async function createCrossLineByEndpointsAction(params: {
           segment_index: nextIndex,
           geometry: newGeometry,
           section_geometry: newGeometry,
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
           basic_param_id: basicParamId,
         },
       ],
@@ -923,6 +950,7 @@ export async function createCrossLineByEndpointsAction(params: {
           crossLineId: newCrossLineId,
           distance,
           shoreLineId: bankId,
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
           leftPoint: start,
           rightPoint: end,
         },

@@ -3,6 +3,7 @@ import type { ChangeEvent } from 'react';
 import { ensureDefaultBasicParams } from '../../services/basicParamsService';
 import { setCurrentTaskId } from './taskState';
 import { stripZFromGeoJSON } from '../../utils/geojson';
+import { coordsToVerticalFootPoint, getVerticalFootPointFromAny } from '../../utils/verticalFootPoint';
 
 export function uploadMainGeoJsonAction(params: {
   e: ChangeEvent<HTMLInputElement>;
@@ -127,6 +128,16 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
       // 防御性：确保导入断面为 2D 坐标
       const line2d = stripZFromGeoJSON(line as any) as any;
 
+      const coords = (line2d.geometry.coordinates as number[][]) || [];
+      const left = coords[0];
+      const right = coords[coords.length - 1];
+
+      const fallbackMid =
+        Array.isArray(left) && Array.isArray(right) ? ([(left[0] + right[0]) / 2, (left[1] + right[1]) / 2] as any) : null;
+
+      const verticalFootPoint =
+        getVerticalFootPointFromAny(props) ?? (fallbackMid ? coordsToVerticalFootPoint(fallbackMid) : null);
+
       sectionsToCreate.push({
         section_id: sectionId,
         section_name: props.section_name || props.name || `导入断面${index + 1}`,
@@ -136,12 +147,9 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
         segment_index: index,
         geometry: line2d.geometry,
         section_geometry: line2d.geometry,
+        ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
         basic_param_id: basicParamId,
       });
-
-      const coords = (line2d.geometry.coordinates as number[][]) || [];
-      const left = coords[0];
-      const right = coords[coords.length - 1];
 
       line.properties = {
         ...props,
@@ -150,6 +158,7 @@ export async function uploadSectionsGeoJsonAndCreateTaskAction(params: {
         distance,
         shoreLineId: bankId,
         bank_id: bankId,
+        ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
         leftPoint: left,
         rightPoint: right,
       };
@@ -206,11 +215,15 @@ export function exportSectionsSampleAction(params: { perpendicularData: GeoJSON.
     .map((f: any) => {
       const props = f?.properties || {};
       const bankId = String(props.bank_id || props.shoreLineId || props.bankId || '');
+      const verticalFootPoint = getVerticalFootPointFromAny(props) ?? undefined;
       return {
         type: 'Feature' as const,
         geometry: f.geometry,
         // 导出时必须带 bank_id，作为导入后按岸段分组依据
-        properties: bankId ? { bank_id: bankId } : {},
+        properties: {
+          ...(bankId ? { bank_id: bankId } : {}),
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
+        },
       };
     });
 

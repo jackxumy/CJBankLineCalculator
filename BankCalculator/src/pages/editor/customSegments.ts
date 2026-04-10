@@ -3,6 +3,11 @@ import type { Dispatch, SetStateAction } from 'react';
 import { generatePerpendicularLines } from '../../utils/geometry';
 import type { SectionParams } from '../../types/sections';
 import type { SelectionGroup } from '../../types/selection';
+import {
+  coordsToVerticalFootPoint,
+  getVerticalFootCoordsFromAny,
+  getVerticalFootPointFromAny,
+} from '../../utils/verticalFootPoint';
 
 export function applyCustomSegmentsAction(params: {
   editingGroupId: string | null;
@@ -84,6 +89,7 @@ export function applyCustomSegmentsAction(params: {
           coordinates: [newLeft, newRight],
         };
 
+        const verticalFootPoint = coordsToVerticalFootPoint(centerPoint.geometry.coordinates as any);
         const nextProps: any = {
           ...lineProp,
           crossLineId: lineProp.crossLineId,
@@ -93,6 +99,7 @@ export function applyCustomSegmentsAction(params: {
             lineProp.shoreLineId ?? (editingGroup.lineIndex !== undefined ? `line-${editingGroup.lineIndex}` : undefined),
           leftPoint: newLeft,
           rightPoint: newRight,
+          ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
           analysisConfig: editingGroup.properties || { ...(globalProperties || {}) },
         };
 
@@ -134,14 +141,19 @@ export function applyCustomSegmentsAction(params: {
 
     const leftPoint = lineProp.leftPoint as number[] | undefined;
     const rightPoint = lineProp.rightPoint as number[] | undefined;
+    const anchorPoint = getVerticalFootCoordsFromAny(lineProp) ?? undefined;
     if (!leftPoint || !rightPoint) return true;
 
     try {
-      const midPoint = turf.point([(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2]);
-      const distOnLine = turf.nearestPointOnLine(editingGroup.line, midPoint, { units: 'meters' });
+      const p =
+        Array.isArray(anchorPoint) && anchorPoint.length >= 2
+          ? anchorPoint
+          : [(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2];
+      const pt = turf.point(p as any);
+      const distOnLine = turf.nearestPointOnLine(editingGroup.line, pt, { units: 'meters' });
       const actualDist = distOnLine.properties.location ?? 0;
 
-      const distToLine = turf.distance(midPoint, distOnLine, { units: 'meters' });
+      const distToLine = turf.distance(pt, distOnLine, { units: 'meters' });
 
       if (distToLine > Math.max(globalLength, editingGroup.length) / 2 + 100) {
         return true;
@@ -170,6 +182,7 @@ export function applyCustomSegmentsAction(params: {
     const props: any = line.properties || {};
     const leftPoint = props.leftPoint;
     const rightPoint = props.rightPoint;
+    const verticalFootPoint = getVerticalFootPointFromAny(props);
     line.properties = {
       crossLineId: startId + idx,
       distance: props.distance,
@@ -177,6 +190,7 @@ export function applyCustomSegmentsAction(params: {
       shoreLineId: editingGroup.lineIndex !== undefined ? `line-${editingGroup.lineIndex}` : undefined,
       leftPoint,
       rightPoint,
+      ...(verticalFootPoint ? { vertical_foot_point: verticalFootPoint } : {}),
       analysisConfig: editingGroup.properties || { ...globalProperties },
     };
   });
