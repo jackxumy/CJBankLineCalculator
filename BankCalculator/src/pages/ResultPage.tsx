@@ -37,6 +37,30 @@ interface SectionResult {
   risk_score?: number;
 }
 
+type SectionProfilePoint = {
+  index?: number;
+  distance?: number;
+  elevation?: number;
+  x?: number;
+  y?: number;
+};
+
+type SectionProfile = {
+  id?: number;
+  task_id?: string;
+  section_id?: string;
+  section_name?: string;
+  bank_id?: string;
+  interval?: number;
+  point_count?: number;
+  profile_data?: {
+    profile?: SectionProfilePoint[];
+    interval?: number;
+    points_v?: Array<[number, number, number]>;
+  };
+  [k: string]: any;
+};
+
 type TaskProgressSnapshot = {
   taskId: string;
   taskName?: string;
@@ -73,6 +97,8 @@ function ResultPage() {
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
 
+  const selectedTaskRef = useRef<string | null>(null);
+
   const pollTimerRef = useRef<number | null>(null);
   const activePollTaskIdRef = useRef<string | null>(null);
   const lastSectionsByTaskRef = useRef<Record<string, SectionResult[]>>({});
@@ -98,7 +124,126 @@ function ResultPage() {
   const [matrixSectionName, setMatrixSectionName] = useState<string | null>(null);
   const [matrixDetail, setMatrixDetail] = useState<any | null>(null);
 
-  const openMatrixDetail = async (sectionId: string, sectionName?: string) => {
+  const profilesCacheRef = useRef<Record<string, Record<string, SectionProfile>>>({});
+  const profilesPromiseRef = useRef<Record<string, Promise<Record<string, SectionProfile>> | null>>({});
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileDetail, setProfileDetail] = useState<SectionProfile | null>(null);
+
+  useEffect(() => {
+    selectedTaskRef.current = selectedTask;
+  }, [selectedTask]);
+
+  const parseProfilesList = (data: any): any[] => {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.profiles)) return data.profiles;
+    if (Array.isArray(data.data?.profiles)) return data.data.profiles;
+    if (Array.isArray(data.data)) return data.data;
+    return [];
+  };
+
+  const ensureTaskProfilesLoaded = async (taskId: string) => {
+    if (!taskId) return {} as Record<string, SectionProfile>;
+    if (profilesCacheRef.current[taskId]) return profilesCacheRef.current[taskId];
+    if (profilesPromiseRef.current[taskId]) return profilesPromiseRef.current[taskId]!;
+
+    const promise = (async () => {
+      const res = await fetch(`/v0/bank/tasks/${encodeURIComponent(taskId)}/section-profiles`);
+      const text = await res.text();
+      let json: any = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${text?.slice(0, 500)}`);
+      }
+
+      const payload = json ?? text;
+      const list = parseProfilesList(payload);
+      const bySection: Record<string, SectionProfile> = {};
+      list.forEach((p: any) => {
+        const sid = p?.section_id ?? p?.sectionId ?? p?.sectionID;
+        if (!sid) return;
+        bySection[String(sid)] = p as SectionProfile;
+      });
+      profilesCacheRef.current[taskId] = bySection;
+      return bySection;
+    })();
+
+    profilesPromiseRef.current[taskId] = promise;
+    try {
+      return await promise;
+    } finally {
+      profilesPromiseRef.current[taskId] = null;
+    }
+  };
+
+  const getProfileSeries = (p: SectionProfile | null) => {
+    const profile = p?.profile_data?.profile;
+    if (Array.isArray(profile) && profile.length > 0) {
+      const points = profile
+        .map((pt, idx) => {
+          const d = pt?.distance;
+          const e = pt?.elevation;
+          const distance = typeof d === 'number' ? d : idx;
+          const elevation = typeof e === 'number' ? e : null;
+          if (elevation === null || !Number.isFinite(distance) || !Number.isFinite(elevation)) return null;
+          return { distance, elevation };
+        })
+        .filter(Boolean) as Array<{ distance: number; elevation: number }>;
+      return points;
+    }
+    return [] as Array<{ distance: number; elevation: number }>;
+  };
+
+  const renderProfileChart = (series: Array<{ distance: number; elevation: number }>) => {
+    if (!series || series.length < 2) {
+      return <div className="profile-empty">无剖面数据</div>;
+    }
+
+    const width = 900;
+    const height = 220;
+    const padL = 44;
+    const padR = 16;
+    const padT = 12;
+    const padB = 30;
+
+    const xs = series.map(p => p.distance);
+    const ys = series.map(p => p.elevation);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    const spanX = maxX - minX || 1;
+    const spanY = maxY - minY || 1;
+
+    const xToSvg = (x: number) => padL + ((x - minX) / spanX) * (width - padL - padR);
+    const yToSvg = (y: number) => padT + (1 - (y - minY) / spanY) * (height - padT - padB);
+
+    const polylinePoints = series.map(p => `${xToSvg(p.distance)},${yToSvg(p.elevation)}`).join(' ');
+
+    return (
+      <div className="profile-chart-wrap">
+        <svg className="profile-chart" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="断面剖面折线">
+          <line x1={padL} y1={height - padB} x2={width - padR} y2={height - padB} className="profile-axis" />
+          <line x1={padL} y1={padT} x2={padL} y2={height - padB} className="profile-axis" />
+          <polyline points={polylinePoints} className="profile-polyline" fill="none" />
+
+          <text x={padL} y={padT + 10} className="profile-label" textAnchor="start">{Number.isFinite(maxY) ? maxY.toFixed(3) : ''}</text>
+          <text x={padL} y={height - padB - 6} className="profile-label" textAnchor="start">{Number.isFinite(minY) ? minY.toFixed(3) : ''}</text>
+          <text x={padL} y={height - 8} className="profile-label" textAnchor="start">{Number.isFinite(minX) ? minX.toFixed(2) : ''}</text>
+          <text x={width - padR} y={height - 8} className="profile-label" textAnchor="end">{Number.isFinite(maxX) ? maxX.toFixed(2) : ''}</text>
+        </svg>
+      </div>
+    );
+  };
+
+  const openMatrixDetail = async (taskId: string | null, sectionId: string, sectionName?: string) => {
     if (!sectionId) return;
     setMatrixOpen(true);
     setMatrixLoading(true);
@@ -107,7 +252,13 @@ function ResultPage() {
     setMatrixSectionName(sectionName || null);
     setMatrixDetail(null);
 
-    try {
+    setProfileLoading(true);
+    setProfileError(null);
+    setProfileDetail(null);
+
+    const effectiveTaskId = taskId || selectedTaskRef.current;
+
+    const matrixPromise = (async () => {
       const res = await fetch(`/v0/bank/results/${encodeURIComponent(sectionId)}/matrix`);
       const text = await res.text();
       let json: any = null;
@@ -121,15 +272,29 @@ function ResultPage() {
         throw new Error(`HTTP ${res.status}: ${text?.slice(0, 500)}`);
       }
 
-      // 兼容不同后端包装：{matrix:{...}} / {data:{matrix:{...}}} / 直接返回 matrix
       const payload = json ?? text;
       const matrix = payload?.matrix ?? payload?.data?.matrix ?? payload?.data ?? payload;
       setMatrixDetail(matrix);
-    } catch (err: any) {
+    })().catch((err: any) => {
       setMatrixError(err?.message || '获取矩阵详情失败');
-    } finally {
+    }).finally(() => {
       setMatrixLoading(false);
-    }
+    });
+
+    const profilePromise = (async () => {
+      if (!effectiveTaskId) {
+        throw new Error('未选择任务，无法加载断面剖面');
+      }
+      const bySection = await ensureTaskProfilesLoaded(effectiveTaskId);
+      const prof = bySection[String(sectionId)] ?? null;
+      setProfileDetail(prof);
+    })().catch((err: any) => {
+      setProfileError(err?.message || '获取断面剖面失败');
+    }).finally(() => {
+      setProfileLoading(false);
+    });
+
+    await Promise.allSettled([matrixPromise, profilePromise]);
   };
 
   const closeMatrixDetail = () => {
@@ -139,6 +304,10 @@ function ResultPage() {
     setMatrixSectionId(null);
     setMatrixSectionName(null);
     setMatrixDetail(null);
+
+    setProfileLoading(false);
+    setProfileError(null);
+    setProfileDetail(null);
   };
 
   const formatCellValue = (v: any) => {
@@ -491,6 +660,7 @@ function ResultPage() {
     stopPolling();
 
     setSelectedTask(taskId);
+    selectedTaskRef.current = taskId;
     setLoading(true);
     setError(null);
     setProgressOpen(true);
@@ -784,7 +954,8 @@ function ResultPage() {
         btn.onclick = () => {
           const sid = String(p.id);
           const sname = String(p.name ?? '断面');
-          openMatrixDetail(sid, sname);
+          const tid = selectedTaskRef.current;
+          openMatrixDetail(tid, sid, sname);
         };
         root.appendChild(btn);
 
@@ -963,50 +1134,61 @@ function ResultPage() {
               <button className="matrix-modal-close" onClick={closeMatrixDetail}>关闭</button>
             </div>
 
-            {matrixLoading ? (
-              <div className="matrix-loading">加载中...</div>
-            ) : matrixError ? (
-              <div className="matrix-error">{matrixError}</div>
-            ) : matrixDetail ? (
-              <div className="matrix-body">
-                <div className="matrix-kv">
-                  <div className="matrix-kv-row"><span>case-id</span><span>{formatCellValue(matrixDetail['case-id'] ?? matrixDetail.case_id ?? matrixDetail.caseId)}</span></div>
-                  <div className="matrix-kv-row"><span>result</span><span>{formatCellValue(matrixDetail.result)}</span></div>
-                  <div className="matrix-kv-row"><span>risk-level</span><span>{Array.isArray(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
-                    ? JSON.stringify(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
-                    : formatCellValue(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)}</span></div>
+            <div className="matrix-body">
+              {matrixLoading ? (
+                <div className="matrix-loading">加载中...</div>
+              ) : matrixError ? (
+                <div className="matrix-error">{matrixError}</div>
+              ) : matrixDetail ? (
+                <>
+                  <div className="matrix-kv">
+                    <div className="matrix-kv-row"><span>case-id</span><span>{formatCellValue(matrixDetail['case-id'] ?? matrixDetail.case_id ?? matrixDetail.caseId)}</span></div>
+                    <div className="matrix-kv-row"><span>result</span><span>{formatCellValue(matrixDetail.result)}</span></div>
+                    <div className="matrix-kv-row"><span>risk-level</span><span>{Array.isArray(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
+                      ? JSON.stringify(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
+                      : formatCellValue(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)}</span></div>
 
-                  {(() => {
-                    const rawEntries = Object.entries(matrixDetail || {});
-                    const skipKeys = new Set([
-                      'case-id', 'case_id', 'caseId',
-                      'result',
-                      'risk-level', 'risk_level', 'riskLevel',
-                      'matrices',
-                    ]);
-                    const others = rawEntries.filter(([k]) => !skipKeys.has(k));
-                    if (others.length === 0) return null;
-                    return others.map(([k, v]) => (
-                      <div className="matrix-kv-row" key={k}><span>{k}</span><span>{formatCellValue(v)}</span></div>
-                    ));
-                  })()}
-                </div>
+                    {(() => {
+                      const rawEntries = Object.entries(matrixDetail || {});
+                      const skipKeys = new Set([
+                        'case-id', 'case_id', 'caseId',
+                        'result',
+                        'risk-level', 'risk_level', 'riskLevel',
+                        'matrices',
+                      ]);
+                      const others = rawEntries.filter(([k]) => !skipKeys.has(k));
+                      if (others.length === 0) return null;
+                      return others.map(([k, v]) => (
+                        <div className="matrix-kv-row" key={k}><span>{k}</span><span>{formatCellValue(v)}</span></div>
+                      ));
+                    })()}
+                  </div>
 
-                <div className="matrix-section-title">matrices</div>
-                <div className="matrix-matrices">
-                  {(() => {
-                    const matrices = matrixDetail.matrices ?? {};
-                    const entries = Object.entries(matrices);
-                    if (entries.length === 0) {
-                      return <div className="matrix-empty">无 matrices 数据</div>;
-                    }
-                    return entries.map(([k, v]) => renderMatrixTable(k, v));
-                  })()}
-                </div>
-              </div>
-            ) : (
-              <div className="matrix-empty">无数据</div>
-            )}
+                  <div className="matrix-section-title">matrices</div>
+                  <div className="matrix-matrices">
+                    {(() => {
+                      const matrices = matrixDetail.matrices ?? {};
+                      const entries = Object.entries(matrices);
+                      if (entries.length === 0) {
+                        return <div className="matrix-empty">无 matrices 数据</div>;
+                      }
+                      return entries.map(([k, v]) => renderMatrixTable(k, v));
+                    })()}
+                  </div>
+                </>
+              ) : (
+                <div className="matrix-empty">无矩阵数据</div>
+              )}
+
+              <div className="profile-section-title">断面剖面折线</div>
+              {profileLoading ? (
+                <div className="profile-loading">加载中...</div>
+              ) : profileError ? (
+                <div className="profile-error">{profileError}</div>
+              ) : (
+                renderProfileChart(getProfileSeries(profileDetail))
+              )}
+            </div>
           </div>
         </div>
       )}
