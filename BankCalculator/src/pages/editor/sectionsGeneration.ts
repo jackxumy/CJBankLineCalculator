@@ -35,11 +35,10 @@ function isFromBackendFeature(feature: any) {
 
 function extendCrossLineToFirstShorelineIntersection(params: {
   crossLine: GeoJSON.Feature<GeoJSON.LineString>;
-  shoreLineId?: string;
   uploadedData: GeoJSON.FeatureCollection;
   maxRayLengthMeters?: number;
 }) {
-  const { crossLine, shoreLineId, uploadedData } = params;
+  const { crossLine, uploadedData } = params;
   // 约束：最多延长 10000m；若仍无交点则丢弃该断面（返回 null）
   const maxRayLengthMeters = Math.max(1, Number(params.maxRayLengthMeters ?? 10000));
 
@@ -71,8 +70,6 @@ function extendCrossLineToFirstShorelineIntersection(params: {
   const features = (uploadedData?.features || []) as any[];
   for (let i = 0; i < features.length; i++) {
     const f = features[i];
-    const id = getShoreLineIdFromFeature(f, i);
-    if (shoreLineId && id === shoreLineId) continue;
 
     const parts = toLineStrings(f?.geometry);
     for (const part of parts) {
@@ -335,7 +332,6 @@ async function generateSectionsAndCreateTaskCore(params: {
         if (!params.extendToFirstShorelineIntersection) return f;
         return extendCrossLineToFirstShorelineIntersection({
           crossLine: f,
-          shoreLineId,
           uploadedData,
           maxRayLengthMeters: 10000,
         });

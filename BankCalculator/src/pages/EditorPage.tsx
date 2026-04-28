@@ -313,6 +313,98 @@ function EditorPage() {
     return { ok: true };
   };
 
+  // 一键删除错误断面：删除所有未通过检查的断面，仅保留未验证(pending/undefined)与已通过(valid)
+  // 同时与后端联动：对有 sectionId 的断面调用 DELETE /v0/bank/sections/{sectionId}
+  const deleteAllInvalidSections = async () => {
+    if (!perpendicularData || perpendicularData.features.length === 0) {
+      alert('当前没有断面可删除');
+      return;
+    }
+
+    const isInvalid = (props: any): boolean => {
+      if (!props) return false;
+      const st = props.validation_status ?? props.validationStatus;
+      const stRaw = props.validation_status_raw ?? props.validationStatusRaw;
+      const isValid = props.is_valid ?? props.isValid;
+
+      if (isValid === false) return true;
+      if (typeof st === 'string' && String(st).toLowerCase() === 'invalid') return true;
+      if (typeof stRaw === 'string' && String(stRaw).toLowerCase().startsWith('invalid')) return true;
+      return false;
+    };
+
+    const features = (perpendicularData.features as any[]) || [];
+    const invalidFeatures = features.filter((f) => isInvalid(f?.properties));
+    const removedCount = invalidFeatures.length;
+    if (removedCount <= 0) {
+      alert('没有未通过检查的断面');
+      return;
+    }
+
+    const sectionIds = invalidFeatures
+      .map((f) => {
+        const p = f?.properties || {};
+        return (p.sectionId ?? p.section_id ?? p.id) as string | undefined;
+      })
+      .filter(Boolean)
+      .map((s) => String(s));
+    const uniqueSectionIds = Array.from(new Set(sectionIds));
+    const localOnlyCount = removedCount - uniqueSectionIds.length;
+
+    const kept = features.filter((f) => !isInvalid(f?.properties));
+    const ok = window.confirm(
+      `确认删除所有未通过检查的断面？\n\n` +
+        `将删除 ${removedCount} 条，保留 ${kept.length} 条。\n` +
+        `其中可同步后端删除 ${uniqueSectionIds.length} 条${localOnlyCount > 0 ? `，仅本地删除 ${localOnlyCount} 条（缺少 sectionId）` : ''}。`,
+    );
+    if (!ok) return;
+
+    // 先更新前端（删除后索引会重排）
+    const remaining = kept.map((f: any, idx: number) => {
+      if (f?.properties) (f.properties as any).crossLineId = idx;
+      return f;
+    });
+    setPerpendicularData(turf.featureCollection(remaining as any));
+    clearSelectedCrossLines();
+    setCrossLineEditMode('none');
+
+    // 再同步后端（仅删除有 sectionId 的）
+    if (uniqueSectionIds.length === 0) {
+      alert(`已删除 ${removedCount} 条断面（未同步到后端）`);
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      uniqueSectionIds.map((sectionId) =>
+        fetch(`/v0/bank/sections/${encodeURIComponent(sectionId)}`, {
+          method: 'DELETE',
+        }).then((res) => {
+          if (!res.ok) throw new Error(res.statusText);
+          return true;
+        }),
+      ),
+    );
+
+    const failCount = results.filter((r) => r.status === 'rejected').length;
+    if (failCount > 0) {
+      console.error(
+        '一键删除错误断面：后端删除失败明细:',
+        results
+          .map((r, idx) => ({
+            sectionId: uniqueSectionIds[idx],
+            ok: r.status === 'fulfilled',
+            reason: r.status === 'rejected' ? (r.reason as any)?.message || String(r.reason) : undefined,
+          }))
+          .filter((x) => !x.ok),
+      );
+      alert(
+        `已删除 ${removedCount} 条断面；后端同步成功 ${uniqueSectionIds.length - failCount}，失败 ${failCount}`,
+      );
+    } else {
+      alert(`已删除 ${removedCount} 条断面（已同步到后端）`);
+    }
+  };
+
   // 当断面集合变化时，自动异步触发后端验证
   useEffect(() => {
     if (!perpendicularData || perpendicularData.features.length === 0) return;
@@ -1520,6 +1612,7 @@ function EditorPage() {
         isSelectingCrossLines={isSelectingCrossLines}
         toggleCrossLineSelection={toggleCrossLineSelection}
         validateAllPendingSections={validateAllPendingSections}
+        deleteAllInvalidSections={deleteAllInvalidSections}
         crossLineControlMode={crossLineControlMode}
         setCrossLineControlMode={setCrossLineControlMode}
         crossLineEditMode={crossLineEditMode}

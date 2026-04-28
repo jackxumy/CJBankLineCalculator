@@ -64,6 +64,7 @@ interface EditorSidebarProps {
   isSelectingCrossLines: boolean;
   toggleCrossLineSelection: () => void;
   validateAllPendingSections: () => void;
+  deleteAllInvalidSections: () => Promise<void>;
   crossLineControlMode: 'shoreline' | 'free';
   setCrossLineControlMode: (mode: 'shoreline' | 'free') => void;
   crossLineEditMode: 'none' | 'select' | 'add';
@@ -129,6 +130,7 @@ function EditorSidebar(props: EditorSidebarProps) {
     isSelectingCrossLines,
     toggleCrossLineSelection,
     validateAllPendingSections,
+    deleteAllInvalidSections,
     crossLineControlMode,
     setCrossLineControlMode,
     crossLineEditMode,
@@ -261,6 +263,22 @@ function EditorSidebar(props: EditorSidebarProps) {
                   aria-label="断面检查"
                 >
                   <CheckCircle2 size={16} /> 断面检查
+                </button>
+              </div>
+            )}
+
+            {perpendicularData && perpendicularData.features.length > 0 && (
+              <div className={styles.mt12}>
+                <button
+                  type="button"
+                  className={styles.outlineButton}
+                  onClick={() => {
+                    void deleteAllInvalidSections();
+                  }}
+                  title="一键删除所有未通过检查的断面（仅保留未验证与已通过）"
+                  aria-label="一键删除错误断面"
+                >
+                  <Trash2 size={16} /> 一键删除
                 </button>
               </div>
             )}
