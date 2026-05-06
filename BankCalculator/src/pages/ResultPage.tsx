@@ -111,7 +111,7 @@ function ResultPage() {
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showSections, setShowSections] = useState(true);
+  const [showSections, setShowSections] = useState(false);
 
   const [progressOpen, setProgressOpen] = useState(false);
   const [progress, setProgress] = useState<TaskProgressSnapshot | null>(null);
