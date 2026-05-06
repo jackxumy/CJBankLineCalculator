@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { SectionParams } from '../types/sections';
+import TiffResourcePicker from './TiffResourcePicker';
 import styles from './Modal.module.css';
 
 interface SectionPropertiesModalProps {
@@ -19,6 +20,31 @@ function SectionPropertiesModal({
 }: SectionPropertiesModalProps) {
   const [params, setParams] = useState<SectionParams>(config || {});
   const [isSaving, setIsSaving] = useState(false);
+
+  const updateDemField = (field: 'bench_id' | 'ref_id', nextValue: string) => {
+    setParams((prev) => {
+      const next = { ...prev } as SectionParams & Record<string, any>;
+      if (nextValue) {
+        next[field] = nextValue;
+      } else {
+        delete next[field];
+      }
+      return next;
+    });
+  };
+
+  const extractYear = (value?: string) => {
+    const match = String(value || '').match(/\d{4}/);
+    return match ? match[0] : '';
+  };
+
+  const normalizeTimepoint = (value?: string) => {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (!digits) return '';
+    if (digits.length >= 6) return digits.slice(0, 6);
+    if (digits.length === 4) return `${digits}01`;
+    return digits;
+  };
 
   const sanitizeFileName = (name: string) => {
     const base = (name || 'config').trim() || 'config';
@@ -166,25 +192,23 @@ function SectionPropertiesModal({
           <legend className={styles.legend}>DEM参数</legend>
 
           <div className={styles.grid2}>
-            <div>
-              <label>基准DEM (bench_id):</label>
-              <input
-                type="text"
-                value={params.bench_id || ''}
-                onChange={(e) => setParams({ ...params, bench_id: e.target.value })}
-                className={styles.input}
-              />
-            </div>
+            <TiffResourcePicker
+              label="基准DEM (bench_id):"
+              value={params.bench_id || ''}
+              onConfirm={(nextValue) => updateDemField('bench_id', nextValue)}
+              defaultUploadSegment={params.segment || ''}
+              defaultUploadYear={extractYear(params.current_timepoint || params.comparison_timepoint)}
+              defaultUploadTimepoint={normalizeTimepoint(params.current_timepoint || params.comparison_timepoint)}
+            />
 
-            <div>
-              <label>参考DEM (ref_id):</label>
-              <input
-                type="text"
-                value={params.ref_id || ''}
-                onChange={(e) => setParams({ ...params, ref_id: e.target.value })}
-                className={styles.input}
-              />
-            </div>
+            <TiffResourcePicker
+              label="参考DEM (ref_id):"
+              value={params.ref_id || ''}
+              onConfirm={(nextValue) => updateDemField('ref_id', nextValue)}
+              defaultUploadSegment={params.segment || ''}
+              defaultUploadYear={extractYear(params.comparison_timepoint || params.current_timepoint)}
+              defaultUploadTimepoint={normalizeTimepoint(params.comparison_timepoint || params.current_timepoint)}
+            />
           </div>
         </fieldset>
 

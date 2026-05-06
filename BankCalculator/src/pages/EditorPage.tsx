@@ -51,24 +51,24 @@ function EditorPage() {
   // 全局垂线配置（用于首次绘制整个 GeoJSON）
   const [globalInterval, setGlobalInterval] = useState<number>(1000);
   const [globalLength, setGlobalLength] = useState<number>(1000);
-  
+
   // 当前正在编辑的组ID
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
-  
+
   const [showCrossLines, setShowCrossLines] = useState<boolean>(true);
-  
+
   // 全局属性配置
   const [globalProperties, setGlobalProperties] = useState<SectionParams | null>(null);
   // 属性配置弹窗状态
   const [showGlobalPropertiesModal, setShowGlobalPropertiesModal] = useState<boolean>(false);
   const [editingPropertiesGroupId, setEditingPropertiesGroupId] = useState<string | null>(null);
-  
+
   // 新增状态：控制岸段选择模式
   const [isSelectingShoreLines, setIsSelectingShoreLines] = useState<boolean>(false);
-  
+
   // 新增状态：控制起止点选择模式
   const [isSelectingStartEnd, setIsSelectingStartEnd] = useState<boolean>(false);
-  
+
   // 新增状态：选中的用于生成垂线的线段（存储线的唯一标识）
   const [selectedLines, setSelectedLines] = useState<Set<string>>(new Set());
 
@@ -80,7 +80,7 @@ function EditorPage() {
   const [bankList, setBankList] = useState<any[]>([]);
 
   const prevSelectedBankGroupRef = useRef<string[]>([]);
-  
+
   // 新增状态：控制断面选择模式
   const [isSelectingCrossLines, setIsSelectingCrossLines] = useState<boolean>(false);
 
@@ -89,13 +89,13 @@ function EditorPage() {
 
   // 新增状态：断面编辑控制模式（岸段线/自由）
   const [crossLineControlMode, setCrossLineControlMode] = useState<'shoreline' | 'free'>('shoreline');
-  
+
   // 新增状态：断面编辑模式
   // - 'none': 不进行选择/添加（用于“释放选择”）
   // - 'select': 选择现有断面
   // - 'add': 新建断面
   const [crossLineEditMode, setCrossLineEditMode] = useState<'none' | 'select' | 'add'>('none');
-  
+
   // 新增状态：选中的断面索引
   const [selectedCrossLineIndex, setSelectedCrossLineIndex] = useState<number | null>(null);
 
@@ -354,8 +354,8 @@ function EditorPage() {
     const kept = features.filter((f) => !isInvalid(f?.properties));
     const ok = window.confirm(
       `确认删除所有未通过检查的断面？\n\n` +
-        `将删除 ${removedCount} 条，保留 ${kept.length} 条。\n` +
-        `其中可同步后端删除 ${uniqueSectionIds.length} 条${localOnlyCount > 0 ? `，仅本地删除 ${localOnlyCount} 条（缺少 sectionId）` : ''}。`,
+      `将删除 ${removedCount} 条，保留 ${kept.length} 条。\n` +
+      `其中可同步后端删除 ${uniqueSectionIds.length} 条${localOnlyCount > 0 ? `，仅本地删除 ${localOnlyCount} 条（缺少 sectionId）` : ''}。`,
     );
     if (!ok) return;
 
@@ -628,6 +628,266 @@ function EditorPage() {
     }
   };
 
+  type SmoothParams = {
+    passes: number;
+    lookAhead: number;
+    minSpan: number;
+    maxSpan: number;
+    nearFactor: number;
+  };
+
+  const smoothLineCoordinates = (coords: number[][], params: SmoothParams): number[][] => {
+    const cleaned = (coords || [])
+      .map((c) => [Number(c?.[0]), Number(c?.[1])])
+      .filter((c) => Number.isFinite(c[0]) && Number.isFinite(c[1])) as number[][];
+
+    if (cleaned.length < 3) return cleaned;
+
+    const dist = (a: number[], b: number[]) => {
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    const pointSegDist = (p: number[], a: number[], b: number[]) => {
+      const abx = b[0] - a[0];
+      const aby = b[1] - a[1];
+      const apx = p[0] - a[0];
+      const apy = p[1] - a[1];
+      const ab2 = abx * abx + aby * aby;
+      if (ab2 <= 0) return dist(p, a);
+      const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / ab2));
+      const qx = a[0] + abx * t;
+      const qy = a[1] + aby * t;
+      const dx = p[0] - qx;
+      const dy = p[1] - qy;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    const isClosed = cleaned.length >= 4 && dist(cleaned[0], cleaned[cleaned.length - 1]) <= 1e-12;
+    let base = isClosed ? cleaned.slice(0, -1) : cleaned.slice();
+    if (base.length < 3) return cleaned;
+
+    let total = 0;
+    for (let i = 0; i < base.length - 1; i++) total += dist(base[i], base[i + 1]);
+    if (isClosed && base.length > 2) total += dist(base[base.length - 1], base[0]);
+    const edgeCount = isClosed ? base.length : Math.max(1, base.length - 1);
+    const avgStep = Math.max(total / Math.max(1, edgeCount), 1e-9);
+
+    // 使用传入的平滑参数（首次平滑时保存并在后续迭代中复用），避免随迭代次数提高约束
+    const passes = params.passes;
+    const lookAhead = params.lookAhead;
+    const minSpan = params.minSpan;
+    const maxSpan = params.maxSpan;
+    const nearFactor = params.nearFactor;
+
+    for (let pass = 0; pass < passes; pass++) {
+      if (base.length < (isClosed ? 6 : 4)) break;
+
+      const next: number[][] = [];
+      let i = 0;
+      const lastIdx = base.length - 1;
+      const endIdx = isClosed ? base.length : lastIdx;
+
+      while (i < endIdx) {
+        const curr = base[i];
+        next.push(curr);
+
+        // 开放线保护首尾，避免端点拓扑漂移
+        if (!isClosed && (i === 0 || i >= lastIdx - minSpan)) {
+          i += 1;
+          continue;
+        }
+
+        let bestJ = -1;
+        let bestNear = Number.POSITIVE_INFINITY;
+        const maxJ = Math.min(lastIdx, i + lookAhead);
+
+        for (let j = i + minSpan; j <= maxJ; j++) {
+          const near = dist(curr, base[j]);
+          if (near < bestNear) {
+            bestNear = near;
+            bestJ = j;
+          }
+        }
+
+        if (bestJ <= i + minSpan) {
+          i += 1;
+          continue;
+        }
+
+        // 保护岛屿：如果跨越距离太大（折点少），直接跳过不删除
+        const span = bestJ - i;
+        if (span > maxSpan) {
+          i += 1;
+          continue;
+        }
+
+        const nearLimit = avgStep * nearFactor;
+        // 增加最小阈值检查：如果最近距离小于avgStep的0.35，说明是折点少的区域，保护它
+        if (bestNear > nearLimit || bestNear < avgStep * 0.35) {
+          i += 1;
+          continue;
+        }
+
+        let arcLen = 0;
+        let maxDev = 0;
+        for (let k = i; k < bestJ; k++) {
+          arcLen += dist(base[k], base[k + 1]);
+        }
+        for (let k = i + 1; k < bestJ; k++) {
+          maxDev = Math.max(maxDev, pointSegDist(base[k], base[i], base[bestJ]));
+        }
+
+        const chord = Math.max(dist(base[i], base[bestJ]), 1e-12);
+        const detourRatio = arcLen / chord;
+
+        // 仅删除“走了明显弯路且偏离主线”的局部突起，保留原有大尺度弯曲。
+        const shouldClip =
+          detourRatio > 1.15 &&
+          maxDev > avgStep * 0.7 &&
+          arcLen > bestNear * 1.2;
+
+        if (shouldClip) {
+          i = bestJ;
+          continue;
+        }
+
+        i += 1;
+      }
+
+      if (!isClosed) {
+        const tail = base[lastIdx];
+        const prev = next[next.length - 1];
+        if (!prev || prev[0] !== tail[0] || prev[1] !== tail[1]) {
+          next.push(tail);
+        }
+      }
+
+      // 闭合线保形：保证最少点数并闭合，不做均值平滑，避免整圈缩小。
+      if (isClosed && next.length >= 3) {
+        base = next;
+      } else if (!isClosed && next.length >= 2) {
+        base = next;
+      } else {
+        break;
+      }
+    }
+
+    if (isClosed) {
+      if (base.length < 3) return cleaned;
+      const first = base[0];
+      const last = base[base.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) {
+        return [...base, [first[0], first[1]]];
+      }
+      return base;
+    }
+
+    return base;
+  };
+
+  const smoothSelectedShoreLines = () => {
+    if (!uploadedData || uploadedData.features.length === 0) {
+      alert('请先加载岸段数据');
+      return;
+    }
+
+    if (selectedLines.size === 0) {
+      alert('请先点击拾取需要平滑的岸段');
+      return;
+    }
+
+    let changedCount = 0;
+    const nextFeatures = (uploadedData.features as any[]).map((f, index) => {
+      const shoreLineId = getShoreLineId(f, index);
+      if (!selectedLines.has(shoreLineId)) return f;
+
+      const props = f?.properties || {};
+      const prevLevelRaw = props.smooth_level ?? props.smoothLevel;
+      const prevLevel = Number.isFinite(Number(prevLevelRaw)) ? Number(prevLevelRaw) : 0;
+      const nextLevel = prevLevel + 1;
+
+      // const computeParamsFromLevel = (lvl: number) => {
+      //   const passes = Math.min(3, Math.max(1, lvl));
+      //   const lookAhead = Math.min(20, 10 + lvl * 1.5);
+      //   const minSpan = 3;
+      //   const maxSpan = 12;
+      //   const nearFactor = Math.min(1.8, 1.5 + lvl * 0.08);
+      //   return { passes, lookAhead, minSpan, maxSpan, nearFactor } as any;
+      // };
+
+      const computeParamsFromLevel = () => {
+        const passes = 10;        // 每轮执行3次平滑，力度拉满
+        const lookAhead = 20;   // 往前看更远，能识别更大范围的凸起
+        const minSpan = 2;      // 放宽最小跨点，小折点也能处理
+        const maxSpan = 30;     // 允许跨更多点，删掉较大突出部位
+        const nearFactor = 20.2; // 大幅放宽距离阈值，更容易判定为可拉直
+        return { passes, lookAhead, minSpan, maxSpan, nearFactor } as any;
+      };
+
+      // 首次平滑时计算并保存参数；后续复用该参数，避免随迭代次数提高约束
+      const existingParams = props.smooth_params as SmoothParams | undefined;
+      const paramsToUse: SmoothParams = existingParams ?? computeParamsFromLevel();
+
+      if (f?.geometry?.type === 'LineString') {
+        const coords = (f.geometry.coordinates as number[][]) || [];
+        const smoothedCoords = smoothLineCoordinates(coords, paramsToUse);
+        if (smoothedCoords.length < 2) return f;
+        changedCount++;
+        return {
+          ...f,
+          geometry: {
+            type: 'LineString',
+            coordinates: smoothedCoords,
+          },
+          properties: {
+            ...props,
+            smooth_level: nextLevel,
+            smooth_params: paramsToUse,
+            smoothed_at: Date.now(),
+          },
+        };
+      }
+
+      if (f?.geometry?.type === 'MultiLineString') {
+        const parts = (f.geometry.coordinates as number[][][]) || [];
+        const smoothedParts = parts
+          .map((part) => smoothLineCoordinates(part || [], paramsToUse))
+          .filter((part) => part.length >= 2);
+
+        if (smoothedParts.length === 0) return f;
+        changedCount++;
+        return {
+          ...f,
+          geometry: {
+            type: 'MultiLineString',
+            coordinates: smoothedParts,
+          },
+          properties: {
+            ...props,
+            smooth_level: nextLevel,
+            smooth_params: paramsToUse,
+            smoothed_at: Date.now(),
+          },
+        };
+      }
+
+      return f;
+    });
+
+    if (changedCount <= 0) {
+      alert('未找到可平滑的线要素（仅支持 LineString / MultiLineString）');
+      return;
+    }
+
+    setUploadedData({
+      ...uploadedData,
+      features: nextFeatures,
+    } as any);
+
+  };
+
   const loadBankGroup = async (regionCode: string) => {
     if (!regionCode) return;
     try {
@@ -848,14 +1108,14 @@ function EditorPage() {
       setIsSelectingCrossLines(false); // 关闭断面选择模式
     }
   };
-  
+
   // 全选或取消全选所有岸段
   const toggleSelectAllShoreLines = () => {
     if (!uploadedData) {
       alert('请先上传 GeoJSON 数据');
       return;
     }
-    
+
     // 如果当前已经全选了（选中数量等于可选线要素数量），则清空
     const selectableIds: string[] = [];
     uploadedData.features.forEach((f: any, index: number) => {
@@ -870,7 +1130,7 @@ function EditorPage() {
       setSelectedLines(new Set(selectableIds));
     }
   };
-  
+
   // 切换起止点选择模式
   const toggleStartEndSelection = () => {
     setIsSelectingStartEnd(!isSelectingStartEnd);
@@ -881,7 +1141,7 @@ function EditorPage() {
       setIsSelectingCrossLines(false); // 关闭断面选择模式
     }
   };
-  
+
   // 切换断面选择模式
   const toggleCrossLineSelection = () => {
     const next = !isSelectingCrossLines;
@@ -1136,7 +1396,7 @@ function EditorPage() {
       alert(`发送岸段失败: ${err?.message || String(err)}`);
     }
   };
-  
+
   // 在指定位置新建断面
   const createCrossLineAtPoint = async (line: GeoJSON.Feature<GeoJSON.LineString>, distanceOnLine: number) => {
     await createCrossLineAtPointAction({
@@ -1149,7 +1409,7 @@ function EditorPage() {
       setPerpendicularData,
     });
   };
-  
+
   // 删除选中的断面
   const deleteSelectedCrossLine = async () => {
     const indices = getSelectedCrossLineIndices();
@@ -1181,7 +1441,7 @@ function EditorPage() {
     // 单删也清空多选，避免索引错位
     setSelectedCrossLineIndices(new Set());
   };
-  
+
   // 平移选中的断面
   const translateSelectedCrossLine = async (offsetMeters: number) => {
     await translateSelectedCrossLineAction({
@@ -1346,7 +1606,7 @@ function EditorPage() {
       setPerpendicularData,
     });
   };
-  
+
   // 为选中的断面配置属性
   const configureSelectedCrossLineProperties = async () => {
     await configureSelectedCrossLinePropertiesAction({
@@ -1576,6 +1836,7 @@ function EditorPage() {
         bankList={bankList}
         deleteBankById={deleteBankById}
         deleteBanksByIds={deleteBanksByIds}
+        smoothSelectedShoreLines={smoothSelectedShoreLines}
         selectedBankGroup={selectedBankGroup}
         setSelectedBankGroup={handleSelectBanksFromDropdown}
         deleteBankGroup={deleteBankGroup}
@@ -1654,17 +1915,17 @@ function EditorPage() {
         if (editingPropertiesGroupId.startsWith('cross-line-')) {
           const index = parseInt(editingPropertiesGroupId.replace('cross-line-', ''));
           if (!perpendicularData || !perpendicularData.features[index]) return null;
-          
+
           const currentLine = perpendicularData.features[index];
           const currentConfig = (currentLine.properties as any)?.properties || globalProperties;
           const sectionId = (currentLine.properties as any)?.sectionId;
-          
+
           if (!currentConfig) {
             alert('断面参数未加载，请稍后再试');
             setEditingPropertiesGroupId(null);
             return null;
           }
-          
+
           return (
             <SectionPropertiesModal
               config={currentConfig}
@@ -1687,18 +1948,18 @@ function EditorPage() {
             />
           );
         }
-        
+
         // 组属性配置
         const group = groups.find(g => g.id === editingPropertiesGroupId);
         if (!group) return null;
-        
+
         const groupConfig = group.properties || globalProperties;
         if (!groupConfig) {
           alert('参数未加载，请先创建断面');
           setEditingPropertiesGroupId(null);
           return null;
         }
-        
+
         return (
           <SectionPropertiesModal
             config={groupConfig}

@@ -28,6 +28,7 @@ interface EditorSidebarProps {
   bankList: any[];
   deleteBankById: (bankId: string) => void;
   deleteBanksByIds: (bankIds: string[]) => void;
+  smoothSelectedShoreLines: () => void;
   selectedBankGroup: string[];
   setSelectedBankGroup: (v: string[]) => void;
   deleteBankGroup: () => void;
@@ -97,6 +98,7 @@ function EditorSidebar(props: EditorSidebarProps) {
     bankList,
     deleteBankById,
     deleteBanksByIds,
+    smoothSelectedShoreLines,
     basicParamsList,
     selectedBasicParamIdState,
     // totalSelectedSegments, (unused)
@@ -221,7 +223,7 @@ function EditorSidebar(props: EditorSidebarProps) {
                     ))}
               </select>
             </div>
-            <div className={styles.mt12}>
+            <div className={`${styles.mt12} ${styles.buttonGrid}`}>
               <button
                 type="button"
                 className={styles.outlineButton}
@@ -250,6 +252,16 @@ function EditorSidebar(props: EditorSidebarProps) {
                 disabled={!activeSelectedBank}
               >
                 <Trash2 size={16} /> 删除
+              </button>
+              <button
+                type="button"
+                className={styles.outlineButton}
+                onClick={smoothSelectedShoreLines}
+                title="对拾取选中的岸段执行平滑；可多次点击逐步增强"
+                aria-label="平滑岸段"
+                disabled={!uploadedData || selectedLinesSize === 0}
+              >
+                <Zap size={16} /> 平滑
               </button>
             </div>
 
