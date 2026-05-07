@@ -489,8 +489,11 @@ export async function generateComputeSectionsAndCreateTask(params: {
   });
 }
 
-export async function runCurrentTask(params: { perpendicularData: GeoJSON.FeatureCollection }) {
-  const { perpendicularData } = params;
+export async function runCurrentTask(params: { 
+  perpendicularData: GeoJSON.FeatureCollection;
+  setPage?: (page: 'home' | 'editor' | 'result', taskId?: string) => void;
+}) {
+  const { perpendicularData, setPage } = params;
 
   if (!perpendicularData || perpendicularData.features.length === 0) {
     alert('请先绘制断面');
@@ -505,6 +508,10 @@ export async function runCurrentTask(params: { perpendicularData: GeoJSON.Featur
 
   try {
     console.log(`开始分析任务: ${taskId}`);
+
+    if (setPage) {
+      setPage('result', taskId);
+    }
 
     const response = await fetch(`/v0/bank/tasks/${taskId}/run`, {
       method: 'POST',

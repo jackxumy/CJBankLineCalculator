@@ -35,7 +35,12 @@ import {
 import { fetchBasicParamDetailAsSectionParams, fetchBasicParamsList } from './editor/basicParamsApi';
 import { getCurrentTaskId } from './editor/taskState';
 
-function EditorPage() {
+interface EditorPageProps {
+  setPage?: (page: 'home' | 'editor' | 'result', taskId?: string) => void;
+}
+
+function EditorPage(props: EditorPageProps) {
+  const { setPage } = props;
   // 上传的 GeoJSON 数据 (主线)
   const [uploadedData, setUploadedData] = useState<GeoJSON.FeatureCollection | null>(null);
   // 生成的垂线数据
@@ -78,6 +83,10 @@ function EditorPage() {
   const [selectedBankGroup, setSelectedBankGroup] = useState<string[]>([]);
   // 当前可选的岸段列表（按 bank_id）
   const [bankList, setBankList] = useState<any[]>([]);
+  // 已加载到地图上的岸段列表
+  const [loadedBanks, setLoadedBanks] = useState<any[]>([]);
+  // 已加载岸段的多选状态
+  const [selectedLoadedBanks, setSelectedLoadedBanks] = useState<Set<string>>(new Set());
 
   const prevSelectedBankGroupRef = useRef<string[]>([]);
 
@@ -521,6 +530,13 @@ function EditorPage() {
         return next;
       });
 
+      // 添加到已加载岸段列表
+      setLoadedBanks((prev) => {
+        const exists = prev.some((bank) => String(bank.bank_id) === String(b.bank_id));
+        if (exists) return prev;
+        return [...prev, b];
+      });
+
       // 不清空现有选择，允许多条岸段共存。仅将编辑模式调整为默认关闭，避免干扰当前操作。
       setIsSelectingShoreLines(false);
       setIsSelectingStartEnd(false);
@@ -626,6 +642,39 @@ function EditorPage() {
     } else {
       alert(`已批量删除 ${successIds.length} 条岸段`);
     }
+  };
+
+  // 清除已加载的岸段：仅从地图与本地列表移除，不删除后端数据
+  const deleteLoadedBanks = () => {
+    const selected = Array.from(selectedLoadedBanks);
+    if (selected.length === 0) {
+      alert('请先选择要清除的岸段');
+      return;
+    }
+
+    const ok = window.confirm(`确认从地图上清除已选的 ${selected.length} 条岸段？`);
+    if (!ok) return;
+
+    setLoadedBanks((prev) => prev.filter((bank) => !selected.includes(String(bank.bank_id))));
+
+    setUploadedData((prev) => {
+      if (!prev) return prev;
+      const features = (prev.features || []).filter((f: any) => {
+        const p = f?.properties || {};
+        const id = String(p.bank_id || p.bankId || '');
+        return !selected.includes(id);
+      });
+      return { ...prev, features } as any;
+    });
+
+    setSelectedLines((prev) => {
+      if (!prev || prev.size === 0) return prev;
+      const next = new Set(prev);
+      selected.forEach((id) => next.delete(id));
+      return next.size === prev.size ? prev : next;
+    });
+
+    setSelectedLoadedBanks(new Set());
   };
 
   type SmoothParams = {
@@ -1678,7 +1727,7 @@ function EditorPage() {
       return;
     }
 
-    await runCurrentTask({ perpendicularData });
+    await runCurrentTask({ perpendicularData, setPage });
   };
 
   // 应用自定义线段配置：更新当前编辑组的垂线
@@ -1840,6 +1889,10 @@ function EditorPage() {
         selectedBankGroup={selectedBankGroup}
         setSelectedBankGroup={handleSelectBanksFromDropdown}
         deleteBankGroup={deleteBankGroup}
+        loadedBanks={loadedBanks}
+        selectedLoadedBanks={selectedLoadedBanks}
+        setSelectedLoadedBanks={setSelectedLoadedBanks}
+        deleteLoadedBanks={deleteLoadedBanks}
         basicParamsList={basicParamsList}
         selectedBasicParamIdState={selectedBasicParamIdState}
         totalSelectedSegments={totalSelectedSegments}

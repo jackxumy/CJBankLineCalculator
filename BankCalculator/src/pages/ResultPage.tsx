@@ -98,29 +98,44 @@ const CLOSE_LOOP_DISTANCE_METERS = 2000;
 const MATRIX_GROUPS = [
   {
     title: '水流动力指标',
-    matrixKey: 'water_flow_power_matrix',
-    resultKey: 'water_flow_power_result_matrix',
-    rowNames: ['抗冲流速(Ky)', '造床流量当量(PQ)', '水位变幅(Zd)']
+    weightKey: 'wRE',
+    indicatorKeys: [
+      { label: '抗冲流速(Ky)', key: 'Ky' },
+      { label: '造床流量当量(PQ)', key: 'PQ' },
+      { label: '水位变幅(Zd)', key: 'Zd' }
+    ]
   },
   {
     title: '河床演变指标',
-    matrixKey: 'riverbed_evolution_matrix',
-    resultKey: 'riverbed_evolution_result_matrix',
-    rowNames: ['岸坡坡比(Sa)', '近岸冲刷(Ln)', '滩槽高差(Zb)']
+    weightKey: 'wNM',
+    indicatorKeys: [
+      { label: '岸坡坡比(Sa)', key: 'Sa' },
+      { label: '近岸冲刷(Ln)', key: 'Ln' },
+      { label: '滩槽高差(Zb)', key: 'Zb' }
+    ]
   },
   {
     title: '地质工程指标',
-    matrixKey: 'geology_engineering_matrix',
-    resultKey: 'geology_engineering_result_matrix',
-    rowNames: ['土体组成(Dsed)', '岸坡防护(PL)', '荷载控制(LC)']
+    weightKey: 'wGE',
+    indicatorKeys: [
+      { label: '土体组成(Dsed)', key: 'Dsed' },
+      { label: '岸坡防护(PL)', key: 'PL' },
+      { label: '荷载控制(LC)', key: 'LC' }
+    ]
   }
 ] as const;
 
-function ResultPage() {
+interface ResultPageProps {
+  initialTaskId?: string;
+}
+
+function ResultPage(props: ResultPageProps) {
+  const { initialTaskId } = props;
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
 
   const selectedTaskRef = useRef<string | null>(null);
+  const autoOpenTaskRef = useRef<string | null>(null);
 
   const pollTimerRef = useRef<number | null>(null);
   const activePollTaskIdRef = useRef<string | null>(null);
@@ -129,12 +144,13 @@ function ResultPage() {
   const sectionClickHandlerRef = useRef<((e: any) => void) | null>(null);
   const sectionEnterHandlerRef = useRef<(() => void) | null>(null);
   const sectionLeaveHandlerRef = useRef<(() => void) | null>(null);
+  const [mapReady, setMapReady] = useState(false);
 
   const [taskList, setTaskList] = useState<Task[]>([]);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showSections, setShowSections] = useState(false);
+  const [showSections, setShowSections] = useState(true);
 
   const [progressOpen, setProgressOpen] = useState(false);
   const [progress, setProgress] = useState<TaskProgressSnapshot | null>(null);
@@ -156,6 +172,11 @@ function ResultPage() {
   useEffect(() => {
     selectedTaskRef.current = selectedTask;
   }, [selectedTask]);
+
+  useEffect(() => {
+    if (!initialTaskId) return;
+    setSelectedTask(initialTaskId);
+  }, [initialTaskId]);
 
   const parseProfilesList = (data: any): any[] => {
     if (!data) return [];
@@ -282,7 +303,7 @@ function ResultPage() {
     const effectiveTaskId = taskId || selectedTaskRef.current;
 
     const matrixPromise = (async () => {
-      const res = await fetch(`/v0/bank/results/${encodeURIComponent(sectionId)}/matrix`);
+      const res = await fetch(`/v0/bank/results/${encodeURIComponent(sectionId)}`);
       const text = await res.text();
       let json: any = null;
       try {
@@ -296,7 +317,19 @@ function ResultPage() {
       }
 
       const payload = json ?? text;
-      const matrix = payload?.matrix ?? payload?.data?.matrix ?? payload?.data ?? payload;
+      const result = payload?.result ?? payload?.data?.result ?? payload?.data ?? payload;
+      const indicators = result?.indicators ?? payload?.indicators ?? {};
+      const matrices = indicators?.matrices ?? result?.matrices ?? payload?.matrices ?? {};
+      const matrix = {
+        ...result,
+        ...indicators,
+        matrices,
+        weight_matrix: matrices.weight_matrix ?? indicators.weight_matrix ?? result?.weight_matrix,
+        concat_matrix: matrices.concat_matrix ?? indicators.concat_matrix ?? result?.concat_matrix,
+        result_matrix: matrices.result_matrix ?? indicators.result_matrix ?? result?.result_matrix,
+        risk_level: result?.['risk-level'] ?? result?.risk_level ?? result?.riskLevel,
+        result: result?.result ?? indicators?.result ?? payload?.result?.result,
+      };
       console.log('ResultPage: matrix detail payload:', payload);
       console.log('ResultPage: matrix detail resolved matrix:', matrix);
       setMatrixDetail(matrix);
@@ -351,57 +384,109 @@ function ResultPage() {
     }
   };
 
-  const normalizeMatrixRows = (matrix: any) => {
-    if (!matrix) return [] as any[][];
-    if (Array.isArray(matrix)) {
-      if (matrix.every(row => Array.isArray(row))) {
-        return matrix as any[][];
-      }
-      return matrix.map((item) => (Array.isArray(item) ? item : [item]));
-    }
-    if (Array.isArray(matrix.rows)) return matrix.rows;
-    if (Array.isArray(matrix.data)) return matrix.data;
-    return [] as any[][];
+  const generateMatrixCSV = () => {
+    if (!matrixDetail) return '';
+
+    const rows: string[][] = [];
+    
+    // 头部信息
+    rows.push(['断面矩阵详情']);
+    rows.push([]);
+    rows.push(['字段', '值']);
+    rows.push(['断面名称', String(matrixSectionName || '-')]);
+    rows.push(['断面ID', String(matrixSectionId || '-')]);
+    rows.push(['Task ID', formatCellValue(matrixDetail.task_id ?? matrixDetail.taskId)]);
+    rows.push(['Case ID', formatCellValue(matrixDetail['case-id'] ?? matrixDetail.case_id ?? matrixDetail.caseId)]);
+    rows.push(['区域代码', formatCellValue(matrixDetail.region_code ?? matrixDetail.regionCode)]);
+    rows.push(['岸段ID', formatCellValue(matrixDetail.bank_id ?? matrixDetail.bankId)]);
+    rows.push(['运行时间', formatCellValue(matrixDetail.run_time ?? matrixDetail.runTime)]);
+    rows.push(['水流量', formatCellValue(matrixDetail.water_qs ?? matrixDetail?.indicators?.water_qs ?? matrixDetail?.water_qs)]);
+    rows.push(['潮差', formatCellValue(matrixDetail.tidal_level ?? matrixDetail?.indicators?.tidal_level ?? matrixDetail?.tidal_level)]);
+    rows.push(['风险等级', formatCellValue(matrixDetail.risk_level ?? matrixDetail.riskLevel)]);
+    rows.push([]);
+    
+    // 指标矩阵部分
+    const indicators = matrixDetail?.indicators?.thresholds ?? matrixDetail?.thresholds ?? {};
+    
+    MATRIX_GROUPS.forEach((group, groupIdx) => {
+      const weightKey = group.weightKey as keyof typeof indicators;
+      const weightValues = indicators?.[weightKey];
+      const subThresholds = indicators?.sub_thresholds || {};
+      const groupWeight = Array.isArray(indicators?.wRL) ? indicators.wRL[groupIdx] : weightValues;
+      
+      // 组标题
+      rows.push([]);
+      rows.push([group.title]);
+      rows.push(['准则权重', formatCellValue(groupWeight)]);
+      rows.push([]);
+      
+      // 表头
+      rows.push(['指标', '阈值1', '阈值2', '阈值3', '权重', '结果']);
+      
+      // 数据行
+      group.indicatorKeys.forEach(({ label, key }, idx) => {
+        const thresholdRow = subThresholds[key] || [];
+        const displayThresholds = Array.isArray(thresholdRow) ? thresholdRow : [];
+        const displayWeight = Array.isArray(weightValues) ? formatCellValue(weightValues[idx]) : formatCellValue(weightValues);
+        const rawValues = matrixDetail?.raw_values || {};
+        const resultValue = rawValues[key] !== undefined && rawValues[key] !== null ? formatCellValue(rawValues[key]) : 'N/A';
+        rows.push([
+          label,
+          displayThresholds[0] !== undefined ? formatCellValue(displayThresholds[0]) : 'N/A',
+          displayThresholds[1] !== undefined ? formatCellValue(displayThresholds[1]) : 'N/A',
+          displayThresholds[2] !== undefined ? formatCellValue(displayThresholds[2]) : 'N/A',
+          displayWeight !== undefined ? displayWeight : 'N/A',
+          resultValue
+        ]);
+      });
+    });
+    
+    // 转换为 CSV 格式
+    return rows.map(row => 
+      row.map(cell => {
+        const str = String(cell);
+        // 如果包含逗号、双引号或换行符，则用双引号包围并转义双引号
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      }).join(',')
+    ).join('\n');
   };
 
-  const extractScalarValue = (value: any) => {
-    if (Array.isArray(value)) {
-      if (value.length === 0) return null;
-      return extractScalarValue(value[0]);
+  const downloadMatrixCSV = () => {
+    const csv = generateMatrixCSV();
+    if (!csv) {
+      alert('无可导出的数据');
+      return;
     }
-    if (value && typeof value === 'object') {
-      if ('value' in value) return extractScalarValue(value.value);
-      if ('weight' in value) return extractScalarValue(value.weight);
-      if ('result' in value && Object.keys(value).length === 1) return extractScalarValue(value.result);
-    }
-    return value ?? null;
+    
+    // 创建 Blob 并下载
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    
+    link.setAttribute('href', url);
+    link.setAttribute('download', `断面矩阵详情_${matrixSectionId || 'export'}_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.style.visibility = 'hidden';
+    
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
-  const normalizeWeightValues = (weightMatrix: any) => {
-    const rows = normalizeMatrixRows(weightMatrix);
-    if (rows.length > 0) {
-      return rows.map((row: any) => extractScalarValue(row));
-    }
-    if (Array.isArray(weightMatrix)) {
-      return weightMatrix.map((item) => extractScalarValue(item));
-    }
-    if (weightMatrix && typeof weightMatrix === 'object') {
-      return Object.values(weightMatrix).map((item) => extractScalarValue(item));
-    }
-    return [] as any[];
-  };
-
-  const renderAssessmentGroup = (group: typeof MATRIX_GROUPS[number], matrices: Record<string, any>, weightValues: any[]) => {
-    const thresholdRows = normalizeMatrixRows(matrices[group.matrixKey]);
-    const resultRows = normalizeMatrixRows(matrices[group.resultKey]);
-    const groupIndex = MATRIX_GROUPS.findIndex(item => item.matrixKey === group.matrixKey);
-    const groupWeight = weightValues[groupIndex];
-
-    const hasAnyData = thresholdRows.length > 0 || resultRows.length > 0 || groupWeight !== undefined;
+  const renderAssessmentGroup = (group: typeof MATRIX_GROUPS[number], indicators: any, groupIdx: number) => {
+    const weightKey = group.weightKey as keyof typeof indicators;
+    const weightValues = indicators?.[weightKey];
+    const subThresholds = indicators?.sub_thresholds || {};
+    const rawValues = matrixDetail?.raw_values || {};
+    const groupWeight = Array.isArray(indicators?.wRL) ? indicators.wRL[groupIdx] : weightValues;
+    
+    const hasAnyData = group.indicatorKeys.length > 0 && (groupWeight || Object.keys(subThresholds).length > 0 || weightValues);
     if (!hasAnyData) return null;
 
     return (
-      <div className="matrix-assessment-group" key={group.matrixKey}>
+      <div className="matrix-assessment-group" key={group.title}>
         <div className="matrix-assessment-meta">
           <div className="matrix-assessment-title">{group.title}</div>
           <div className="matrix-assessment-weight">
@@ -417,21 +502,24 @@ function ResultPage() {
                 <th className="matrix-assessment-row-header" />
                 <th colSpan={3}>风险阈值</th>
                 <th>权重</th>
+                <th>结果</th>
               </tr>
             </thead>
             <tbody>
-              {group.rowNames.map((rowName, rowIdx) => {
-                const thresholdRow = thresholdRows[rowIdx] ?? [];
-                const resultRow = resultRows[rowIdx] ?? [];
-                const resultValue = Array.isArray(resultRow) ? resultRow[0] : resultRow;
-
+              {group.indicatorKeys.map(({ label, key }, idx) => {
+                const thresholdRow = subThresholds[key] || [];
+                const displayThresholds = Array.isArray(thresholdRow) ? thresholdRow : [];
+                const displayWeight = Array.isArray(weightValues) ? weightValues[idx] : weightValues;
+                const resultValue = rawValues[key] !== undefined && rawValues[key] !== null ? formatCellValue(rawValues[key]) : 'N/A';
+                
                 return (
-                  <tr key={rowName}>
-                    <th scope="row" className="matrix-assessment-row-name">{rowName}</th>
-                    <td>{formatCellValue(thresholdRow[0])}</td>
-                    <td>{formatCellValue(thresholdRow[1])}</td>
-                    <td>{formatCellValue(thresholdRow[2])}</td>
-                    <td>{formatCellValue(resultValue)}</td>
+                  <tr key={key}>
+                    <th scope="row" className="matrix-assessment-row-name">{label}</th>
+                    <td>{displayThresholds[0] !== undefined ? formatCellValue(displayThresholds[0]) : 'N/A'}</td>
+                    <td>{displayThresholds[1] !== undefined ? formatCellValue(displayThresholds[1]) : 'N/A'}</td>
+                    <td>{displayThresholds[2] !== undefined ? formatCellValue(displayThresholds[2]) : 'N/A'}</td>
+                    <td>{displayWeight !== undefined ? formatCellValue(displayWeight) : '-'}</td>
+                    <td>{resultValue}</td>
                   </tr>
                 );
               })}
@@ -507,7 +595,16 @@ function ResultPage() {
       }
     };
     fetchTasks();
-  }, []);
+  }, [initialTaskId]);
+
+  useEffect(() => {
+    if (!initialTaskId) return;
+    if (autoOpenTaskRef.current === initialTaskId) return;
+    if (!mapReady) return;
+
+    autoOpenTaskRef.current = initialTaskId;
+    void handleTaskClick(initialTaskId);
+  }, [initialTaskId, taskList, mapReady]);
 
   const parseResultsList = (data: any): any[] => {
     if (!data) return [];
@@ -1178,6 +1275,8 @@ function ResultPage() {
           'line-width': 2
         }
       });
+      // 标记地图加载完成，以触发自动点击逻辑
+      setMapReady(true);
     });
 
     return () => {
@@ -1212,7 +1311,12 @@ function ResultPage() {
                   {matrixSectionName ? `${matrixSectionName} | ` : ''}断面ID: {matrixSectionId || '-'}
                 </div>
               </div>
-              <button className="matrix-modal-close" onClick={closeMatrixDetail}>关闭</button>
+              <div className="matrix-modal-header-actions">
+                <button className="matrix-modal-download" onClick={downloadMatrixCSV} title="下载CSV数据">
+                  下载CSV
+                </button>
+                <button className="matrix-modal-close" onClick={closeMatrixDetail}>关闭</button>
+              </div>
             </div>
 
             <div className="matrix-body">
@@ -1224,33 +1328,23 @@ function ResultPage() {
                 <>
                   <div className="matrix-kv">
                     <div className="matrix-kv-row"><span>case-id</span><span>{formatCellValue(matrixDetail['case-id'] ?? matrixDetail.case_id ?? matrixDetail.caseId)}</span></div>
-                    <div className="matrix-kv-row"><span>result</span><span>{formatCellValue(matrixDetail.result)}</span></div>
-                    <div className="matrix-kv-row"><span>risk-level</span><span>{Array.isArray(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
-                      ? JSON.stringify(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)
-                      : formatCellValue(matrixDetail['risk-level'] ?? matrixDetail.risk_level ?? matrixDetail.riskLevel)}</span></div>
-
-                    {(() => {
-                      const rawEntries = Object.entries(matrixDetail || {});
-                      const skipKeys = new Set([
-                        'case-id', 'case_id', 'caseId',
-                        'result',
-                        'risk-level', 'risk_level', 'riskLevel',
-                        'matrices',
-                      ]);
-                      const others = rawEntries.filter(([k]) => !skipKeys.has(k));
-                      if (others.length === 0) return null;
-                      return others.map(([k, v]) => (
-                        <div className="matrix-kv-row" key={k}><span>{k}</span><span>{formatCellValue(v)}</span></div>
-                      ));
-                    })()}
+                    <div className="matrix-kv-row"><span>task_id</span><span>{formatCellValue(matrixDetail.task_id ?? matrixDetail.taskId ?? matrixDetail.taskId)}</span></div>
+                    <div className="matrix-kv-row"><span>section_id</span><span>{formatCellValue(matrixDetail.section_id ?? matrixDetail.sectionId ?? matrixDetail.sectionId)}</span></div>
+                    <div className="matrix-kv-row"><span>section_name</span><span>{formatCellValue(matrixDetail.section_name ?? matrixDetail.sectionName ?? matrixDetail.section_name)}</span></div>
+                    <div className="matrix-kv-row"><span>region_code</span><span>{formatCellValue(matrixDetail.region_code ?? matrixDetail.regionCode ?? matrixDetail.region_code)}</span></div>
+                    <div className="matrix-kv-row"><span>bank_id</span><span>{formatCellValue(matrixDetail.bank_id ?? matrixDetail.bankId ?? matrixDetail.bank_id)}</span></div>
+                    <div className="matrix-kv-row"><span>run_time</span><span>{formatCellValue(matrixDetail.run_time ?? matrixDetail.runTime ?? matrixDetail.run_time)}</span></div>
+                    <div className="matrix-kv-row"><span>流量 (water_qs)</span><span>{formatCellValue(matrixDetail.water_qs ?? matrixDetail?.indicators?.water_qs ?? matrixDetail?.water_qs)}</span></div>
+                    <div className="matrix-kv-row"><span>潮差 (tidal_level)</span><span>{formatCellValue(matrixDetail.tidal_level ?? matrixDetail?.indicators?.tidal_level ?? matrixDetail?.tidal_level)}</span></div>
+                    <div className="matrix-kv-row"><span>风险等级</span><span>{formatCellValue(matrixDetail.risk_level ?? matrixDetail.riskLevel)}</span></div>
+                    
                   </div>
 
                   <div className="matrix-section-title">指标矩阵</div>
                   <div className="matrix-assessment-list">
                     {(() => {
-                      const matrices = matrixDetail.matrices ?? matrixDetail ?? {};
-                      const weightValues = normalizeWeightValues(matrices.weight_matrix ?? matrixDetail.weight_matrix ?? matrixDetail.weightMatrix);
-                      const renderedGroups = MATRIX_GROUPS.map(group => renderAssessmentGroup(group, matrices, weightValues)).filter(Boolean);
+                      const indicators = matrixDetail?.indicators?.thresholds ?? matrixDetail?.thresholds ?? {};
+                      const renderedGroups = MATRIX_GROUPS.map((group, idx) => renderAssessmentGroup(group, indicators, idx)).filter(Boolean);
                       if (renderedGroups.length === 0) {
                         return <div className="matrix-empty">无矩阵数据</div>;
                       }

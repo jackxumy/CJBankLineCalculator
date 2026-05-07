@@ -336,3 +336,58 @@
   font-size: 13px;
   font-weight: 500;
 }
+
+.loadedBanksList {
+  display: block;
+  height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.loadedBankItem {
+  padding: 8px 10px;
+  cursor: pointer;
+  border-radius: 2px;
+  margin-bottom: 2px;
+  -webkit-user-select: none;
+  user-select: none;
+  display: flex;
+  align-items: flex-start;
+  font-size: 0.875rem;
+  transition: background-color 0.15s;
+}
+
+.loadedBankItem:hover {
+  background-color: #f1f5f9;
+}
+
+.loadedBankItem.selected {
+  background-color: #e0e7ff;
+}
+
+.loadedBankItemMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.loadedBankItemName {
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.loadedBankItemId {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.clearBanksButton {
+  margin-top: 8px;
+  width: 100%;
+}

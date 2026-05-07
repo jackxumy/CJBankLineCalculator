@@ -32,6 +32,10 @@ interface EditorSidebarProps {
   selectedBankGroup: string[];
   setSelectedBankGroup: (v: string[]) => void;
   deleteBankGroup: () => void;
+  loadedBanks: any[];
+  selectedLoadedBanks: Set<string>;
+  setSelectedLoadedBanks: (v: Set<string>) => void;
+  deleteLoadedBanks: () => void;
   basicParamsList: any[];
   selectedBasicParamIdState: string | number | null;
   totalSelectedSegments: number;
@@ -153,6 +157,10 @@ function EditorSidebar(props: EditorSidebarProps) {
     handleSectionsFileUpload,
     handleSelectBasicParam,
     onExportSections,
+    loadedBanks,
+    selectedLoadedBanks,
+    setSelectedLoadedBanks,
+    deleteLoadedBanks,
   } = props;
 
   const activeSelectedBank = selectedBankGroup[selectedBankGroup.length - 1] || '';
@@ -303,24 +311,70 @@ function EditorSidebar(props: EditorSidebarProps) {
               </div>
             )}
 
-            <div className={`${styles.inputGroup} ${styles.mt12}`}>
-              <label>参数模板:</label>
-              <select
-                value={selectedBasicParamIdState ?? ''}
-                onChange={(e) => handleSelectBasicParam(e.target.value || null)}
-              >
-                <option value="">（不使用模板）</option>
-                {basicParamsList.map((p: any, idx: number) => {
-                  const paramId = p.param_id ?? p.id ?? idx;
-                  const name = p.param_name || p.paramName || String(paramId);
-                  return (
-                    <option key={String(paramId)} value={String(paramId)}>
-                      {name}
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
+            {/* 已加载岸段管理 */}
+            {loadedBanks && loadedBanks.length > 0 && (
+              <div className={`${styles.inputGroup} ${styles.mt12}`}>
+                <div className={styles.bankSelectHeader}>
+                  <span className={styles.bankSelectLabel}>已加载岸段:</span>
+                  <span className={styles.bankSelectCount}>{selectedLoadedBanks.size}/{loadedBanks.length}</span>
+                </div>
+                <div className={styles.loadedBanksList}>
+                  {loadedBanks.map((bank) => {
+                    const bankId = String(bank.bank_id);
+                    const isSelected = selectedLoadedBanks.has(bankId);
+                    const bankName = String(bank.bank_name || bank.bankName || bank.region_code || bankId);
+                    return (
+                      <div
+                        key={bankId}
+                        className={`${styles.loadedBankItem} ${isSelected ? styles.selected : ''}`}
+                        onClick={(e) => {
+                          const newSelected = new Set(selectedLoadedBanks);
+                          if (e.ctrlKey || e.metaKey) {
+                            // Ctrl/Cmd 点击：切换选中状态
+                            if (newSelected.has(bankId)) {
+                              newSelected.delete(bankId);
+                            } else {
+                              newSelected.add(bankId);
+                            }
+                          } else if (e.shiftKey) {
+                            // Shift 点击：范围选择（简单实现，仅在最后选中项和当前项间切换）
+                            if (newSelected.size === 0) {
+                              newSelected.add(bankId);
+                            } else if (newSelected.has(bankId)) {
+                              newSelected.clear();
+                            } else {
+                              newSelected.clear();
+                              newSelected.add(bankId);
+                            }
+                          } else {
+                            // 普通点击：单选
+                            newSelected.clear();
+                            newSelected.add(bankId);
+                          }
+                          setSelectedLoadedBanks(newSelected);
+                        }}
+                      >
+                        <div className={styles.loadedBankItemMain}>
+                          <span className={styles.loadedBankItemName}>{bankName}</span>
+                          <span className={styles.loadedBankItemId}>{bankId}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className={`${styles.outlineButton} ${styles.clearBanksButton}`}
+                  onClick={deleteLoadedBanks}
+                  disabled={selectedLoadedBanks.size === 0}
+                  title="从地图上清除已选岸段"
+                  aria-label="清除岸段"
+                >
+                  <Trash2 size={16} /> 清除({selectedLoadedBanks.size})
+                </button>
+              </div>
+            )}
+
             {uploadedData && (
               <div className={styles.hintText}>
                 要素: {uploadedData.features.length} | 选段: {selectedLinesSize} | 断面: {totalCrossLinesCount}
@@ -376,9 +430,28 @@ function EditorSidebar(props: EditorSidebarProps) {
               </button>
             </div>
 
+            <div className={styles.inputGroup}>
+              <label>参数模板:</label>
+              <select
+                value={selectedBasicParamIdState ?? ''}
+                onChange={(e) => handleSelectBasicParam(e.target.value || null)}
+              >
+                <option value="">（不使用模板）</option>
+                {basicParamsList.map((p: any, idx: number) => {
+                  const paramId = p.param_id ?? p.id ?? idx;
+                  const name = p.param_name || p.paramName || String(paramId);
+                  return (
+                    <option key={String(paramId)} value={String(paramId)}>
+                      {name}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+
             <div className={styles.mt12}>
               <button type="button" className={styles.primaryButton} onClick={handleGenerateSections}>
-                <Ruler size={16} /> 生成精细断面
+                <Ruler size={16} /> 生成展示断面
               </button>
             </div>
 

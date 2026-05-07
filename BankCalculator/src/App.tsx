@@ -5,12 +5,27 @@ import EditorPage from './pages/EditorPage';
 import ResultPage from './pages/ResultPage';
 import './App.css';
 
-type Page = 'home' | 'editor' | 'result';
+type PageState = 
+  | { type: 'home' }
+  | { type: 'editor' }
+  | { type: 'result'; taskId?: string };
 
 function App() {
-  const [page, setPage] = useState<Page>('home');
+  const [pageState, setPageState] = useState<PageState>({ type: 'home' });
 
-  if (page === 'home') {
+  const currentPage = pageState.type;
+
+  const setPage = (page: 'home' | 'editor' | 'result', taskId?: string) => {
+    if (page === 'home') {
+      setPageState({ type: 'home' });
+    } else if (page === 'editor') {
+      setPageState({ type: 'editor' });
+    } else if (page === 'result') {
+      setPageState({ type: 'result', taskId });
+    }
+  };
+
+  if (currentPage === 'home') {
     return <HomePage onNavigate={() => setPage('editor')} />;
   }
 
@@ -23,7 +38,7 @@ function App() {
       <div className="nav-tabs">
         <button 
           type="button"
-          className={`nav-tab ${page === 'editor' ? 'active' : ''}`}
+          className={`nav-tab ${currentPage === 'editor' ? 'active' : ''}`}
           onClick={() => setPage('editor')}
         >
           <Edit3 size={18} />
@@ -31,7 +46,7 @@ function App() {
         </button>
         <button 
           type="button"
-          className={`nav-tab ${page === 'result' ? 'active' : ''}`}
+          className={`nav-tab ${currentPage === 'result' ? 'active' : ''}`}
           onClick={() => setPage('result')}
         >
           <BarChart2 size={18} />
@@ -48,7 +63,10 @@ function App() {
     <div className="app-container">
       {renderNav()}
       <main className="app-main">
-        {page === 'editor' ? <EditorPage /> : <ResultPage />}
+        {currentPage === 'editor' 
+          ? <EditorPage setPage={setPage} /> 
+          : <ResultPage initialTaskId={pageState.type === 'result' ? pageState.taskId : undefined} />
+        }
       </main>
     </div>
   );

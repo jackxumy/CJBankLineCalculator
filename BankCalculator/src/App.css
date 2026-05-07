@@ -855,6 +855,28 @@
   color: #64748b;
 }
 
+.matrix-modal-header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.matrix-modal-download {
+  border: 1px solid #3b82f6;
+  background: #3b82f6;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  color: #ffffff;
+  font-size: 15px;
+  transition: background-color 0.2s;
+}
+
+.matrix-modal-download:hover {
+  background: #2563eb;
+  border-color: #2563eb;
+}
+
 .matrix-modal-close {
   border: 1px solid #e2e8f0;
   background: #ffffff;
@@ -863,6 +885,11 @@
   cursor: pointer;
   color: #334155;
   font-size: 15px;
+  transition: background-color 0.2s;
+}
+
+.matrix-modal-close:hover {
+  background: #f1f5f9;
 }
 
 .matrix-loading,
