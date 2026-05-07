@@ -844,14 +844,14 @@
 }
 
 .matrix-modal-title {
-  font-size: 14px;
+  font-size: 25px;
   font-weight: 800;
   color: #0f172a;
 }
 
 .matrix-modal-subtitle {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: 14px;
   color: #64748b;
 }
 
@@ -862,7 +862,7 @@
   padding: 4px 10px;
   cursor: pointer;
   color: #334155;
-  font-size: 12px;
+  font-size: 15px;
 }
 
 .matrix-loading,
@@ -899,7 +899,7 @@
   background: #f8fafc;
   border-radius: 8px;
   padding: 8px 10px;
-  font-size: 12px;
+  font-size: 15px;
 }
 
 .matrix-kv-row span:first-child {
@@ -916,88 +916,141 @@
 
 .matrix-section-title {
   margin-top: 12px;
-  font-size: 13px;
+  font-size: 20px;
   font-weight: 800;
   color: #0f172a;
 }
 
-.matrix-matrices {
+.matrix-assessment-list {
   margin-top: 10px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 12px;
+  gap: 14px;
 }
 
-.matrix-block {
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  background: #ffffff;
-  padding: 10px;
+.matrix-assessment-group {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 10px;
+  align-items: stretch;
 }
 
-.matrix-block-title {
-  font-size: 12px;
+.matrix-assessment-meta {
+  border: 1px solid #dbeafe;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #eff6ff 0%, #dbeafe 100%);
+  padding: 18px 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 176px;
+}
+
+.matrix-assessment-title {
+  font-size: 24px;
+  line-height: 1.2;
   font-weight: 800;
+  color: #1d4ed8;
+  text-align: center;
+}
+
+.matrix-assessment-weight {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 16px;
+  font-weight: 700;
   color: #0f172a;
-  margin-bottom: 8px;
 }
 
-.matrix-table-wrap {
-  overflow: auto;
-  max-height: 240px;
+.matrix-assessment-weight-value {
+  min-width: 58px;
+  padding: 4px 8px;
   border-radius: 8px;
-  border: 1px solid #e2e8f0;
+  background: #bae6fd;
+  border: 1px solid #7dd3fc;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
-.matrix-table {
+.matrix-assessment-table-wrap {
+  height: 100%;
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid #7dd3fc;
+  background: #f0f9ff;
+}
+
+.matrix-assessment-table {
   width: 100%;
+  height: 100%;
   border-collapse: collapse;
   table-layout: fixed;
 }
 
-.matrix-table td {
+.matrix-assessment-table tbody {
+  height: 100%;
+}
+
+.matrix-assessment-table th,
+.matrix-assessment-table td {
   border: 1px solid #e2e8f0;
-  padding: 6px 8px;
-  font-size: 11px;
+  background: #bae6fd;
+  padding: 8px 8px;
+  font-size: 20px;
   color: #0f172a;
   text-align: center;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
-.matrix-inline-array {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+.matrix-assessment-table thead th {
+  height: 40px;
 }
 
-.matrix-chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 8px;
-  border: 1px solid #e2e8f0;
-  border-radius: 999px;
-  background: #f8fafc;
-  font-size: 11px;
-  color: #0f172a;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+.matrix-assessment-table tbody tr {
+  height: calc((100% - 40px) / 3);
 }
 
-.matrix-json {
-  margin: 0;
-  padding: 8px;
-  background: #0b1220;
-  color: #e2e8f0;
-  border-radius: 8px;
-  font-size: 11px;
-  max-height: 200px;
-  overflow: auto;
+.matrix-assessment-table thead th {
+  background: #2f77a3;
+  color: #ffffff;
+  font-weight: 800;
+  border-color: #2f77a3;
+}
+
+.matrix-assessment-row-header {
+  width: 190px;
+}
+
+.matrix-assessment-row-name {
+  width: 190px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-weight: 800;
+  text-align: center;
+}
+
+.matrix-assessment-table tbody td {
+  background: #bfdbfe;
+}
+
+.matrix-assessment-table tbody tr + tr td,
+.matrix-assessment-table tbody tr + tr th {
+  border-top: 1px solid #93c5fd;
+}
+
+.matrix-assessment-table tbody tr:hover td,
+.matrix-assessment-table tbody tr:hover th {
+  background: #bfdbfe;
 }
 
 /* 结果页：断面剖面折线 */
 
 .profile-section-title {
   margin-top: 14px;
-  font-size: 13px;
+  font-size: 20px;
   font-weight: 800;
   color: #0f172a;
 }
@@ -1005,13 +1058,13 @@
 .profile-loading,
 .profile-empty {
   padding: 10px 6px 6px;
-  font-size: 12px;
+  font-size: 15px;
   color: #64748b;
 }
 
 .profile-error {
   padding: 10px 6px 6px;
-  font-size: 12px;
+  font-size: 15px;
   color: #b91c1c;
   background: #fef2f2;
   border: 1px solid #fecaca;
@@ -1045,5 +1098,5 @@
 
 .profile-label {
   fill: #64748b;
-  font-size: 11px;
+  font-size: 15px;
 }

@@ -93,6 +93,29 @@ const RISK_COLORS: Record<string, string> = {
   'default': '#94a3b8'
 };
 
+const CLOSE_LOOP_DISTANCE_METERS = 2000;
+
+const MATRIX_GROUPS = [
+  {
+    title: '水流动力指标',
+    matrixKey: 'water_flow_power_matrix',
+    resultKey: 'water_flow_power_result_matrix',
+    rowNames: ['抗冲流速(Ky)', '造床流量当量(PQ)', '水位变幅(Zd)']
+  },
+  {
+    title: '河床演变指标',
+    matrixKey: 'riverbed_evolution_matrix',
+    resultKey: 'riverbed_evolution_result_matrix',
+    rowNames: ['岸坡坡比(Sa)', '近岸冲刷(Ln)', '滩槽高差(Zb)']
+  },
+  {
+    title: '地质工程指标',
+    matrixKey: 'geology_engineering_matrix',
+    resultKey: 'geology_engineering_result_matrix',
+    rowNames: ['土体组成(Dsed)', '岸坡防护(PL)', '荷载控制(LC)']
+  }
+] as const;
+
 function ResultPage() {
   const mapContainer = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
@@ -274,6 +297,8 @@ function ResultPage() {
 
       const payload = json ?? text;
       const matrix = payload?.matrix ?? payload?.data?.matrix ?? payload?.data ?? payload;
+      console.log('ResultPage: matrix detail payload:', payload);
+      console.log('ResultPage: matrix detail resolved matrix:', matrix);
       setMatrixDetail(matrix);
     })().catch((err: any) => {
       setMatrixError(err?.message || '获取矩阵详情失败');
@@ -326,50 +351,93 @@ function ResultPage() {
     }
   };
 
-  const renderMatrixTable = (name: string, matrix: any) => {
-    if (!matrix) return null;
-
-    // 2D 数组 => table
-    if (Array.isArray(matrix) && matrix.every((row) => Array.isArray(row))) {
-      return (
-        <div className="matrix-block" key={name}>
-          <div className="matrix-block-title">{name}</div>
-          <div className="matrix-table-wrap">
-            <table className="matrix-table">
-              <tbody>
-                {matrix.map((row: any[], rIdx: number) => (
-                  <tr key={rIdx}>
-                    {row.map((cell: any, cIdx: number) => (
-                      <td key={cIdx}>{formatCellValue(cell)}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      );
-    }
-
-    // 1D 数组 => inline
+  const normalizeMatrixRows = (matrix: any) => {
+    if (!matrix) return [] as any[][];
     if (Array.isArray(matrix)) {
-      return (
-        <div className="matrix-block" key={name}>
-          <div className="matrix-block-title">{name}</div>
-          <div className="matrix-inline-array">
-            {matrix.map((x: any, idx: number) => (
-              <span className="matrix-chip" key={idx}>{formatCellValue(x)}</span>
-            ))}
+      if (matrix.every(row => Array.isArray(row))) {
+        return matrix as any[][];
+      }
+      return matrix.map((item) => (Array.isArray(item) ? item : [item]));
+    }
+    if (Array.isArray(matrix.rows)) return matrix.rows;
+    if (Array.isArray(matrix.data)) return matrix.data;
+    return [] as any[][];
+  };
+
+  const extractScalarValue = (value: any) => {
+    if (Array.isArray(value)) {
+      if (value.length === 0) return null;
+      return extractScalarValue(value[0]);
+    }
+    if (value && typeof value === 'object') {
+      if ('value' in value) return extractScalarValue(value.value);
+      if ('weight' in value) return extractScalarValue(value.weight);
+      if ('result' in value && Object.keys(value).length === 1) return extractScalarValue(value.result);
+    }
+    return value ?? null;
+  };
+
+  const normalizeWeightValues = (weightMatrix: any) => {
+    const rows = normalizeMatrixRows(weightMatrix);
+    if (rows.length > 0) {
+      return rows.map((row: any) => extractScalarValue(row));
+    }
+    if (Array.isArray(weightMatrix)) {
+      return weightMatrix.map((item) => extractScalarValue(item));
+    }
+    if (weightMatrix && typeof weightMatrix === 'object') {
+      return Object.values(weightMatrix).map((item) => extractScalarValue(item));
+    }
+    return [] as any[];
+  };
+
+  const renderAssessmentGroup = (group: typeof MATRIX_GROUPS[number], matrices: Record<string, any>, weightValues: any[]) => {
+    const thresholdRows = normalizeMatrixRows(matrices[group.matrixKey]);
+    const resultRows = normalizeMatrixRows(matrices[group.resultKey]);
+    const groupIndex = MATRIX_GROUPS.findIndex(item => item.matrixKey === group.matrixKey);
+    const groupWeight = weightValues[groupIndex];
+
+    const hasAnyData = thresholdRows.length > 0 || resultRows.length > 0 || groupWeight !== undefined;
+    if (!hasAnyData) return null;
+
+    return (
+      <div className="matrix-assessment-group" key={group.matrixKey}>
+        <div className="matrix-assessment-meta">
+          <div className="matrix-assessment-title">{group.title}</div>
+          <div className="matrix-assessment-weight">
+            <span>准则权重</span>
+            <span className="matrix-assessment-weight-value">{formatCellValue(groupWeight)}</span>
           </div>
         </div>
-      );
-    }
 
-    // 其它 => 直接 JSON
-    return (
-      <div className="matrix-block" key={name}>
-        <div className="matrix-block-title">{name}</div>
-        <pre className="matrix-json">{JSON.stringify(matrix, null, 2)}</pre>
+        <div className="matrix-assessment-table-wrap">
+          <table className="matrix-assessment-table">
+            <thead>
+              <tr>
+                <th className="matrix-assessment-row-header" />
+                <th colSpan={3}>风险阈值</th>
+                <th>权重</th>
+              </tr>
+            </thead>
+            <tbody>
+              {group.rowNames.map((rowName, rowIdx) => {
+                const thresholdRow = thresholdRows[rowIdx] ?? [];
+                const resultRow = resultRows[rowIdx] ?? [];
+                const resultValue = Array.isArray(resultRow) ? resultRow[0] : resultRow;
+
+                return (
+                  <tr key={rowName}>
+                    <th scope="row" className="matrix-assessment-row-name">{rowName}</th>
+                    <td>{formatCellValue(thresholdRow[0])}</td>
+                    <td>{formatCellValue(thresholdRow[1])}</td>
+                    <td>{formatCellValue(thresholdRow[2])}</td>
+                    <td>{formatCellValue(resultValue)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     );
   };
@@ -885,7 +953,7 @@ function ResultPage() {
         },
         paint: {
           'line-color': ['get', 'color'],
-          'line-width': 8,
+          'line-width': 5,
           'line-opacity': 0.9
         }
       });
@@ -1012,14 +1080,16 @@ function ResultPage() {
                 (coords[0][1] + coords[1][1]) / 2,
               ];
           const info = computeColorWithMatrix(s.risk_level);
-            return { mid, color: info.color, section: s };
+          return { mid, color: info.color, section: s, valid: info.valid };
         })
-        .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult }>;
+        .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult; valid: boolean }>;
 
       if (points.length < 2) return;
 
       const midpoints = points.map(p => p.mid as number[]);
-      const newLine = turf.lineString(midpoints as any);
+      const shouldClose = turf.distance(points[0].mid as any, points[points.length - 1].mid as any, { units: 'meters' }) < CLOSE_LOOP_DISTANCE_METERS;
+      const lineCoords = shouldClose ? [...midpoints, midpoints[0]] : midpoints;
+      const newLine = turf.lineString(lineCoords as any);
       const totalDist = turf.length(newLine, { units: 'meters' });
 
       // 构建颜色梯度参数（沿排序后的折线累积距离）
@@ -1032,15 +1102,26 @@ function ResultPage() {
           currentDist += turf.distance(prevMid as any, currMid as any, { units: 'meters' });
         }
         const progress = totalDist > 0 ? (currentDist / totalDist) : 0;
-        riskStops.push({ val: progress, color: points[idx].color });
+        if (points[idx].valid) {
+          riskStops.push({ val: progress, color: points[idx].color });
+        }
       }
 
       // Mapbox interpolate 表达式格式
       const stops: any[] = ['interpolate', ['linear'], ['line-progress']];
-      riskStops.forEach(rs => {
-        const val = Math.max(0, Math.min(1, rs.val));
-        stops.push(val, rs.color);
-      });
+      if (riskStops.length === 0) {
+        stops.push(0, RISK_COLORS.default, 1, RISK_COLORS.default);
+      } else if (riskStops.length === 1) {
+        stops.push(0, riskStops[0].color, 1, riskStops[0].color);
+      } else {
+        riskStops.forEach(rs => {
+          const val = Math.max(0, Math.min(1, rs.val));
+          stops.push(val, rs.color);
+        });
+        if (shouldClose) {
+          stops.push(1, riskStops[0].color);
+        }
+      }
 
       // 渲染新生成的中间折线
       const layerId = `midline-result-${bankId}`;
@@ -1061,7 +1142,7 @@ function ResultPage() {
           paint: {
             'line-width': 20,
             'line-gradient': stops as any,
-            'line-opacity': 0.8
+            'line-opacity': 0.7
           }
         });
       } else {
@@ -1164,15 +1245,16 @@ function ResultPage() {
                     })()}
                   </div>
 
-                  <div className="matrix-section-title">matrices</div>
-                  <div className="matrix-matrices">
+                  <div className="matrix-section-title">指标矩阵</div>
+                  <div className="matrix-assessment-list">
                     {(() => {
-                      const matrices = matrixDetail.matrices ?? {};
-                      const entries = Object.entries(matrices);
-                      if (entries.length === 0) {
-                        return <div className="matrix-empty">无 matrices 数据</div>;
+                      const matrices = matrixDetail.matrices ?? matrixDetail ?? {};
+                      const weightValues = normalizeWeightValues(matrices.weight_matrix ?? matrixDetail.weight_matrix ?? matrixDetail.weightMatrix);
+                      const renderedGroups = MATRIX_GROUPS.map(group => renderAssessmentGroup(group, matrices, weightValues)).filter(Boolean);
+                      if (renderedGroups.length === 0) {
+                        return <div className="matrix-empty">无矩阵数据</div>;
                       }
-                      return entries.map(([k, v]) => renderMatrixTable(k, v));
+                      return renderedGroups;
                     })()}
                   </div>
                 </>
