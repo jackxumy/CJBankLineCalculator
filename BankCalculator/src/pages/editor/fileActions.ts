@@ -11,8 +11,16 @@ export function uploadMainGeoJsonAction(params: {
   setSelectedLines: (v: Set<string>) => void;
   setIsSelectingShoreLines: (v: boolean) => void;
   setIsSelectingStartEnd: (v: boolean) => void;
+  setLoadedBanks?: (fn: (prev: any[]) => any[]) => void;
 }) {
-  const { e, setUploadedData, setSelectedLines, setIsSelectingShoreLines, setIsSelectingStartEnd } = params;
+  const {
+    e,
+    setUploadedData,
+    setSelectedLines,
+    setIsSelectingShoreLines,
+    setIsSelectingStartEnd,
+    setLoadedBanks,
+  } = params;
 
   const file = e.target.files?.[0];
   if (!file) return;
@@ -24,17 +32,62 @@ export function uploadMainGeoJsonAction(params: {
       const geojsonRaw = json.type === 'FeatureCollection' ? json : turf.featureCollection([json]);
       const geojson = stripZFromGeoJSON(geojsonRaw as any);
 
+      const fileName = file.name.split('.')[0]; // 不含扩展名的文件名
+
+      const lineStringFeatures: any[] = [];
+      const newBanks: any[] = [];
+
       geojson.features.forEach((feature: any, index: number) => {
         if (!feature.properties) {
           feature.properties = {};
         }
         feature.properties.index = index;
+
+        // 仅处理 LineString 要素，将其转换为可管理的岸段
+        if (feature.geometry?.type === 'LineString') {
+          const bankId = `${fileName}_${index}`;
+          const bankName = feature.properties.name || feature.properties.bank_name || `${fileName} 线段${index + 1}`;
+
+          // 创建岸段对象
+          const bank = {
+            bank_id: bankId,
+            bank_name: bankName,
+            region_code: feature.properties.region_code || 'uploaded',
+            description: feature.properties.description || `从 ${fileName} 导入的岸线`,
+            geometry: feature.geometry,
+            reversed: !!(feature.properties.reversed === true || feature.properties.reversed === 'true'),
+            from_backend: false, // 标记为前端上传
+          };
+
+          newBanks.push(bank);
+          lineStringFeatures.push({
+            ...feature,
+            properties: {
+              ...feature.properties,
+              bank_id: bankId,
+              bank_name: bankName,
+              from_backend: false,
+            },
+          });
+        } else {
+          // 非 LineString 的要素保持原样
+          lineStringFeatures.push(feature);
+        }
       });
 
-      setUploadedData(geojson);
+      setUploadedData(turf.featureCollection(lineStringFeatures) as any);
       setSelectedLines(new Set());
       setIsSelectingShoreLines(false);
       setIsSelectingStartEnd(false);
+
+      // 将新创建的岸段添加到 loadedBanks，避免重复
+      if (setLoadedBanks && newBanks.length > 0) {
+        setLoadedBanks((prev) => {
+          const existingBankIds = new Set(prev.map((b) => String(b.bank_id)));
+          const banksToAdd = newBanks.filter((b) => !existingBankIds.has(String(b.bank_id)));
+          return banksToAdd.length > 0 ? [...prev, ...banksToAdd] : prev;
+        });
+      }
     } catch {
       alert('解析 GeoJSON 失败，请检查文件格式');
     }

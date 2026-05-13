@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { AnalysisConfig } from '../constants';
 import TiffResourcePicker from './TiffResourcePicker';
 import styles from './Modal.module.css';
+import { updateSectionParams } from '../pages/editor/sectionApi';
 
 type AnalysisConfigDraft = Record<string, any>;
 
@@ -58,16 +59,7 @@ export default function PropertiesModal({
       const updatedConfig = { ...draftConfig } as AnalysisConfig;
       
       if (sectionId) {
-        // 如果有 sectionId，同步到后端断面结果
-        const response = await fetch(`/v0/bank/sections/${sectionId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(updatedConfig)
-        });
-
-        if (!response.ok) {
-          throw new Error('同步到后端失败');
-        }
+        await updateSectionParams(sectionId, updatedConfig as any);
       }
 
       onSave(updatedConfig as any);

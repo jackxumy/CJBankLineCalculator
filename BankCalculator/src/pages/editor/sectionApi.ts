@@ -2,7 +2,7 @@ import type { SectionParams } from '../../types/sections';
 
 export async function fetchSectionParams(sectionId: string): Promise<SectionParams | null> {
   try {
-    const response = await fetch(`/v0/bank/sections/${sectionId}`);
+    const response = await fetch(`/v0/bank/sections/${encodeURIComponent(sectionId)}`);
     if (!response.ok) {
       console.error(`获取断面参数失败: ${response.statusText}`);
       return null;
@@ -36,5 +36,23 @@ export async function fetchSectionParams(sectionId: string): Promise<SectionPara
   } catch (err) {
     console.error('获取断面参数出错:', err);
     return null;
+  }
+}
+
+export async function updateSectionParams(
+  sectionId: string,
+  sectionParams: SectionParams,
+): Promise<void> {
+  const response = await fetch(`/v0/bank/sections/${encodeURIComponent(sectionId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(sectionParams),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(
+      `更新断面参数失败: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`,
+    );
   }
 }

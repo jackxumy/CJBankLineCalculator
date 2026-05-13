@@ -54,7 +54,7 @@ interface EditorSidebarProps {
   toggleFixShoreLineReversed: () => void;
   sendSelectedShoreLinesGeoJson: () => void;
   perpendicularData: GeoJSON.FeatureCollection | null;
-  setShowGlobalPropertiesModal: (v: boolean) => void;
+  openGlobalPropertiesModal: () => void;
   isSelectingStartEnd: boolean;
   toggleStartEndSelection: () => void;
   groups: SelectionGroup[];
@@ -121,7 +121,7 @@ function EditorSidebar(props: EditorSidebarProps) {
     toggleFixShoreLineReversed,
     sendSelectedShoreLinesGeoJson,
     perpendicularData,
-    setShowGlobalPropertiesModal,
+    openGlobalPropertiesModal,
     isSelectingStartEnd,
     toggleStartEndSelection,
     groups,
@@ -488,13 +488,11 @@ function EditorSidebar(props: EditorSidebarProps) {
               </div>
             )}
 
-            {perpendicularData && perpendicularData.features.length > 0 && (
-              <div className={styles.mt12}>
-                <button type="button" className={styles.outlineButton} onClick={() => setShowGlobalPropertiesModal(true)} title="全局属性配置" aria-label="全局属性配置">
-                  <Settings size={14} /> 属性配置
-                </button>
-              </div>
-            )}
+            <div className={styles.mt12}>
+              <button type="button" className={styles.outlineButton} onClick={openGlobalPropertiesModal} title="先选择参数模板，再编辑全局属性" aria-label="全局属性配置">
+                <Settings size={14} /> 模板属性配置
+              </button>
+            </div>
           </div>
         </section>
 

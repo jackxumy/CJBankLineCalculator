@@ -55,3 +55,19 @@ export async function fetchBasicParamDetailAsSectionParams(paramId: string): Pro
     sectionParams: mapBasicParamToSectionParams(data.param),
   };
 }
+
+export async function updateBasicParamAsSectionParams(
+  paramId: string,
+  sectionParams: SectionParams,
+): Promise<void> {
+  const res = await fetch(`/v0/bank/basic-params/${encodeURIComponent(paramId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(sectionParams),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => '');
+    throw new Error(`更新模板失败: ${res.status} ${res.statusText}${errorText ? ` - ${errorText}` : ''}`);
+  }
+}

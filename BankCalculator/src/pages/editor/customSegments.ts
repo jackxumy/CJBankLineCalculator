@@ -3,13 +3,14 @@ import type { Dispatch, SetStateAction } from 'react';
 import { generatePerpendicularLines } from '../../utils/geometry';
 import type { SectionParams } from '../../types/sections';
 import type { SelectionGroup } from '../../types/selection';
+import { updateSectionParams } from './sectionApi';
 import {
   coordsToVerticalFootPoint,
   getVerticalFootCoordsFromAny,
   getVerticalFootPointFromAny,
 } from '../../utils/verticalFootPoint';
 
-export function applyCustomSegmentsAction(params: {
+export async function applyCustomSegmentsAction(params: {
   editingGroupId: string | null;
   groups: SelectionGroup[];
   perpendicularData: GeoJSON.FeatureCollection | null;
@@ -46,6 +47,46 @@ export function applyCustomSegmentsAction(params: {
 
   const start = Math.min(editingGroup.start, editingGroup.end);
   const end = Math.max(editingGroup.start, editingGroup.end);
+  const sectionParamsToApply = (editingGroup.properties || globalProperties || null) as SectionParams | null;
+
+  const getSectionIdFromProps = (props: any): string | null => {
+    const id = props?.sectionId ?? props?.section_id ?? props?.id;
+    if (!id) return null;
+    return String(id);
+  };
+
+  const collectTargetSectionIds = (): string[] => {
+    const ids = new Set<string>();
+    (perpendicularData.features as any[]).forEach((line) => {
+      const lineProp: any = line?.properties || {};
+      const leftPoint = lineProp.leftPoint as number[] | undefined;
+      const rightPoint = lineProp.rightPoint as number[] | undefined;
+      const anchorPoint = getVerticalFootCoordsFromAny(lineProp) ?? undefined;
+      if (!leftPoint || !rightPoint) return;
+
+      try {
+        const p =
+          Array.isArray(anchorPoint) && anchorPoint.length >= 2
+            ? anchorPoint
+            : [(leftPoint[0] + rightPoint[0]) / 2, (leftPoint[1] + rightPoint[1]) / 2];
+        const pt = turf.point(p as any);
+        const distOnLine = turf.nearestPointOnLine(editingGroup.line, pt, { units: 'meters' });
+        const actualDist = distOnLine.properties.location ?? 0;
+        const distToLine = turf.distance(pt, distOnLine, { units: 'meters' });
+
+        if (distToLine > Math.max(globalLength, editingGroup.length) / 2 + 100) return;
+        if (actualDist < start || actualDist > end) return;
+
+        const sectionId = getSectionIdFromProps(lineProp);
+        if (sectionId) ids.add(sectionId);
+      } catch {
+        // ignore matching failures
+      }
+    });
+    return Array.from(ids);
+  };
+
+  const targetSectionIds = collectTargetSectionIds();
 
   const intervalChanged = editingGroup.interval !== editingGroup.lastAppliedInterval;
 
@@ -131,7 +172,23 @@ export function applyCustomSegmentsAction(params: {
     });
 
     setPerpendicularData(turf.featureCollection(updatedLines));
-    alert(`已更新组 ${groups.findIndex((g) => g.id === editingGroupId) + 1} 的垂线长度（未修改间距）`);
+
+    let backendSyncSummary = '（未同步后端属性）';
+    if (sectionParamsToApply && targetSectionIds.length > 0) {
+      const results = await Promise.allSettled(
+        targetSectionIds.map((sectionId) => updateSectionParams(sectionId, sectionParamsToApply)),
+      );
+      const successCount = results.filter((r) => r.status === 'fulfilled').length;
+      const failedCount = results.length - successCount;
+      backendSyncSummary =
+        failedCount > 0
+          ? `（后端属性同步成功 ${successCount}，失败 ${failedCount}）`
+          : `（已同步后端属性 ${successCount} 条）`;
+    }
+
+    alert(
+      `已更新组 ${groups.findIndex((g) => g.id === editingGroupId) + 1} 的垂线长度（未修改间距）${backendSyncSummary}`,
+    );
     return;
   }
 
@@ -211,5 +268,21 @@ export function applyCustomSegmentsAction(params: {
   updatedLines.push(...(featureCollection.features as GeoJSON.Feature<GeoJSON.LineString>[]));
 
   setPerpendicularData(turf.featureCollection(updatedLines));
-  alert(`已应用组 ${groups.findIndex((g) => g.id === editingGroupId) + 1} 的自定义配置（修改了间距，已重绘）`);
+
+  let backendSyncSummary = '（未同步后端属性）';
+  if (sectionParamsToApply && targetSectionIds.length > 0) {
+    const results = await Promise.allSettled(
+      targetSectionIds.map((sectionId) => updateSectionParams(sectionId, sectionParamsToApply)),
+    );
+    const successCount = results.filter((r) => r.status === 'fulfilled').length;
+    const failedCount = results.length - successCount;
+    backendSyncSummary =
+      failedCount > 0
+        ? `（后端属性同步成功 ${successCount}，失败 ${failedCount}）`
+        : `（已同步后端属性 ${successCount} 条）`;
+  }
+
+  alert(
+    `已应用组 ${groups.findIndex((g) => g.id === editingGroupId) + 1} 的自定义配置（修改了间距，已重绘）${backendSyncSummary}`,
+  );
 }

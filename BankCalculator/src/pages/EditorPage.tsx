@@ -32,7 +32,11 @@ import {
   generateSectionsAndCreateTask,
   runCurrentTask,
 } from './editor/sectionsGeneration';
-import { fetchBasicParamDetailAsSectionParams, fetchBasicParamsList } from './editor/basicParamsApi';
+import {
+  fetchBasicParamDetailAsSectionParams,
+  fetchBasicParamsList,
+  updateBasicParamAsSectionParams,
+} from './editor/basicParamsApi';
 import { getCurrentTaskId } from './editor/taskState';
 
 interface EditorPageProps {
@@ -115,6 +119,14 @@ function EditorPage(props: EditorPageProps) {
   const clearSelectedCrossLines = () => {
     setSelectedCrossLineIndex(null);
     setSelectedCrossLineIndices(new Set());
+  };
+
+  const loadBasicParamAsGlobalProperties = async (paramIdStr: string) => {
+    const { numericId, sectionParams } = await fetchBasicParamDetailAsSectionParams(paramIdStr);
+    setGlobalProperties(sectionParams);
+    setSelectedBasicParamIdState(paramIdStr);
+    setCurrentBasicParamId(numericId);
+    return sectionParams;
   };
 
   const getSelectedCrossLineIndices = (): number[] => {
@@ -451,8 +463,13 @@ function EditorPage(props: EditorPageProps) {
           const first: any = list[0];
           const paramId = first.param_id ?? first.id ?? null;
           if (paramId !== null) {
-            setSelectedBasicParamIdState(String(paramId));
             setCurrentBasicParamId(first.id ?? null);
+            try {
+              await loadBasicParamAsGlobalProperties(String(paramId));
+            } catch (innerErr) {
+              console.warn('加载默认基础参数模板详情失败:', innerErr);
+              setSelectedBasicParamIdState(String(paramId));
+            }
           }
         }
       } catch (err) {
@@ -1063,13 +1080,30 @@ function EditorPage(props: EditorPageProps) {
     }
 
     try {
-      const { numericId, sectionParams } = await fetchBasicParamDetailAsSectionParams(paramIdStr);
-      setGlobalProperties(sectionParams);
-      setSelectedBasicParamIdState(paramIdStr);
-      setCurrentBasicParamId(numericId);
+      await loadBasicParamAsGlobalProperties(paramIdStr);
     } catch (err) {
       console.warn('加载模板详情失败:', err);
     }
+  };
+
+  const openGlobalPropertiesModal = async () => {
+    const paramIdStr = selectedBasicParamIdState === null ? '' : String(selectedBasicParamIdState);
+    if (!paramIdStr) {
+      alert('请先选择一个参数模板');
+      return;
+    }
+
+    if (!globalProperties) {
+      try {
+        await loadBasicParamAsGlobalProperties(paramIdStr);
+      } catch (err) {
+        console.warn('打开属性配置时加载模板详情失败:', err);
+        alert('当前模板详情加载失败，请重试');
+        return;
+      }
+    }
+
+    setShowGlobalPropertiesModal(true);
   };
 
   // 反转选中的断面（交换端点并同步到后端如果存在）
@@ -1732,7 +1766,7 @@ function EditorPage(props: EditorPageProps) {
 
   // 应用自定义线段配置：更新当前编辑组的垂线
   const handleApplyCustomSegments = () => {
-    applyCustomSegmentsAction({
+    void applyCustomSegmentsAction({
       editingGroupId,
       groups,
       perpendicularData,
@@ -1751,6 +1785,7 @@ function EditorPage(props: EditorPageProps) {
       setSelectedLines,
       setIsSelectingShoreLines,
       setIsSelectingStartEnd,
+      setLoadedBanks,
     });
   };
 
@@ -1911,7 +1946,7 @@ function EditorPage(props: EditorPageProps) {
         toggleFixShoreLineReversed={toggleFixShoreLineReversed}
         sendSelectedShoreLinesGeoJson={sendSelectedShoreLinesGeoJson}
         perpendicularData={perpendicularData}
-        setShowGlobalPropertiesModal={setShowGlobalPropertiesModal}
+        openGlobalPropertiesModal={openGlobalPropertiesModal}
         isSelectingStartEnd={isSelectingStartEnd}
         toggleStartEndSelection={toggleStartEndSelection}
         groups={groups}
@@ -1954,9 +1989,25 @@ function EditorPage(props: EditorPageProps) {
         <SectionPropertiesModal
           config={globalProperties}
           title="全局属性配置"
-          onSave={(newConfig) => {
+          onSave={async (newConfig) => {
+            const paramIdStr = selectedBasicParamIdState === null ? '' : String(selectedBasicParamIdState);
+            if (!paramIdStr) {
+              throw new Error('未选择可保存的参数模板');
+            }
+
+            await updateBasicParamAsSectionParams(paramIdStr, newConfig);
             setGlobalProperties(newConfig);
-            alert('全局属性配置已更新');
+            setBasicParamsList((prev) =>
+              prev.map((item) => {
+                const itemId = String(item.param_id ?? item.id ?? '');
+                if (itemId !== paramIdStr) return item;
+                return {
+                  ...item,
+                  ...newConfig,
+                };
+              }),
+            );
+            alert('参数模板已保存到后端');
           }}
           onClose={() => setShowGlobalPropertiesModal(false)}
         />
@@ -1970,8 +2021,16 @@ function EditorPage(props: EditorPageProps) {
           if (!perpendicularData || !perpendicularData.features[index]) return null;
 
           const currentLine = perpendicularData.features[index];
-          const currentConfig = (currentLine.properties as any)?.properties || globalProperties;
-          const sectionId = (currentLine.properties as any)?.sectionId;
+          const lineProps: any = currentLine.properties || {};
+          const currentConfig =
+            lineProps.analysisConfig ||
+            lineProps.properties ||
+            lineProps.backendParams ||
+            globalProperties;
+          const sectionId =
+            lineProps.sectionId ||
+            lineProps.section_id ||
+            lineProps.id;
 
           if (!currentConfig) {
             alert('断面参数未加载，请稍后再试');
@@ -1991,7 +2050,8 @@ function EditorPage(props: EditorPageProps) {
                   ...currentLine,
                   properties: {
                     ...currentLine.properties,
-                    properties: newConfig
+                    analysisConfig: newConfig,
+                    properties: newConfig,
                   }
                 };
                 setPerpendicularData(turf.featureCollection(updatedFeatures as GeoJSON.Feature<GeoJSON.LineString>[]));

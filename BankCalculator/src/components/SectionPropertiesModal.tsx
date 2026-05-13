@@ -2,10 +2,11 @@ import { useState } from 'react';
 import type { SectionParams } from '../types/sections';
 import TiffResourcePicker from './TiffResourcePicker';
 import styles from './Modal.module.css';
+import { updateSectionParams } from '../pages/editor/sectionApi';
 
 interface SectionPropertiesModalProps {
   config: SectionParams | null;
-  onSave: (newConfig: SectionParams) => void;
+  onSave: (newConfig: SectionParams) => void | Promise<void>;
   onClose: () => void;
   title: string;
   sectionId?: string;
@@ -77,19 +78,10 @@ function SectionPropertiesModal({
     setIsSaving(true);
     try {
       if (sectionId) {
-        const response = await fetch(`/v0/bank/sections/${sectionId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(params)
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`更新断面参数失败: ${response.statusText} - ${errorText}`);
-        }
+        await updateSectionParams(sectionId, params);
       }
 
-      onSave(params);
+      await Promise.resolve(onSave(params));
       onClose();
     } catch (err: any) {
       console.error('保存参数失败:', err);
