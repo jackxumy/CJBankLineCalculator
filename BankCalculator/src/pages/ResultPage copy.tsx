@@ -33,8 +33,8 @@ interface SectionResult {
   vertical_foot_point?: { type: 'Point'; coordinates: [number, number] } | null;
   // legacy compatibility
   anchorPoint?: number[] | null;
-  risk_level?: string | number; // 字符串(high, medium, low, no) 或 数字(1, 2, 3, 4)
-  indicator_result?: number | null; // /v0/bank/results/{sectionId} 返回的 indicators.result
+  risk_value?: string | number;
+  risk_level?: string | number;
   risk_score?: number;
 }
 
@@ -141,8 +141,7 @@ function ResultPage(props: ResultPageProps) {
   const pollTimerRef = useRef<number | null>(null);
   const activePollTaskIdRef = useRef<string | null>(null);
   const lastSectionsByTaskRef = useRef<Record<string, SectionResult[]>>({});
-  const sectionIndicatorResultCacheRef = useRef<Record<string, Record<string, number | null>>>({});
-  const sectionIndicatorResultPromiseRef = useRef<Record<string, Record<string, Promise<number | null> | null>>>({});
+  const rerunWatchRef = useRef<{ taskId: string | null; requestedAt: number }>({ taskId: null, requestedAt: 0 });
 
   const sectionClickHandlerRef = useRef<((e: any) => void) | null>(null);
   const sectionEnterHandlerRef = useRef<(() => void) | null>(null);
@@ -152,6 +151,7 @@ function ResultPage(props: ResultPageProps) {
   const [taskList, setTaskList] = useState<Task[]>([]);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [rerunning, setRerunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSections, setShowSections] = useState(true);
 
@@ -561,85 +561,34 @@ function ResultPage(props: ResultPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 风险解析辅助：根据 /v0/bank/results/{sectionId} 的 indicators.result(0-1) 映射到 0-3 风险等级
-  const mapIndicatorResultToRiskLevel = (value: any) => {
-    if (value === null || value === undefined || value === '') return null;
-    const n = Number(value);
-    if (!Number.isFinite(n) || n < 0 || n > 1) return null;
-    if (n < 0.25) return 0;
-    if (n < 0.5) return 1;
-    if (n < 0.75) return 2;
-    return 3;
-  };
-
-  const getRiskInfo = (indicatorResult: any) => {
-    const level = mapIndicatorResultToRiskLevel(indicatorResult);
-    if (level === null) {
-      return { valid: false, color: RISK_COLORS.default, label: '未知', level: null };
+  // 风险解析辅助：判断 risk_value 是否为 0-1 的有效数字
+  const getRiskInfo = (risk: any) => {
+    if (risk === null || risk === undefined) {
+      return { valid: false, color: RISK_COLORS.default, label: '未知', level: null, value: null };
     }
-    return { valid: true, color: RISK_COLORS[String(level)] || RISK_COLORS.default, label: level, level };
+
+    const n = Number(risk);
+    if (!isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 1) {
+      if (n < 0.25) {
+        return { valid: true, color: RISK_COLORS['0'], label: '低风险', level: 0, value: n };
+      }
+      if (n < 0.5) {
+        return { valid: true, color: RISK_COLORS['1'], label: '中风险', level: 1, value: n };
+      }
+      if (n < 0.75) {
+        return { valid: true, color: RISK_COLORS['2'], label: '高风险', level: 2, value: n };
+      }
+      return { valid: true, color: RISK_COLORS['3'], label: '极高风险', level: 3, value: n };
+    }
+
+    // 非 0-1 的值视为未知（灰色）
+    return { valid: false, color: RISK_COLORS.default, label: '未知', level: null, value: null };
   };
 
-  // 颜色展示：按 indicators.result 对应的四级风险颜色展示
+  // 颜色展示回退：仅按四级风险颜色展示（result 数值暂不参与）
   // 不同等级之间的过渡（岸线/中线）仍由 Mapbox 的 line-gradient 插值完成
-  const computeColorWithMatrix = (indicatorResult: any) => {
-    return getRiskInfo(indicatorResult);
-  };
-
-  const parseIndicatorResultFromSectionDetail = (payload: any): number | null => {
-    const indicators =
-      payload?.indicators ??
-      payload?.result?.indicators ??
-      payload?.data?.indicators ??
-      payload?.data?.result?.indicators;
-    const raw = indicators?.result;
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n < 0 || n > 1) return null;
-    return n;
-  };
-
-  const ensureSectionIndicatorResultLoaded = async (taskId: string, sectionId: string): Promise<number | null> => {
-    if (!taskId || !sectionId) return null;
-
-    if (!sectionIndicatorResultCacheRef.current[taskId]) {
-      sectionIndicatorResultCacheRef.current[taskId] = {};
-    }
-    if (!sectionIndicatorResultPromiseRef.current[taskId]) {
-      sectionIndicatorResultPromiseRef.current[taskId] = {};
-    }
-
-    if (Object.prototype.hasOwnProperty.call(sectionIndicatorResultCacheRef.current[taskId], sectionId)) {
-      return sectionIndicatorResultCacheRef.current[taskId][sectionId] ?? null;
-    }
-
-    const pending = sectionIndicatorResultPromiseRef.current[taskId][sectionId];
-    if (pending) return pending;
-
-    const promise = (async () => {
-      const res = await fetch(`/v0/bank/results/${encodeURIComponent(sectionId)}`);
-      const text = await res.text();
-      let json: any = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        json = null;
-      }
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${text?.slice(0, 500)}`);
-      }
-
-      const value = parseIndicatorResultFromSectionDetail(json ?? text);
-      sectionIndicatorResultCacheRef.current[taskId][sectionId] = value;
-      return value;
-    })();
-
-    sectionIndicatorResultPromiseRef.current[taskId][sectionId] = promise;
-    try {
-      return await promise;
-    } finally {
-      sectionIndicatorResultPromiseRef.current[taskId][sectionId] = null;
-    }
+  const computeColorWithMatrix = (baseLevel: any) => {
+    return getRiskInfo(baseLevel);
   };
 
   // 获取所有任务列表
@@ -680,10 +629,10 @@ function ResultPage(props: ResultPageProps) {
 
   const normalizeResultRecord = (r: any) => {
     const sectionId = r?.section_id ?? r?.sectionId ?? r?.sectionID;
-    const riskLevel = r?.risk_level ?? r?.riskLevel ?? r?.risk;
+    const riskValue = r?.risk_value ?? r?.riskValue ?? r?.risk;
     const status = r?.status ?? r?.state ?? r?.code;
     const message = r?.error_message ?? r?.errorMessage ?? r?.error ?? r?.message;
-    return { sectionId, riskLevel, status, message, raw: r };
+    return { sectionId, riskValue, status, message, raw: r };
   };
 
   const isTaskCompleted = (taskInfo: any) => {
@@ -781,12 +730,12 @@ function ResultPage(props: ResultPageProps) {
       latestBySection[String(nr.sectionId)] = nr;
     });
 
-    const resultBySection: Record<string, { riskLevel?: any; status?: any; message?: any; raw?: any }> = {};
+    const resultBySection: Record<string, { riskValue?: any; status?: any; message?: any; raw?: any }> = {};
     const errorsFromResults: TaskProgressSnapshot['errors'] = [];
     Object.keys(latestBySection).forEach(sectionId => {
       const nr = latestBySection[sectionId];
       resultBySection[sectionId] = {
-        riskLevel: nr.riskLevel,
+        riskValue: nr.riskValue,
         status: nr.status,
         message: nr.message,
         raw: nr.raw
@@ -795,8 +744,8 @@ function ResultPage(props: ResultPageProps) {
       const st = String(nr.status ?? '').toUpperCase();
       const hasError = (nr.message && String(nr.message).trim().length > 0) || (st && st !== 'SUCCESS' && st !== 'COMPLETED' && st !== '200');
       const riskIsValidNumber = (() => {
-        const n = Number(nr.riskLevel);
-        return !isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3;
+        const n = Number(nr.riskValue);
+        return !isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 1;
       })();
 
       if (hasError && !riskIsValidNumber) {
@@ -811,28 +760,15 @@ function ResultPage(props: ResultPageProps) {
     const mergedSections = baseSections.map(s => {
       const hit = resultBySection[s.section_id];
       if (!hit) return s;
-      return { ...s, risk_level: hit.riskLevel ?? s.risk_level };
-    });
-
-    const detailSectionIds = Object.keys(latestBySection);
-    if (detailSectionIds.length > 0) {
-      await Promise.allSettled(
-        detailSectionIds.map(sectionId => ensureSectionIndicatorResultLoaded(taskId, sectionId))
-      );
-    }
-
-    const sectionsWithIndicatorResult = mergedSections.map(s => {
-      const cached = sectionIndicatorResultCacheRef.current[taskId]?.[s.section_id];
-      if (cached === undefined) return s;
-      return { ...s, indicator_result: cached };
+      return { ...s, risk_value: hit.riskValue ?? s.risk_value };
     });
 
     // 注：result 的数值意义尚不明确，暂不再轮询 /matrix（避免高频额外请求）
 
-    // 统计成功数：以 risk_level(0-3) 为准
+    // 统计成功数：以 risk_value(0-1) 为准
     const successCount = mergedSections.reduce((acc, s) => {
-      const n = Number(s.risk_level);
-      if (!isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3) return acc + 1;
+      const n = Number(s.risk_value);
+      if (!isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 1) return acc + 1;
       return acc;
     }, 0);
 
@@ -842,8 +778,8 @@ function ResultPage(props: ResultPageProps) {
     if (completed) {
       mergedSections.forEach(s => {
         const hasAnyResult = Boolean(resultBySection[s.section_id]);
-        const n = Number(s.risk_level);
-        const riskOk = !isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 3;
+        const n = Number(s.risk_value);
+        const riskOk = !isNaN(n) && Number.isFinite(n) && n >= 0 && n <= 1;
         if (!hasAnyResult || !riskOk) {
           const already = errorsFromResults.some(e => e.section_id === s.section_id);
           if (!already) {
@@ -870,6 +806,20 @@ function ResultPage(props: ResultPageProps) {
     const expectedTotal = baseSections.length;
     const processedCount = completed ? expectedTotal : Math.min(expectedTotal, successCount + allErrors.length);
 
+    const watch = rerunWatchRef.current;
+    const inRerunWatch = watch.taskId === taskId && watch.requestedAt > 0;
+    const runStartedRaw = taskInfo?.run_started_at ?? taskInfo?.runStartedAt ?? null;
+    const runStartedTs = runStartedRaw ? Date.parse(String(runStartedRaw)) : NaN;
+    const rerunStarted = inRerunWatch && Number.isFinite(runStartedTs) && runStartedTs >= (watch.requestedAt - 1000);
+    const rerunWatchTimedOut = inRerunWatch && (Date.now() - watch.requestedAt > 60_000);
+
+    // 重启后后端状态可能短暂仍为 completed，这里强制保留轮询直到检测到新一轮 run_started_at 或超时
+    const forcePollingAfterRerun = inRerunWatch && !rerunStarted && !rerunWatchTimedOut;
+
+    if (rerunStarted || rerunWatchTimedOut) {
+      rerunWatchRef.current = { taskId: null, requestedAt: 0 };
+    }
+
     setProgress({
       taskId,
       taskName,
@@ -886,11 +836,11 @@ function ResultPage(props: ResultPageProps) {
 
     // 轮询驱动地图刷新（断面颜色 + 岸段插值）
     if (map) {
-      renderSections(sectionsWithIndicatorResult);
-      applyShorelineGradient(sectionsWithIndicatorResult);
+      renderSections(mergedSections);
+      applyShorelineGradient(mergedSections);
     }
 
-    const shouldStop = completed || (expectedTotal > 0 && processedCount >= expectedTotal);
+    const shouldStop = !forcePollingAfterRerun && (completed || (expectedTotal > 0 && processedCount >= expectedTotal));
     if (shouldStop) {
       stopPolling();
     }
@@ -955,8 +905,8 @@ function ResultPage(props: ResultPageProps) {
           vertical_foot_point: getVerticalFootPointFromAny(s) ?? null,
           // legacy compatibility
           anchorPoint: (s.anchorPoint ?? s.anchor_point ?? s.anchor) ?? null,
-          risk_level: s.risk_level,
-          indicator_result: null
+          risk_value: s.risk_value,
+          risk_level: s.risk_level
         }));
 
       // 打印处理后的断面列表 JSON，便于调试（也可在控制台查看）
@@ -1067,6 +1017,47 @@ function ResultPage(props: ResultPageProps) {
     }
   };
 
+  // 重启当前选中的任务
+  const handleRerunTask = async () => {
+    if (!selectedTask) return;
+
+    const confirmRerun = window.confirm('确定要重启当前选中的任务吗？将重新计算该案例。');
+    if (!confirmRerun) return;
+
+    setRerunning(true);
+    setError(null);
+    rerunWatchRef.current = { taskId: selectedTask, requestedAt: Date.now() };
+
+    try {
+      const res = await fetch(`/v0/bank/tasks/${encodeURIComponent(selectedTask)}/run`, {
+        method: 'POST'
+      });
+      const text = await res.text();
+      let json: any = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+
+      if (!res.ok) {
+        throw new Error((json && (json.message || json.error)) || `HTTP ${res.status}: ${text?.slice(0, 500)}`);
+      }
+
+      if (json && json.success === false) {
+        throw new Error(json.message || '重启任务失败');
+      }
+
+      // 重新打开并刷新当前任务，启动新的轮询与可视化
+      await handleTaskClick(selectedTask);
+    } catch (e: any) {
+      console.error('重启任务出错:', e);
+      setError(e?.message || '重启任务失败');
+    } finally {
+      setRerunning(false);
+    }
+  };
+
   // 渲染断面集合几何并在地图显示
   const renderSections = (sections: SectionResult[]) => {
     const map = mapRef.current;
@@ -1074,19 +1065,10 @@ function ResultPage(props: ResultPageProps) {
 
     // 转换断面数据为 GeoJSON
     const features = sections.filter(s => s.geometry).map(s => {
-      const info = computeColorWithMatrix(s.indicator_result);
+      const info = computeColorWithMatrix(s.risk_value);
       const color = info.color;
-      const displayRisk = info.valid ? info.level : info.label;
-
-      // 风险等级的中文标签映射
-      const RISK_LABELS: Record<number, string> = {
-        3: '极高风险',
-        2: '高风险',
-        1: '一般风险',
-        0: '低/无风险'
-      };
-
-      const riskLabel = info.valid && info.level !== null ? RISK_LABELS[info.level] : '未知';
+      const displayRisk = info.valid ? Number(Number(info.value).toFixed(4)) : info.label;
+      const riskLabel = info.valid ? info.label : '未知';
 
       return {
         type: 'Feature',
@@ -1094,7 +1076,7 @@ function ResultPage(props: ResultPageProps) {
         properties: {
           id: s.section_id,
           name: s.section_name || s.section_id,
-          risk_level: displayRisk,
+          risk_value: displayRisk,
           risk_label: riskLabel,
           color: color
         }
@@ -1179,7 +1161,7 @@ function ResultPage(props: ResultPageProps) {
         risk.style.marginTop = '4px';
         risk.style.fontSize = '12px';
         risk.style.color = '#64748b';
-        risk.innerHTML = `风险等级: <span style="color:${p.color}; font-weight:700;">${p.risk_label}</span>`;
+        risk.innerHTML = `风险分级: <span style="color:${p.color}; font-weight:700;">${p.risk_label}</span> (risk_value: ${p.risk_value ?? '未知'})`;
         root.appendChild(risk);
 
         const btn = document.createElement('button');
@@ -1253,7 +1235,7 @@ function ResultPage(props: ResultPageProps) {
                 (coords[0][0] + coords[1][0]) / 2,
                 (coords[0][1] + coords[1][1]) / 2,
               ];
-          const info = computeColorWithMatrix(s.indicator_result);
+          const info = computeColorWithMatrix(s.risk_value);
           return { mid, color: info.color, section: s, valid: info.valid };
         })
         .filter(Boolean) as Array<{ mid: number[]; color: string; section: SectionResult; valid: boolean }>;
@@ -1540,7 +1522,15 @@ function ResultPage(props: ResultPageProps) {
 
         <button
           className="delete-task-btn"
-          disabled={!selectedTask || loading}
+          disabled={!selectedTask || loading || rerunning}
+          onClick={handleRerunTask}
+        >
+          {rerunning ? '重启中...' : '重启选中任务'}
+        </button>
+
+        <button
+          className="delete-task-btn"
+          disabled={!selectedTask || loading || rerunning}
           onClick={handleDeleteTask}
         >
           删除选中任务
@@ -1555,8 +1545,8 @@ function ResultPage(props: ResultPageProps) {
             <div className="legend">
               <div className="legend-item"><span className="dot high"></span>极高风险</div>
               <div className="legend-item"><span className="dot medium"></span>高风险</div>
-              <div className="legend-item"><span className="dot low"></span>一般风险</div>
-              <div className="legend-item"><span className="dot no"></span>低/无风险</div>
+              <div className="legend-item"><span className="dot low"></span>中风险</div>
+              <div className="legend-item"><span className="dot no"></span>低风险</div>
             </div>
           </div>
         )}

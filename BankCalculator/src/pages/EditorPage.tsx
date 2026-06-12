@@ -503,23 +503,27 @@ function EditorPage(props: EditorPageProps) {
     if (!bankId) return;
     try {
       // 尝试按 REST 资源路径获取单条
+      // 打印请求信息以便调试：当在“获取岸段”下拉中点击岸段时，会在控制台输出请求 URL
+      console.log('[请求] GET', `/v0/bank/banks/${encodeURIComponent(bankId)}`);
       let res = await fetch(`/v0/bank/banks/${encodeURIComponent(bankId)}`);
       if (!res.ok) {
         // 退回到查询参数形式
+        console.log('[请求-回退] GET', `/v0/bank/banks?bank_id=${encodeURIComponent(bankId)}`);
         res = await fetch(`/v0/bank/banks?bank_id=${encodeURIComponent(bankId)}`);
       }
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const data = await res.json();
       const bank = (data?.bank || data?.banks?.[0] || data?.data || data) as any;
       const b = Array.isArray(bank) ? bank[0] : bank;
-      if (!b || !b.geometry) {
+      const geom = b?.geometry || b?.bank_geometry || b?.bankGeometry;
+      if (!b || !geom) {
         alert('未找到指定的岸段或该岸段无几何数据');
         return;
       }
 
       const newFeature = {
         type: 'Feature' as const,
-        geometry: b.geometry,
+        geometry: geom,
         properties: {
           index: uploadedData ? uploadedData.features.length : 0,
           bank_id: b.bank_id,
@@ -966,10 +970,10 @@ function EditorPage(props: EditorPageProps) {
       const list = Array.isArray(banks) ? banks : [];
 
       const features = list
-        .filter((b) => b?.geometry)
+        .filter((b) => b?.geometry || b?.bank_geometry || b?.bankGeometry)
         .map((b, index) => ({
           type: 'Feature' as const,
-          geometry: b.geometry,
+          geometry: b.geometry || b.bank_geometry || b.bankGeometry,
           properties: {
             index,
             bank_id: b.bank_id,
